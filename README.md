@@ -16,14 +16,15 @@
 - **主后端**：Rust（axum + SQLite，workspace 见 `backend/`）
 - **推理服务**：Python FastAPI（`python/`），承载 cl_tagger 打标 + Q-Align 美学评分
 
-## 当前状态（M2 导入与索引完成）
+## 当前状态（M3 查重完成）
 
 - [x] 规划文档（3 份）
 - [x] 前端骨架：9 个路由页面、布局、图片墙组件、mock 数据，`npm run build` 通过
 - [x] 推理服务骨架：`/health`、`/infer/tags`、`/infer/aesthetic`（含批量），已验证可启动
-- [x] Rust 主后端（M1）：workspace（core/db/api/app）+ SQLite 迁移 + `/health` `/api/v1/images` `/api/v1/stats` `/ws` + 前端静态托管
-- [x] M2 导入与索引：扫描/移动进库（哈希分片）/MD5/pHash/清晰度/EXIF/WebP 缩略图/批量入库/去重计数，`POST /api/v1/import` + 批次查询 + WS `batch.done` 广播，`cargo test` 19 过 / `clippy` 0 警告
-- [ ] 查重/打标/评分流水线（M3–M5）
+- [x] Rust 主后端（M1）：workspace（core/db/api/app）+ SQLite 迁移 + REST/WS + 前端静态托管
+- [x] M2 导入与索引：扫描/移动进库（哈希分片）/MD5/pHash/清晰度/EXIF/WebP 缩略图/批量入库/去重计数，`POST /api/v1/import` + 批次查询 + WS `batch.done` 广播
+- [x] M3 查重与回收站：pHash 聚类（增量+全量）、模糊/清晰对判定（best/redundant）、查重管理 API（stats/groups/scan/resolve）、回收站（recycle/restore/purge）、缩略图静态托管 `/thumbs/*`、前端查重页/回收站页接真实 API；`cargo test` 22 过 / `clippy` 0 警告
+- [ ] 打标/评分流水线（M4–M5）
 - [ ] Tauri 桌面壳（M8）
 
 ## 启动

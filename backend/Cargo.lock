@@ -589,6 +589,7 @@ dependencies = [
  "axum",
  "moevault-core",
  "moevault-db",
+ "moevault-dedup",
  "moevault-ingest",
  "serde",
  "serde_json",
@@ -625,6 +626,16 @@ version = "0.1.0"
 dependencies = [
  "moevault-core",
  "rusqlite",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "moevault-dedup"
+version = "0.1.0"
+dependencies = [
+ "moevault-core",
+ "moevault-db",
  "thiserror",
  "tracing",
 ]

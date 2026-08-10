@@ -106,3 +106,59 @@ pub struct ImportBatch {
     pub state: String,
     pub created_at: i64,
 }
+
+/// 查重组列表项（/api/v1/dedup/groups 返回）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DedupGroupSummary {
+    pub id: i64,
+    /// 组内 active 成员数。
+    pub size: i64,
+    /// 冗余候选数（active 非最优）。
+    pub redundant_count: i64,
+    /// 最优图（清晰度最高）信息。
+    pub best_id: Option<i64>,
+    pub best_thumb_rel: Option<String>,
+    pub best_clarity: Option<f64>,
+}
+
+/// 查重组详情（/api/v1/dedup/groups/{id} 返回）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DedupGroupDetail {
+    pub id: i64,
+    pub state: String,
+    pub members: Vec<GroupMember>,
+}
+
+/// 查重组成员。
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupMember {
+    pub image_id: i64,
+    pub rel_path: String,
+    pub thumb_rel: String,
+    pub width: i64,
+    pub height: i64,
+    pub clarity_score: f64,
+    pub aesthetic_score: Option<f64>,
+    pub is_redundant: bool,
+    pub is_best: bool,
+}
+
+/// 回收站项（/api/v1/trash 返回）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RecycledItem {
+    pub image_id: i64,
+    pub rel_path: String,
+    pub thumb_rel: String,
+    pub reason: String,
+    pub original_rel: String,
+    pub deleted_at: i64,
+}
+
+/// 查重统计（/api/v1/dedup/stats 返回）。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DedupStats {
+    pub group_count: i64,
+    /// 参与查重的图片数（有组归属的 active 图）。
+    pub involved_images: i64,
+    pub redundant_count: i64,
+}

@@ -8,6 +8,7 @@ license.workspace = true
 moevault-core = { path = "../core" }
 moevault-db = { path = "../db" }
 moevault-ingest = { path = "../ingest" }
+moevault-dedup = { path = "../dedup" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

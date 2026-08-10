@@ -1,0 +1,11 @@
+[package]
+name = "moevault-dedup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+moevault-core = { path = "../core" }
+moevault-db = { path = "../db" }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -41,6 +41,11 @@ async fn main() {
     let state = AppState::new(db, config.data_dir.clone());
     let mut app = build_router(state);
 
+    // 缩略图静态托管：/thumbs/<thumb_rel>
+    let thumbs_dir = config.data_dir.join("thumbs");
+    tracing::info!("托管缩略图目录: {}", thumbs_dir.display());
+    app = app.nest_service("/thumbs", ServeDir::new(&thumbs_dir));
+
     // 生产模式：托管前端构建产物（SPA fallback 到 index.html）
     if let Some(dir) = &config.static_dir {
         let index = dir.join("index.html");

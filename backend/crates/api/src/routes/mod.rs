@@ -1,8 +1,10 @@
 //! 路由模块组织。
 
+pub mod dedup;
 pub mod health;
 pub mod images;
 pub mod import;
+pub mod trash;
 pub mod ws;
 
 use axum::Json;

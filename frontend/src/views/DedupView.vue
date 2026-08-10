@@ -1,39 +1,65 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { useDedupStore } from '@/stores/dedup'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useDedupStore, thumbUrl, type DedupGroup, type GroupMember } from '@/stores/dedup'
 
 const dedup = useDedupStore()
-interface MockGroup {
-  id: number
-  size: number
-  redundant: number
-  members: { id: number; hue: number; clarity: number; best: boolean }[]
-}
-
-const groups = ref<MockGroup[]>([])
+const expanded = ref<Set<number>>(new Set())
+const membersCache = ref<Record<number, GroupMember[]>>({})
+const scanning = ref(false)
+const resolving = ref<number | null>(null)
 
 onMounted(() => {
-  dedup.loadMock()
-  groups.value = Array.from({ length: 8 }, (_, i) => {
-    const size = 2 + (i % 4)
-    const members = Array.from({ length: size }, (_, j) => ({
-      id: i * 10 + j,
-      hue: (i * 47 + j * 61) % 360,
-      clarity: +(2 + (size - j) + ((i * 7) % 10) / 10).toFixed(1),
-      best: j === 0,
-    }))
-    return {
-      id: 2000 + i,
-      size,
-      redundant: size - 1,
-      members,
-    }
-  })
+  dedup.fetchGroups().catch((e: Error) => ElMessage.error(e.message))
 })
 
-function resolveGroup(g: MockGroup) {
-  ElMessage.success(`组 #${g.id}: 保留最优，${g.redundant} 张冗余候选将入回收站（骨架占位）`)
+async function toggleExpand(g: DedupGroup) {
+  if (expanded.value.has(g.id)) {
+    expanded.value.delete(g.id)
+    return
+  }
+  expanded.value.add(g.id)
+  if (!membersCache.value[g.id]) {
+    try {
+      const detail = await dedup.groupDetail(g.id)
+      membersCache.value[g.id] = detail.members
+    } catch (e) {
+      ElMessage.error((e as Error).message)
+    }
+  }
+}
+
+async function runScan() {
+  scanning.value = true
+  try {
+    await dedup.scan(true)
+    ElMessage.success('全库查重任务已启动（完成后 WS 自动刷新）')
+    setTimeout(() => dedup.fetchGroups(), 2000)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    scanning.value = false
+  }
+}
+
+async function resolveBest(g: DedupGroup) {
+  await ElMessageBox.confirm(
+    `组 #${g.id} 共 ${g.size} 张，将保留最优（最清晰），其余 ${g.redundant_count} 张移入回收站（可恢复）。`,
+    '确认查重结果',
+    { type: 'warning', confirmButtonText: '保留最优，其余入回收站' },
+  )
+  resolving.value = g.id
+  try {
+    const r = await dedup.resolve(g.id, 'best_only')
+    ElMessage.success(`已回收 ${r.recycled} 张冗余图`)
+    membersCache.value[g.id] = []
+    expanded.value.delete(g.id)
+    await dedup.fetchGroups()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    resolving.value = null
+  }
 }
 </script>
 
@@ -45,35 +71,88 @@ function resolveGroup(g: MockGroup) {
       <el-statistic title="冗余候选" :value="dedup.redundantCount">
         <template #suffix><span style="font-size: 12px">张</span></template>
       </el-statistic>
-      <el-button type="primary" plain style="margin-left: auto">全库重扫（骨架占位）</el-button>
+      <el-button
+        type="primary"
+        plain
+        style="margin-left: auto"
+        :loading="scanning"
+        @click="runScan"
+      >
+        全库重扫
+      </el-button>
     </div>
 
-    <el-card v-for="g in groups" :key="g.id" class="group-card">
-      <template #header>
-        <div class="group-head">
-          <span>组 #{{ g.id }} · 共 {{ g.size }} 张 · 冗余 {{ g.redundant }} 张</span>
-          <span>
-            <el-button size="small" @click="ElMessage.info('对比视图（骨架占位）')">对比</el-button>
-            <el-button size="small" type="primary" @click="resolveGroup(g)">保留最优 → 回收站</el-button>
+    <div v-loading="dedup.loading" class="group-list">
+      <el-empty v-if="!dedup.loading && dedup.groups.length === 0" description="暂无重复组" />
+
+      <el-card v-for="g in dedup.groups" :key="g.id" class="group-card">
+        <template #header>
+          <div class="group-head">
+            <span class="group-title">
+              组 #{{ g.id }}
+              <el-tag v-if="g.redundant_count > 0" type="warning" size="small">
+                冗余 {{ g.redundant_count }}
+              </el-tag>
+              <el-tag v-else type="success" size="small">无冗余</el-tag>
+              <span class="group-size num-mono">共 {{ g.size }} 张</span>
+            </span>
+            <span class="group-actions">
+              <el-button size="small" @click="toggleExpand(g)">
+                {{ expanded.has(g.id) ? '收起' : '展开' }}
+              </el-button>
+              <el-button
+                v-if="g.redundant_count > 0"
+                size="small"
+                type="primary"
+                :loading="resolving === g.id"
+                @click="resolveBest(g)"
+              >
+                保留最优 → 回收站
+              </el-button>
+            </span>
+          </div>
+        </template>
+
+        <div v-if="expanded.has(g.id)" class="members">
+          <div
+            v-for="m in membersCache[g.id] ?? []"
+            :key="m.image_id"
+            class="member"
+            :class="{ best: m.is_best }"
+          >
+            <el-image
+              class="member-thumb"
+              :src="thumbUrl(m.thumb_rel)"
+              fit="cover"
+              :preview-src-list="[thumbUrl(m.thumb_rel)]"
+            >
+              <template #error>
+                <div class="thumb-fallback">无图</div>
+              </template>
+            </el-image>
+            <div class="member-tags">
+              <el-tag v-if="m.is_best" type="success" size="small">✓ 最优</el-tag>
+              <el-tag v-if="m.is_redundant" type="warning" size="small">⚠ 冗余</el-tag>
+            </div>
+            <div class="member-info num-mono">
+              清晰度 {{ m.clarity_score.toFixed(2) }}<br />
+              {{ m.width }}×{{ m.height }}
+            </div>
+          </div>
+        </div>
+        <div v-else class="best-preview">
+          <el-image
+            v-if="g.best_thumb_rel"
+            class="best-thumb"
+            :src="thumbUrl(g.best_thumb_rel)"
+            fit="cover"
+          />
+          <span class="best-text num-mono">
+            最优清晰度：{{ g.best_clarity?.toFixed(2) ?? '—' }}
           </span>
         </div>
-      </template>
-      <div class="members">
-        <div v-for="m in g.members" :key="m.id" class="member" :class="{ best: m.best }">
-          <div
-            class="member-thumb"
-            :style="`background: hsl(${m.hue} 65% 72%)`"
-            :title="m.best ? '最优（清晰度最高）' : '冗余候选'"
-          >
-            <span v-if="m.best" class="mk best-mk">✓</span>
-            <span v-else class="mk warn-mk">⚠</span>
-          </div>
-          <div class="member-clarity num-mono">清晰度 {{ m.clarity.toFixed(1) }}</div>
-        </div>
-      </div>
-    </el-card>
-
-    <el-empty v-if="groups.length === 0" description="暂无重复组" />
+      </el-card>
+    </div>
   </div>
 </template>
 
@@ -99,46 +178,66 @@ function resolveGroup(g: MockGroup) {
   justify-content: space-between;
   align-items: center;
 }
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.group-size {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
 .members {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
 }
 .member {
-  width: 120px;
+  width: 132px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 2px solid var(--el-border-color-lighter);
+  background: var(--el-bg-color);
 }
-.member-thumb {
-  height: 84px;
-  border-radius: 6px;
-  position: relative;
-  border: 2px solid transparent;
-}
-.member.best .member-thumb {
+.member.best {
   border-color: var(--el-color-success);
 }
-.mk {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  color: #fff;
-  font-size: 12px;
+.member-thumb {
+  width: 128px;
+  height: 90px;
+}
+.thumb-fallback {
+  width: 128px;
+  height: 90px;
   display: flex;
   align-items: center;
   justify-content: center;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+  font-size: 12px;
 }
-.best-mk {
-  background: var(--el-color-success);
+.member-tags {
+  padding: 4px 6px 0;
+  display: flex;
+  gap: 4px;
 }
-.warn-mk {
-  background: var(--el-color-warning);
-}
-.member-clarity {
+.member-info {
+  padding: 4px 6px 6px;
   font-size: 11px;
   color: var(--el-text-color-secondary);
-  margin-top: 4px;
-  text-align: center;
+}
+.best-preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.best-thumb {
+  width: 96px;
+  height: 68px;
+  border-radius: 6px;
+}
+.best-text {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 </style>

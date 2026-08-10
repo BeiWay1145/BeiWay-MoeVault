@@ -41,6 +41,11 @@ impl AppState {
         self.data_dir.join("thumbs")
     }
 
+    /// 回收站目录（`data/recycle`）。
+    pub fn recycle_dir(&self) -> PathBuf {
+        self.data_dir.join("recycle")
+    }
+
     /// 向所有连接的 WS 客户端广播事件（JSON 字符串）。
     pub fn broadcast(&self, event: WsEvent) {
         let _ = self.ws_tx.send(event);

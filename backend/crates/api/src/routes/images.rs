@@ -4,11 +4,12 @@
 //! 按 docs/TECH_DETAILS.md 第 2.1 节在 M2+ 补全。
 
 use axum::{
-    extract::{Query, State},
-    routing::get,
+    extract::{Path, Query, State},
+    routing::{get, post},
     Json, Router,
 };
 use moevault_core::models::{Page, Stats, STATUS_ACTIVE};
+use moevault_core::ErrorKind;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -20,6 +21,32 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/images", get(list_images))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/images/{id}/recycle", post(recycle_image))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecycleRequest {
+    /// duplicate / manual / auto。
+    pub reason: Option<String>,
+}
+
+/// POST /api/v1/images/{id}/recycle：把单张图片移入回收站。
+async fn recycle_image(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<RecycleRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let reason = req.reason.unwrap_or_else(|| "manual".to_string());
+    let db = state.db.clone();
+    let library = state.library_dir();
+    let recycle = state.recycle_dir();
+    tokio::task::spawn_blocking(move || {
+        moevault_dedup::recycle_image(&db, id, &reason, &library, &recycle)
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
+    Ok(Json(json!({ "recycled": id })))
 }
 
 #[derive(Debug, Deserialize)]

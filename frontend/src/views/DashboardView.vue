@@ -11,7 +11,8 @@ const taskStore = useTaskStore()
 const libraryStore = useLibraryStore()
 
 onMounted(() => {
-  dedupStore.loadMock()
+  // 真实 API（失败静默，不阻塞总览渲染）
+  dedupStore.refreshStats().catch(() => {})
   taskStore.loadMock()
 })
 
