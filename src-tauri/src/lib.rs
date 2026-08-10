@@ -45,15 +45,30 @@ pub fn run() {
 /// 启动后端进程。
 /// - debug：直接跑 backend 的编译产物
 /// - release：跑打包的 sidecar（externalBin 同名的 target/release/moevault-app.exe）
+/// 使用 CREATE_NO_WINDOW 隐藏控制台；日志重定向到 <cwd>/backend.log 便于排查。
 fn start_backend() -> std::io::Result<Child> {
   let exe = backend_exe_path();
+  let dir = working_dir();
+  // 日志文件（backend.log 建在数据目录旁）
+  let log_path = dir.join("backend.log");
+  let log_file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&log_path)?;
+
   let mut cmd = Command::new(&exe);
   cmd
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    // 默认数据目录（当前目录下 data/）
-    .current_dir(working_dir());
-  eprintln!("[MoeVault] 启动后端: {} ({})", exe.display(), cmd.get_current_dir().map(|d| d.display().to_string()).unwrap_or_default());
+    .current_dir(&dir)
+    .stdout(Stdio::from(log_file.try_clone()?))
+    .stderr(Stdio::from(log_file));
+  // Windows：隐藏后端控制台窗口
+  #[cfg(target_os = "windows")]
+  {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+  }
+  eprintln!("[MoeVault] 启动后端: {} (cwd: {}, log: {})", exe.display(), dir.display(), log_path.display());
   cmd.spawn()
 }
 
@@ -92,10 +107,10 @@ fn working_dir() -> PathBuf {
   }
 }
 
-/// 轮询后端端口直到就绪（最多 30 秒）。
+/// 轮询后端 /health 直到就绪（最多 30 秒）。
 fn wait_for_backend() {
   for _ in 0..150 {
-    if port_open(BACKEND_PORT) {
+    if backend_healthy() {
       eprintln!("[MoeVault] 后端就绪: {BACKEND_URL}");
       return;
     }
@@ -104,12 +119,28 @@ fn wait_for_backend() {
   eprintln!("[MoeVault] 后端 30 秒内未就绪");
 }
 
-/// 检查 TCP 端口是否可连接。
-fn port_open(port: u16) -> bool {
-  use std::net::TcpStream;
-  TcpStream::connect_timeout(
-    &format!("127.0.0.1:{port}").parse().unwrap(),
+/// 检查后端 /health 是否返回 200。
+fn backend_healthy() -> bool {
+  match std::net::TcpStream::connect_timeout(
+    &format!("127.0.0.1:{BACKEND_PORT}").parse().unwrap(),
     Duration::from_millis(150),
-  )
-  .is_ok()
+  ) {
+    Ok(mut stream) => {
+      use std::io::Write;
+      // 发送 HTTP 请求并读取响应头，确认 200
+      let _ = stream.write_all(
+        b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+      );
+      use std::io::Read;
+      let mut buf = [0u8; 128];
+      match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+          let text = String::from_utf8_lossy(&buf[..n]);
+          text.contains(" 200 ")
+        }
+        _ => false,
+      }
+    }
+    Err(_) => false,
+  }
 }

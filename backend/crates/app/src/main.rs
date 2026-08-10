@@ -2,6 +2,10 @@
 //!
 //! 启动流程：加载配置 → 打开 SQLite（含迁移）→ 构建路由 →
 //! 可选托管前端静态资源 → 监听端口（优雅退出）。
+//!
+//! release 模式隐藏控制台窗口（桌面壳 spawn 时不弹黑框）。
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use moevault_api::{build_router, AppState};
 use moevault_core::Config;
