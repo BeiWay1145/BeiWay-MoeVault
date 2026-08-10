@@ -1,5 +1,6 @@
 //! 路由模块组织。
 
+pub mod aesthetic;
 pub mod dedup;
 pub mod health;
 pub mod images;

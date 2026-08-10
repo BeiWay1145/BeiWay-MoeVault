@@ -29,7 +29,7 @@ pub struct TagProgress {
 #[derive(Clone)]
 pub struct InferClient {
     http: reqwest::Client,
-    base_url: String,
+    pub(crate) base_url: String,
 }
 
 impl InferClient {

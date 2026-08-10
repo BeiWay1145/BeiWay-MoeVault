@@ -803,6 +803,33 @@ impl Db {
         Ok(())
     }
 
+    /// 未评分（aesthetic_score IS NULL）的 active 图片 id 列表。
+    pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 10000);
+        let mut stmt = conn.prepare(
+            "SELECT id FROM images
+             WHERE status = 'active' AND aesthetic_score IS NULL
+             ORDER BY id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 写入美学评分。
+    pub fn set_aesthetic_score(&self, image_id: i64, score: f64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET aesthetic_score = ?2 WHERE id = ?1",
+            params![image_id, score],
+        )?;
+        Ok(())
+    }
+
     // ---------- SauceNAO 缓存 ----------
 
     /// 读取溯源缓存。

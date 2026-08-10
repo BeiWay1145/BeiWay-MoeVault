@@ -25,10 +25,12 @@ class AestheticModel:
                 return
             try:
                 import torch  # noqa: F401  # 确保 torch 可用，给出明确报错
-                from transformers import AutoModelForImageClassification, AutoProcessor
+                from transformers import AutoImageProcessor, AutoModelForImageClassification
 
                 model_ref = config.AESTHETIC_MODEL
-                self._processor = AutoProcessor.from_pretrained(model_ref)
+                # 用 AutoImageProcessor（纯视觉），避免 Siglip2 的 AutoProcessor
+                # 在 transformers 5.x 下尝试构建 tokenizer 失败
+                self._processor = AutoImageProcessor.from_pretrained(model_ref)
                 self._model = AutoModelForImageClassification.from_pretrained(model_ref)
                 self._model.eval()
                 if torch.cuda.is_available():

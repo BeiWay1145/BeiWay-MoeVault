@@ -6,11 +6,13 @@
 //! 3. 爬取标签（danbooru 官方 API / gelbooru dapi）
 //! 4. 溯源失败 → 回退本地 cl_tagger（推理服务 HTTP）
 
+pub mod aesthetic;
 pub mod booru;
 pub mod keypool;
 pub mod pipeline;
 pub mod saucenao;
 
+pub use aesthetic::{run_aesthetic_pipeline, AestheticProgress};
 pub use keypool::{ApiKeyPool, KeyState};
 pub use pipeline::{run_tag_pipeline, InferClient, TagProgress};
 pub use saucenao::{SauceNaoClient, SauceNaoResult};

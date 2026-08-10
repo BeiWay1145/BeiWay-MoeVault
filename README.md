@@ -27,7 +27,8 @@
 - [x] M4 打标流水线：SauceNAO 溯源 → danbooru/gelbooru 标签爬取 → 本地 cl_tagger 回退；`/api/v1/tagging/*`（run/stats/keys）+ `/images/{id}/tags|retag`
 - [x] 多 API key 轮换调度：`ApiKeyPool`（round-robin 轮换 + 冷却容错延时 + 短/日配额追踪 + 日配额预警<10 停用）、配额状态 JSON 持久化（`data/sauce_keys.json`，重启恢复）、`GET /api/v1/tagging/keys` 查看状态
 - [x] 不可溯源标记：`images.no_auto_sauce`（相似度不足或无结果自动标记）、自动打标跳过、`retag` 手动强制；`cargo test` 33 过 / `clippy` 0 警告
-- [ ] 美学评分流水线（M5）
+- [x] M5 美学评分流水线：本地 Q-Align（trojblue/distill-q-align-aesthetic-siglip2-base）批量评分写库；`/api/v1/aesthetic/run|stats` + `/images/{id}/rescore`；`cargo test` 33 过 / `clippy` 0 警告
+- [ ] 搜索筛选（组合筛选/排序 API + 前端）
 - [ ] Tauri 桌面壳（M8）
 
 ## 启动
@@ -56,5 +57,5 @@ cd frontend && npm install && npm run dev
 ## 关键外部依赖（本地）
 
 - cl_tagger 模型：`D:/Game/AI/cl_tagger/models`（SIGLIP2 ONNX 打标）
-- 美学模型：`trojblue/distill-q-align-aesthetic-siglip2-base`（首次运行联网下载）
+- 美学模型：`trojblue/distill-q-align-aesthetic-siglip2-base`（首次运行联网下载；**需 torch + torchvision**，已装于 cl_tagger venv 的 CPU 版）
 - SauceNAO API key：settings 表 `saucenao_api_keys`（**逗号分隔多 key**，兼容旧 `saucenao_api_key`）；配额状态自动持久化到 `data/sauce_keys.json`，重启恢复
