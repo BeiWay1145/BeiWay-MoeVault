@@ -23,6 +23,12 @@ pub const DEFAULT_SHORT_LIMIT: u32 = 6;
 pub struct KeyState {
     /// API key（明文，仅内部使用）。
     pub api_key: String,
+    /// 密钥名称（默认 Key0/Key1/...）。
+    #[serde(default = "default_name")]
+    pub name: String,
+    /// 账号等级：free / member。
+    #[serde(default = "default_tier_str")]
+    pub tier: String,
     /// 30s 窗口剩余配额。
     pub short_remaining: i64,
     /// 30s 窗口上限。
@@ -41,10 +47,20 @@ pub struct KeyState {
     pub total_requests: u64,
 }
 
+fn default_name() -> String {
+    "Key".to_string()
+}
+
+fn default_tier_str() -> String {
+    "free".to_string()
+}
+
 impl KeyState {
     fn new(api_key: String) -> Self {
         Self {
             api_key,
+            name: default_name(),
+            tier: default_tier_str(),
             short_remaining: DEFAULT_SHORT_LIMIT as i64,
             short_limit: DEFAULT_SHORT_LIMIT as i64,
             long_remaining: 95,
@@ -117,12 +133,33 @@ struct PoolSnapshot {
 }
 
 impl ApiKeyPool {
-    /// 从多个 API key 构建调度器。
+    /// 从多个 API key 构建调度器（无名称/等级，默认 Key/free）。
     pub fn new(keys: Vec<String>) -> Self {
         let keys: Vec<KeyState> = keys
             .into_iter()
             .filter(|k| !k.trim().is_empty())
-            .map(KeyState::new)
+            .map(|k| {
+                let mut s = KeyState::new(k);
+                s.name = format!("Key{}", 0);
+                s
+            })
+            .collect();
+        Self {
+            inner: Mutex::new(PoolInner { keys, cursor: 0, persist: None }),
+        }
+    }
+
+    /// 从带名称/等级的结构化配置构建调度器。
+    pub fn from_config(keys: &[moevault_core::models::SauceNaoKey]) -> Self {
+        let keys: Vec<KeyState> = keys
+            .iter()
+            .filter(|k| !k.key.trim().is_empty())
+            .map(|k| KeyState {
+                api_key: k.key.clone(),
+                name: k.name.clone(),
+                tier: k.tier.clone(),
+                ..KeyState::new(k.key.clone())
+            })
             .collect();
         Self {
             inner: Mutex::new(PoolInner { keys, cursor: 0, persist: None }),

@@ -68,6 +68,29 @@ def health():
 
 
 # ---------- 打标 ----------
+class TaggerConfigRequest(BaseModel):
+    model_dir: str
+
+
+@app.post("/infer/tagger/config")
+def tagger_config(req: TaggerConfigRequest):
+    """切换打标模型目录（重新加载模型）。"""
+    import os
+
+    if not os.path.isdir(req.model_dir):
+        raise HTTPException(status_code=404, detail=f"模型目录不存在: {req.model_dir}")
+    try:
+        with _infer_lock:
+            _tagger.load_from_dir(req.model_dir)
+        return {
+            "ok": True,
+            "model_dir": _tagger.model_dir,
+            "tags": len(_tagger._idx_to_tag),
+        }
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"模型切换失败: {e}") from e
+
+
 @app.post("/infer/tags")
 def infer_tags(req: TagRequest):
     _check_path(req.path)

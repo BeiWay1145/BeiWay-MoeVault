@@ -1,44 +1,85 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { get, put, post, del } from '@/api/client'
+
+export interface SauceKeyConfig {
+  name: string
+  key_masked: string
+  tier: string
+  has_key: boolean
+}
 
 export interface SettingsState {
-  libraryDir: string
-  saucenaoKey: string
-  saucenaoSimilarity: number
-  tagThreshold: number
-  dedupHamming: number
-  aestheticModel: string
-  /** 0 = 不自动清空 */
-  recycleDays: number
-  sidecarEnabled: boolean
-  cnDictEnabled: boolean
-  darkMode: 'auto' | 'light' | 'dark'
+  saucenao_min_sim: number
+  tag_threshold: number
+  tagger_model_dir: string
+  tagger_model_name: string
+  aesthetic_model: string
+  dedup_hamming: number
+  sidecar_enabled: boolean
+  cn_dict_enabled: boolean
+  recycle_days: number
+  library_dir: string
 }
 
 const defaults: SettingsState = {
-  libraryDir: 'data/library',
-  saucenaoKey: '',
-  saucenaoSimilarity: 75,
-  tagThreshold: 0.5,
-  dedupHamming: 8,
-  aestheticModel: 'trojblue/distill-q-align-aesthetic-siglip2-base',
-  recycleDays: 0,
-  sidecarEnabled: false,
-  cnDictEnabled: false,
-  darkMode: 'auto',
+  saucenao_min_sim: 75,
+  tag_threshold: 0.5,
+  tagger_model_dir: 'D:/Game/AI/cl_tagger/models',
+  tagger_model_name: 'cl_tagger (SIGLIP2 ONNX)',
+  aesthetic_model: 'trojblue/distill-q-align-aesthetic-siglip2-base',
+  dedup_hamming: 8,
+  sidecar_enabled: false,
+  cn_dict_enabled: false,
+  recycle_days: 0,
+  library_dir: 'data/library',
 }
 
-/** 设置状态（骨架阶段为前端本地默认值，接入后端后读写 /api/v1/settings） */
+/** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
 export const useSettingsStore = defineStore('settings', () => {
   const settings = ref<SettingsState>({ ...defaults })
+  const loaded = ref(false)
 
-  function update(patch: Partial<SettingsState>) {
-    settings.value = { ...settings.value, ...patch }
+  async function load() {
+    try {
+      const s = await get<Record<string, unknown>>('/settings')
+      settings.value = {
+        ...defaults,
+        saucenao_min_sim: s.saucenao_min_sim != null ? Number(s.saucenao_min_sim) : defaults.saucenao_min_sim,
+        tag_threshold: s.tag_threshold != null ? Number(s.tag_threshold) : defaults.tag_threshold,
+        tagger_model_dir: String(s.tagger_model_dir ?? defaults.tagger_model_dir),
+        tagger_model_name: String(s.tagger_model_name ?? defaults.tagger_model_name),
+        aesthetic_model: String(s.aesthetic_model ?? defaults.aesthetic_model),
+        dedup_hamming: s.dedup_hamming != null ? Number(s.dedup_hamming) : defaults.dedup_hamming,
+        sidecar_enabled: s.sidecar_enabled === true || s.sidecar_enabled === 'true',
+        cn_dict_enabled: s.cn_dict_enabled === true || s.cn_dict_enabled === 'true',
+        recycle_days: s.recycle_days != null ? Number(s.recycle_days) : defaults.recycle_days,
+        library_dir: String(s.library_dir ?? defaults.library_dir),
+      }
+      loaded.value = true
+    } catch {
+      loaded.value = true // 后端不可用时用默认值
+    }
+  }
+
+  async function save() {
+    await put('/settings', {
+      saucenao_min_sim: String(settings.value.saucenao_min_sim),
+      tag_threshold: String(settings.value.tag_threshold),
+      tagger_model_dir: settings.value.tagger_model_dir,
+      tagger_model_name: settings.value.tagger_model_name,
+      aesthetic_model: settings.value.aesthetic_model,
+      dedup_hamming: String(settings.value.dedup_hamming),
+      sidecar_enabled: String(settings.value.sidecar_enabled),
+      cn_dict_enabled: String(settings.value.cn_dict_enabled),
+      recycle_days: String(settings.value.recycle_days),
+      library_dir: settings.value.library_dir,
+    })
   }
 
   function reset() {
     settings.value = { ...defaults }
   }
 
-  return { settings, update, reset }
+  return { settings, loaded, load, save, reset }
 })

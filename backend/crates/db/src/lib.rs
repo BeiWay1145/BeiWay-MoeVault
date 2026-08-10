@@ -247,12 +247,32 @@ impl Db {
                 r.get(0)
             })?;
         let total_tags = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
+        let avg_aesthetic: Option<f64> = conn
+            .query_row(
+                "SELECT AVG(aesthetic_score) FROM images WHERE aesthetic_score IS NOT NULL",
+                [],
+                |r| r.get::<_, Option<f64>>(0),
+            )
+            .unwrap_or(None);
+        // 本月导入（本地时区月首的 epoch 秒）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let month_start = month_start_secs(now);
+        let month_imported: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM images WHERE imported_at >= ?1",
+            params![month_start],
+            |r| r.get(0),
+        )?;
         Ok(Stats {
             total_images,
             active_images,
             recycled_images,
             redundant_candidates,
             total_tags,
+            avg_aesthetic,
+            month_imported,
         })
     }
 
@@ -985,6 +1005,30 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 当前 UTC 月首的 epoch 秒（近似本地时区月首，误差 ≤ 时区偏移，可接受）。
+fn month_start_secs(now_epoch: i64) -> i64 {
+    let days = now_epoch.div_euclid(86400);
+    // epoch 天数 → (年,月,日)
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    // 月首天数
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era2 = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe2 = y2 - era2 * 400;
+    let mp2 = (m + 9) % 12;
+    let doy2 = (153 * mp2 + 2) / 5;
+    let doe2 = yoe2 * 365 + yoe2 / 4 - yoe2 / 100 + doy2;
+    let month_start_days = era2 * 146097 + doe2 - 719468;
+    month_start_days * 86400
 }
 
 fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {

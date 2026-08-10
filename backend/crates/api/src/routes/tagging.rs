@@ -36,24 +36,41 @@ pub struct RetagRequest {
     pub force_sauce: Option<bool>,
 }
 
-/// 从 settings 表读取打标配置。返回 (api_keys, min_sim, tag_threshold)。
-/// 多 key 用逗号分隔（saucenao_api_keys），兼容旧单 key（saucenao_api_key）。
+/// 从 settings 表读取打标配置。返回 (api_keys, min_sim, tag_threshold, model_dir)。
+/// 多 key 优先读 saucenao_keys JSON（含名称/等级），回退旧逗号分隔。
 #[allow(clippy::type_complexity)]
 fn read_tag_config(
     db: &moevault_db::Db,
-) -> Result<(Vec<String>, f64, f64), (axum::http::StatusCode, Json<Value>)> {
-    let keys_str = db
-        .get_setting("saucenao_api_keys")
+) -> Result<(Vec<moevault_core::models::SauceNaoKey>, f64, f64, Option<String>), (axum::http::StatusCode, Json<Value>)> {
+    // 多 key：优先 saucenao_keys JSON
+    let keys: Vec<moevault_core::models::SauceNaoKey> = db
+        .get_setting("saucenao_keys")
         .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?
-        .or(db
-            .get_setting("saucenao_api_key")
-            .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?)
+        .and_then(|json| serde_json::from_str::<Vec<moevault_core::models::SauceNaoKey>>(&json).ok())
         .unwrap_or_default();
-    let api_keys: Vec<String> = keys_str
-        .split([',', ';', '\n', ' '])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // 若 JSON 为空，回退旧格式
+    let keys = if keys.is_empty() {
+        let keys_str = db
+            .get_setting("saucenao_api_keys")
+            .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?
+            .or(db
+                .get_setting("saucenao_api_key")
+                .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?)
+            .unwrap_or_default();
+        keys_str
+            .split([',', ';', '\n', ' '])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .enumerate()
+            .map(|(i, k)| moevault_core::models::SauceNaoKey {
+                name: format!("Key{i}"),
+                key: k,
+                tier: "free".to_string(),
+            })
+            .collect()
+    } else {
+        keys
+    };
     let min_sim = db
         .get_setting("saucenao_min_sim")
         .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?
@@ -64,7 +81,10 @@ fn read_tag_config(
         .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.5);
-    Ok((api_keys, min_sim, tag_threshold))
+    let model_dir = db
+        .get_setting("tagger_model_dir")
+        .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
+    Ok((keys, min_sim, tag_threshold, model_dir))
 }
 
 /// 获取/初始化全局 SauceNAO key pool（含持久化恢复）。
@@ -73,7 +93,7 @@ fn read_tag_config(
 /// - 复用已初始化的 pool（配额/冷却跨请求保持）
 async fn get_or_init_pool(
     state: &AppState,
-    api_keys: &[String],
+    keys_cfg: &[moevault_core::models::SauceNaoKey],
 ) -> Result<Arc<ApiKeyPool>, (axum::http::StatusCode, Json<Value>)> {
     {
         let slot = state.sauce_pool.read().await;
@@ -83,14 +103,15 @@ async fn get_or_init_pool(
     }
     // 持久化路径：data_dir/sauce_keys.json
     let persist_path = state.data_dir.join("sauce_keys.json");
-    let pool = match ApiKeyPool::load_from(&persist_path, api_keys) {
+    let key_strings: Vec<String> = keys_cfg.iter().map(|k| k.key.clone()).collect();
+    let pool = match ApiKeyPool::load_from(&persist_path, &key_strings) {
         Some(p) => {
             tracing::info!("已从快照恢复 SauceNAO key 配额状态");
             p
         }
         None => {
             tracing::info!("无有效快照，新建 SauceNAO key pool");
-            ApiKeyPool::new(api_keys.to_vec())
+            ApiKeyPool::from_config(keys_cfg)
         }
     };
     pool.set_persist_path(persist_path);
@@ -98,6 +119,20 @@ async fn get_or_init_pool(
     let mut slot = state.sauce_pool.write().await;
     *slot = Some(pool.clone());
     Ok(pool)
+}
+
+/// 通知推理服务切换打标模型目录（可选）。
+async fn sync_tagger_model(state: &AppState, model_dir: &Option<String>) {
+    if let Some(dir) = model_dir {
+        let st = state.clone();
+        let dir = dir.clone();
+        tokio::spawn(async move {
+            let infer = InferClient::new(st.infer_base_url.clone());
+            if let Err(e) = infer.use_tagger_model(&dir).await {
+                tracing::warn!(error = %e, "切换打标模型失败");
+            }
+        });
+    }
 }
 
 async fn run_tagging(
@@ -109,7 +144,7 @@ async fn run_tagging(
 
     // 从 settings 读配置（spawn_blocking 包同步 DB 访问）
     let db_for_config = state.db.clone();
-    let (api_keys, min_sim, tag_threshold) = tokio::task::spawn_blocking(move || {
+    let (api_keys, min_sim, tag_threshold, model_dir) = tokio::task::spawn_blocking(move || {
         read_tag_config(&db_for_config)
     })
     .await
@@ -119,9 +154,12 @@ async fn run_tagging(
     if api_keys.is_empty() {
         return Err(error_response(
             ErrorKind::InvalidInput,
-            "未配置 SauceNAO API key（设置页或 settings 表 saucenao_api_keys）",
+            "未配置 SauceNAO API key（设置页添加密钥）",
         ));
     }
+
+    // 同步打标模型目录到推理服务
+    sync_tagger_model(&state, &model_dir).await;
 
     let pool = get_or_init_pool(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
@@ -218,6 +256,8 @@ async fn key_status(
         .iter()
         .map(|k| {
             json!({
+                "name": k.name,
+                "tier": k.tier,
                 "key_masked": format!("{}...{}", &k.api_key[..4.min(k.api_key.len())], &k.api_key[k.api_key.len().saturating_sub(4)..]),
                 "short_remaining": k.short_remaining,
                 "short_limit": k.short_limit,
@@ -252,7 +292,7 @@ async fn retag_image(
     let st = state.clone();
     // 配置
     let db_for_config = state.db.clone();
-    let (api_keys, min_sim, tag_threshold) = tokio::task::spawn_blocking(move || {
+    let (api_keys, min_sim, tag_threshold, model_dir) = tokio::task::spawn_blocking(move || {
         read_tag_config(&db_for_config)
     })
     .await
@@ -261,6 +301,9 @@ async fn retag_image(
     if api_keys.is_empty() {
         return Err(error_response(ErrorKind::InvalidInput, "未配置 SauceNAO API key"));
     }
+
+    // 同步打标模型目录到推理服务
+    sync_tagger_model(&state, &model_dir).await;
 
     let pool = get_or_init_pool(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));

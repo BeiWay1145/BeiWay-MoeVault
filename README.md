@@ -30,6 +30,7 @@
 - [x] M5 美学评分流水线：本地 Q-Align（trojblue/distill-q-align-aesthetic-siglip2-base）批量评分写库；`/api/v1/aesthetic/run|stats` + `/images/{id}/rescore`；`cargo test` 33 过 / `clippy` 0 警告
 - [x] M6 搜索筛选：`/api/v1/images` 组合筛选（标签 AND/排除、关键字、日期、美学/清晰度范围、来源、格式、尺寸、冗余候选）+ 排序（imported/date/aesthetic/clarity/size/random）；前端图库/搜索页接真实 API + 缩略图显示；`cargo test` 34 过 / `clippy` 0 警告
 - [x] M8 Tauri 桌面壳：窗口加载后端 URL（启动时自动拉起后端 sidecar）；构建产出 MSI + NSIS 安装包
+- [x] 设置增强：多 SauceNAO key 管理（名称/等级/配额查看/删除）、暗黑主题切换、打标模型选择（运行时切换模型目录）、总览真实统计（含平均美学分/本月导入）
 - [ ] 标签管理 API（自定义标签/合并/黑名单）
 
 ## 启动

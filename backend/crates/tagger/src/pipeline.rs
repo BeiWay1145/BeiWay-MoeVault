@@ -48,6 +48,27 @@ impl InferClient {
         &self.http
     }
 
+    /// 通知推理服务切换打标模型目录（重载模型）。
+    pub async fn use_tagger_model(&self, model_dir: &str) -> Result<(), TaggerError> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            model_dir: &'a str,
+        }
+        let resp = self
+            .http
+            .post(format!("{}/infer/tagger/config", self.base_url))
+            .json(&Req { model_dir })
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(TaggerError::Invalid(format!(
+                "推理服务切换模型返回 {}",
+                resp.status()
+            )));
+        }
+        Ok(())
+    }
+
     /// 调用 /infer/tags 获取本地标签。
     pub async fn infer_tags(&self, path: &Path, threshold: f64) -> Result<Vec<(String, f64)>, TaggerError> {
         #[derive(Serialize)]

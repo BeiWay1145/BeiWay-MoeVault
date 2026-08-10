@@ -1,19 +1,50 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDedupStore } from '@/stores/dedup'
 import { useTaskStore } from '@/stores/tasks'
 import { useLibraryStore, thumbUrl } from '@/stores/library'
+import { get } from '@/api/client'
 
 const router = useRouter()
 const dedupStore = useDedupStore()
 const taskStore = useTaskStore()
 const libraryStore = useLibraryStore()
 
-onMounted(() => {
-  // 真实 API（失败静默，不阻塞总览渲染）
+// 真实统计（/api/v1/stats + /tagging/stats）
+const totalImages = ref(0)
+const monthImported = ref(0)
+const avgAesthetic = ref('—')
+const untaggedCount = ref(0)
+const runningTasks = ref(0)
+
+onMounted(async () => {
+  // 总览统计（/api/v1/stats 含平均美学分/本月导入）
+  try {
+    const s = await get<{
+      total_images: number
+      month_imported: number
+      avg_aesthetic: number | null
+    }>('/stats')
+    totalImages.value = s.total_images
+    monthImported.value = s.month_imported
+    avgAesthetic.value = s.avg_aesthetic != null ? s.avg_aesthetic.toFixed(1) : '—'
+  } catch {
+    /* 静默 */
+  }
+  // 冗余候选
   dedupStore.refreshStats().catch(() => {})
+  // 待打标
+  try {
+    const t = await get<{ untagged: number; tagged: number; active_images: number }>(
+      '/tagging/stats',
+    )
+    untaggedCount.value = t.untagged
+  } catch {
+    /* 静默 */
+  }
   taskStore.loadMock()
+  runningTasks.value = taskStore.running
   libraryStore.fetchImages(12).catch(() => {})
 })
 
@@ -31,13 +62,13 @@ const quickLinks = [
     <el-row :gutter="16" class="stat-row">
       <el-col :span="4">
         <el-card shadow="hover" class="stat-card" @click="router.push('/library')">
-          <div class="stat-num num-mono">12,843</div>
+          <div class="stat-num num-mono">{{ totalImages.toLocaleString() }}</div>
           <div class="stat-label">图片总数</div>
         </el-card>
       </el-col>
       <el-col :span="4">
         <el-card shadow="hover" class="stat-card" @click="router.push('/library')">
-          <div class="stat-num num-mono">1,204</div>
+          <div class="stat-num num-mono">{{ monthImported.toLocaleString() }}</div>
           <div class="stat-label">本月导入</div>
         </el-card>
       </el-col>
@@ -49,19 +80,19 @@ const quickLinks = [
       </el-col>
       <el-col :span="4">
         <el-card shadow="hover" class="stat-card" @click="router.push('/tasks')">
-          <div class="stat-num num-mono">{{ taskStore.running }}</div>
+          <div class="stat-num num-mono">{{ runningTasks }}</div>
           <div class="stat-label">进行中任务</div>
         </el-card>
       </el-col>
       <el-col :span="4">
         <el-card shadow="hover" class="stat-card" @click="router.push('/search')">
-          <div class="stat-num num-mono">0</div>
+          <div class="stat-num num-mono">{{ untaggedCount }}</div>
           <div class="stat-label">待打标</div>
         </el-card>
       </el-col>
       <el-col :span="4">
         <el-card shadow="hover" class="stat-card" @click="router.push('/search')">
-          <div class="stat-num num-mono">3.8</div>
+          <div class="stat-num num-mono">{{ avgAesthetic }}</div>
           <div class="stat-label">平均美学分</div>
         </el-card>
       </el-col>

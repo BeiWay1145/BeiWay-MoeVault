@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus, Sunny, List } from '@element-plus/icons-vue'
+import { Plus, Sunny, Moon, List } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { post } from '@/api/client'
 
@@ -10,6 +10,14 @@ const importVisible = ref(false)
 const importPaths = ref('')
 const importMode = ref<'move' | 'copy'>('move')
 const submitting = ref(false)
+
+// 主题切换（暗黑/亮色，持久化 localStorage）
+const isDark = ref(document.documentElement.classList.contains('dark'))
+function toggleTheme() {
+  isDark.value = !isDark.value
+  document.documentElement.classList.toggle('dark', isDark.value)
+  localStorage.setItem('moevault-theme', isDark.value ? 'dark' : 'light')
+}
 
 function onImportConfirm() {
   if (!importPaths.value.trim()) {
@@ -46,7 +54,7 @@ function onImportConfirm() {
     </div>
     <div class="right">
       <el-button :icon="List" text @click="router.push('/tasks')" title="任务中心" />
-      <el-button :icon="Sunny" text title="主题切换（骨架占位）" />
+      <el-button :icon="isDark ? Sunny : Moon" text @click="toggleTheme" :title="isDark ? '切换亮色模式' : '切换暗黑模式'" />
     </div>
 
     <el-dialog v-model="importVisible" title="导入图片" width="560px">

@@ -118,6 +118,22 @@ pub enum SortKey {
     Random,
 }
 
+/// SauceNAO API key 配置项（settings 表 saucenao_keys JSON）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SauceNaoKey {
+    /// 密钥名称（默认 Key0/Key1/.../KeyN）。
+    pub name: String,
+    /// API key（明文，仅内部使用）。
+    pub key: String,
+    /// 账号等级：free / member。
+    #[serde(default = "default_tier")]
+    pub tier: String,
+}
+
+fn default_tier() -> String {
+    "free".to_string()
+}
+
 impl SortKey {
     /// 对应 SQL 排序列（白名单，防注入）。
     pub fn sql_col(&self) -> &'static str {
@@ -140,6 +156,10 @@ pub struct Stats {
     pub recycled_images: i64,
     pub redundant_candidates: i64,
     pub total_tags: i64,
+    /// 平均美学分（无评分图为 null）。
+    pub avg_aesthetic: Option<f64>,
+    /// 本月导入数（按 imported_at）。
+    pub month_imported: i64,
 }
 
 /// 列表分页响应。
