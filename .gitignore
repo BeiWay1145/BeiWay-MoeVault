@@ -1,0 +1,24 @@
+# ---- Node / 前端 ----
+frontend/node_modules/
+frontend/dist/
+frontend/.npm-cache/
+
+# ---- Python ----
+python/.venv/
+__pycache__/
+*.pyc
+
+# ---- 运行时数据（库目录/缩略图/回收站/数据库）----
+data/
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- IDE ----
+.idea/
+.vscode/
+
+# ---- Reasonix 工具元数据 ----
+.reasonix/

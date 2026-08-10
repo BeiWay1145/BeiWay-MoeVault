@@ -1,0 +1,14 @@
+# 推理服务依赖（运行时可复用 cl_tagger 的 .venv，见 run_server.bat / README.md）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# 打标模型（onnxruntime）
+onnxruntime-gpu>=1.15
+
+# 美学模型（torch + transformers）
+torch>=2.1
+transformers>=4.49
+
+Pillow>=10.0
+numpy>=1.24

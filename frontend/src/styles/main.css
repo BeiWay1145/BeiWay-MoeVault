@@ -1,0 +1,29 @@
+/* 全局基础样式 */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    'PingFang SC', 'Microsoft YaHei', 'Segoe UI', system-ui, -apple-system,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color: var(--el-text-color-primary);
+  background: var(--el-bg-color-page);
+}
+
+/* 数字等宽，便于进度/统计对齐 */
+.num-mono {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* 图片墙通用：铺满内容区 */
+.wall-container {
+  height: 100%;
+  overflow-y: auto;
+}
