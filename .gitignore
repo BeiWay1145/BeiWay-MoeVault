@@ -8,6 +8,9 @@ python/.venv/
 __pycache__/
 *.pyc
 
+# ---- Rust ----
+backend/target/
+
 # ---- 运行时数据（库目录/缩略图/回收站/数据库）----
 data/
 

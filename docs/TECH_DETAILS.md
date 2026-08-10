@@ -152,7 +152,8 @@ CREATE INDEX idx_recycle_deleted_at ON recycle_bin(deleted_at);
 
 ### 1.3 迁移策略
 
-- 使用 `refinery`（Rust 迁移库），SQL 迁移文件版本化递增：`V1__init.sql`、`V2__...`。
+- **实现**：轻量自研迁移器（`backend/crates/db/src/migration.rs`），SQL 文件编译期嵌入（`include_str!`），`schema_migrations` 表记录版本；每个迁移单事务执行、幂等可重跑。未采用 refinery 以规避与 rusqlite 的版本耦合。
+- 迁移文件按 `V{n}__name.sql` 命名递增（`backend/crates/db/migrations/`）。
 - 启动时自动跑未应用的迁移；迁移失败则拒绝启动（日志明确报错）。
 - 索引/统计为增量维护，破坏性重建走"手动全量重建"（管理命令）。
 
