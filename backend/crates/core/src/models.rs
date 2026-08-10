@@ -253,6 +253,18 @@ pub struct ImageTagView {
     pub confidence: Option<f64>,
 }
 
+/// 标签列表项（含关联图数）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TagWithCount {
+    pub id: i64,
+    pub name: String,
+    pub name_cn: Option<String>,
+    pub category: String,
+    pub is_custom: bool,
+    pub is_blacklisted: bool,
+    pub image_count: i64,
+}
+
 /// 单图打标状态。
 #[derive(Debug, Clone, Serialize)]
 pub struct TaggingState {

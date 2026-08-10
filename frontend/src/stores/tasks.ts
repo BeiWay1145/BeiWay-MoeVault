@@ -11,20 +11,20 @@ export interface TaskItem {
   error?: string
 }
 
-/** 任务中心状态（骨架占位） */
+/**
+ * 任务中心状态。
+ * 说明：任务队列（jobs 表）的后端查询 API 尚未实现，
+ * 当前无数据时显示空态；后续接入 /api/v1/tasks 后填充。
+ */
 export const useTaskStore = defineStore('tasks', () => {
   const tasks = ref<TaskItem[]>([])
   const running = ref(0)
 
-  function loadMock() {
-    tasks.value = [
-      { id: 12, type: '导入批次', status: 'running', progress: 0.78, done: 128, total: 164 },
-      { id: 13, type: 'SauceNAO 溯源', status: 'running', progress: 0.31, done: 2140, total: 6900 },
-      { id: 14, type: '美学评分', status: 'done', progress: 1, done: 47, total: 47 },
-      { id: 15, type: '打标', status: 'failed', progress: 0, done: 0, total: 1, error: '溯源失败: 相似度 32% < 75%' },
-    ]
-    running.value = tasks.value.filter((t) => t.status === 'running').length
+  /** 从后端加载任务（暂未实现，保持空数组）。 */
+  async function load() {
+    tasks.value = []
+    running.value = 0
   }
 
-  return { tasks, running, loadMock }
+  return { tasks, running, load }
 })

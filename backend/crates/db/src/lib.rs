@@ -11,7 +11,8 @@ use std::sync::Mutex;
 
 use moevault_core::models::{
     DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageFilter,
-    ImageListItem, ImageTagView, ImportBatch, RecycledItem, SortKey, Stats, TaggingState,
+    ImageListItem, ImageTagView, ImportBatch, RecycledItem, SortKey, Stats, TagWithCount,
+    TaggingState,
 };
 use moevault_core::{AppError, ErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -941,8 +942,7 @@ impl Db {
     }
 
     /// 未评分（aesthetic_score IS NULL）的 active 图片 id 列表。
-    pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {
-        let conn = self.conn.lock().unwrap();
+    pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {        let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 10000);
         let mut stmt = conn.prepare(
             "SELECT id FROM images
@@ -965,6 +965,35 @@ impl Db {
             params![image_id, score],
         )?;
         Ok(())
+    }
+
+    /// 标签列表（含关联图数，按图数降序）。
+    pub fn list_tags(&self, limit: i64) -> Result<Vec<TagWithCount>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 1000);
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, t.name_cn, t.category, t.is_custom, t.is_blacklisted,
+                    (SELECT COUNT(DISTINCT it.image_id) FROM image_tags it WHERE it.tag_id = t.id)
+             FROM tags t
+             ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(TagWithCount {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                name_cn: r.get(2)?,
+                category: r.get(3)?,
+                is_custom: r.get::<_, i64>(4)? != 0,
+                is_blacklisted: r.get::<_, i64>(5)? != 0,
+                image_count: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // ---------- SauceNAO 缓存 ----------

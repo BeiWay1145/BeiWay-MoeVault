@@ -14,15 +14,28 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::error_response;
+use super::{db_error_response, error_response};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/tagging/run", post(run_tagging))
         .route("/api/v1/tagging/stats", get(tagging_stats))
         .route("/api/v1/tagging/keys", get(key_status))
+        .route("/api/v1/tags", get(list_tags))
         .route("/api/v1/images/{id}/tags", get(image_tags))
         .route("/api/v1/images/{id}/retag", post(retag_image))
+}
+
+/// GET /api/v1/tags：标签列表（含关联图数）。
+async fn list_tags(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let tags = tokio::task::spawn_blocking(move || db.list_tags(1000))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "items": tags, "total": tags.len() })))
 }
 
 #[derive(Debug, Deserialize)]

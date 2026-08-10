@@ -43,7 +43,7 @@ onMounted(async () => {
   } catch {
     /* 静默 */
   }
-  taskStore.loadMock()
+  taskStore.load()
   runningTasks.value = taskStore.running
   libraryStore.fetchImages(12).catch(() => {})
 })

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
 import { useTaskStore } from '@/stores/tasks'
 
 const taskStore = useTaskStore()
 
-onMounted(() => taskStore.loadMock())
+onMounted(() => {
+  taskStore.load()
+})
 
 const statusTag = (s: string) =>
   ({ pending: 'info', running: 'primary', done: 'success', failed: 'danger', cancelled: 'info' })[s] as
@@ -13,16 +14,16 @@ const statusTag = (s: string) =>
     | 'primary'
     | 'success'
     | 'danger'
-
-function retry(id: number) {
-  ElMessage.success(`重试任务 #${id}（骨架占位）`)
-}
 </script>
 
 <template>
   <div class="tasks-page">
     <el-card class="block" header="进行中">
-      <el-empty v-if="taskStore.tasks.filter((t) => t.status === 'running').length === 0" description="无进行中任务" :image-size="60" />
+      <el-empty
+        v-if="taskStore.tasks.filter((t) => t.status === 'running').length === 0"
+        description="无进行中任务"
+        :image-size="60"
+      />
       <div v-for="t in taskStore.tasks.filter((x) => x.status === 'running')" :key="t.id" class="task-item">
         <div class="task-head">
           <span>{{ t.type }} #{{ t.id }}</span>
@@ -33,21 +34,24 @@ function retry(id: number) {
     </el-card>
 
     <el-card class="block" header="失败与重试">
-      <el-empty v-if="taskStore.tasks.filter((t) => t.status === 'failed').length === 0" description="无失败任务" :image-size="60" />
+      <el-empty
+        v-if="taskStore.tasks.filter((t) => t.status === 'failed').length === 0"
+        description="无失败任务"
+        :image-size="60"
+      />
       <el-table :data="taskStore.tasks.filter((t) => t.status === 'failed')">
         <el-table-column prop="id" label="ID" width="80" />
         <el-table-column prop="type" label="类型" width="120" />
         <el-table-column prop="error" label="错误信息" />
-        <el-table-column label="操作" width="160">
-          <template #default="{ row }">
-            <el-button size="small" type="primary" @click="retry(row.id)">重试</el-button>
-            <el-button size="small">忽略</el-button>
-          </template>
-        </el-table-column>
       </el-table>
     </el-card>
 
     <el-card class="block" header="历史">
+      <el-empty
+        v-if="taskStore.tasks.filter((t) => t.status === 'done').length === 0"
+        description="暂无历史任务"
+        :image-size="60"
+      />
       <el-table :data="taskStore.tasks.filter((t) => t.status === 'done')">
         <el-table-column prop="id" label="ID" width="80" />
         <el-table-column prop="type" label="类型" />
