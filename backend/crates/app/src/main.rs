@@ -12,21 +12,40 @@ use moevault_core::Config;
 use moevault_db::Db;
 use tower_http::services::{ServeDir, ServeFile};
 
-fn init_tracing() {
+fn init_tracing(data_dir: &std::path::Path) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,moevault=debug"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .init();
+    // 日志写文件（data/logs/app.log），便于查看问题
+    let log_dir = data_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("app.log"));
+    match file {
+        Ok(f) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .with_writer(std::sync::Mutex::new(f))
+                .try_init();
+        }
+        Err(e) => {
+            eprintln!("[MoeVault] 日志文件打开失败，回退 stdout: {e}");
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .try_init();
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
-
     let config = Config::from_env();
+    init_tracing(&config.data_dir);
+
     if let Err(e) = config.validate() {
         tracing::error!("配置校验失败: {e}");
         std::process::exit(1);

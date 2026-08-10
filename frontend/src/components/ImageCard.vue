@@ -7,6 +7,7 @@ const props = defineProps<{
   image: ImageItem
   selected?: boolean
   listMode?: boolean
+  waterfallMode?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -18,6 +19,13 @@ const emit = defineEmits<{
 
 const src = computed(() => thumbUrl(props.image.thumbRel))
 
+// 瀑布流：缩略图高度按原图宽高比（长图更高，形成错落）
+const thumbStyle = computed(() => {
+  if (!props.waterfallMode || !props.image.width || !props.image.height) return {}
+  const ratio = props.image.height / props.image.width
+  return { aspectRatio: `${props.image.width} / ${props.image.height}`, height: 'auto' }
+})
+
 function fmtSize(bytes: number) {
   if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`
   return `${Math.round(bytes / 1024)} KB`
@@ -27,10 +35,10 @@ function fmtSize(bytes: number) {
 <template>
   <div
     class="image-card"
-    :class="{ selected, 'list-mode': listMode }"
+    :class="{ selected, 'list-mode': listMode, 'waterfall-mode': waterfallMode }"
     @click="emit('click', image)"
   >
-    <div class="thumb">
+    <div class="thumb" :style="thumbStyle">
       <el-image
         v-if="src"
         :src="src"
@@ -104,6 +112,14 @@ function fmtSize(bytes: number) {
   width: 96px;
   height: 72px;
   flex: none;
+}
+.waterfall-mode .thumb {
+  aspect-ratio: auto;
+  height: auto;
+  width: 100%;
+}
+.waterfall-mode .thumb-img {
+  display: block;
 }
 .badge {
   position: absolute;

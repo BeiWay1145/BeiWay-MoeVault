@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus, Sunny, Moon, List } from '@element-plus/icons-vue'
+import { Plus, Sunny, Moon, List, FolderOpened } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { post } from '@/api/client'
 
@@ -10,6 +10,7 @@ const importVisible = ref(false)
 const importPaths = ref('')
 const importMode = ref<'move' | 'copy'>('move')
 const submitting = ref(false)
+const folderInput = ref<HTMLInputElement | null>(null)
 
 // 主题切换（暗黑/亮色，持久化 localStorage）
 const isDark = ref(document.documentElement.classList.contains('dark'))
@@ -17,6 +18,40 @@ function toggleTheme() {
   isDark.value = !isDark.value
   document.documentElement.classList.toggle('dark', isDark.value)
   localStorage.setItem('moevault-theme', isDark.value ? 'dark' : 'light')
+}
+
+/** 选择文件夹（webkitdirectory）填入路径列表。 */
+function onPickFolder(e: Event) {
+  const input = e.target as HTMLInputElement
+  const files = input.files
+  if (!files || files.length === 0) return
+  // 提取唯一目录：取第一个文件的相对路径前缀
+  const dirs = new Set<string>()
+  for (const f of files) {
+    // webkitRelativePath: "folder/sub/file.jpg"
+    const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath
+    if (rel) {
+      const top = rel.split('/')[0]
+      if (top) dirs.add(top)
+    }
+  }
+  // 浏览器拿不到绝对路径，这里提示用户手填（Tauri 桌面壳后续用 dialog 插件）
+  if (dirs.size > 0) {
+    ElMessage.info('浏览器环境无法获取文件夹绝对路径，请在桌面壳（Tauri）中使用，或手动输入路径')
+  }
+  input.value = ''
+}
+
+/** 拖拽导入：文件拖到窗口。浏览器无路径，提示桌面壳用法。 */
+function onDropImport(e: DragEvent) {
+  e.preventDefault()
+  const files = e.dataTransfer?.files
+  if (!files || files.length === 0) return
+  ElMessage.info('已识别拖拽。浏览器环境无法获取文件路径，请使用桌面壳版本（自动支持拖拽）或手动输入路径')
+}
+
+function onDragOver(e: DragEvent) {
+  e.preventDefault()
 }
 
 function onImportConfirm() {
@@ -57,7 +92,7 @@ function onImportConfirm() {
       <el-button :icon="isDark ? Sunny : Moon" text @click="toggleTheme" :title="isDark ? '切换亮色模式' : '切换暗黑模式'" />
     </div>
 
-    <el-dialog v-model="importVisible" title="导入图片" width="560px">
+    <el-dialog v-model="importVisible" title="导入图片" width="560px" @dragover="onDragOver" @drop="onDropImport">
       <el-form label-width="90px">
         <el-form-item label="路径">
           <el-input
@@ -66,6 +101,18 @@ function onImportConfirm() {
             :rows="4"
             placeholder="支持文件夹或文件，每行一个&#10;例如：D:/Pictures 或 D:/a/1.png"
           />
+        </el-form-item>
+        <el-form-item label="选择文件夹">
+          <input
+            ref="folderInput"
+            type="file"
+            webkitdirectory
+            multiple
+            style="display: none"
+            @change="onPickFolder"
+          />
+          <el-button :icon="FolderOpened" @click="folderInput?.click()">浏览文件夹…</el-button>
+          <span class="hint">桌面壳版本支持直接拖拽文件夹/图片到窗口</span>
         </el-form-item>
         <el-form-item label="导入方式">
           <el-radio-group v-model="importMode">

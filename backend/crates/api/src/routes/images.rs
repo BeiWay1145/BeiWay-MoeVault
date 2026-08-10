@@ -22,6 +22,38 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/images", get(list_images))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/images/{id}/recycle", post(recycle_image))
+        .route("/api/v1/images/{id}/sidecar", post(generate_sidecar))
+}
+
+/// POST /api/v1/images/{id}/sidecar：生成 sidecar .txt（逗号分隔标签，与 cl_tagger 格式一致）。
+async fn generate_sidecar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let library_dir = state.library_dir();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // 1. 取图片 rel_path
+        let img = db
+            .get_image_by_id(id)
+            .map_err(db_error_response)?
+            .ok_or_else(|| error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")))?;
+        // 2. 取标签（所有来源，按名字逗号拼接）
+        let tags = db.image_tags(id).map_err(db_error_response)?;
+        let tag_str: Vec<String> = tags.iter().map(|t| t.name.clone()).collect();
+        let content = tag_str.join(", ");
+        // 3. 写同名 .txt（图片旁）
+        let src_path = library_dir.join(&img.rel_path);
+        let txt_path = src_path.with_extension("txt");
+        std::fs::write(&txt_path, content)
+            .map_err(|e| error_response(ErrorKind::Internal, format!("写入失败: {e}")))?;
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(txt_path.display().to_string())
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+
+    Ok(Json(json!({ "ok": true, "path": result })))
 }
 
 #[derive(Debug, Deserialize)]

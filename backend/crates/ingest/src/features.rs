@@ -33,18 +33,28 @@ pub fn file_md5(path: &Path) -> Result<String, IngestError> {
 }
 
 /// 从源文件提取全部特征。
+/// 图片解码失败时降级返回（尺寸 0 / phash 0 / clarity 0），确保文件仍能入库。
 pub fn extract_features(path: &Path) -> Result<ImageFeatures, IngestError> {
     let md5 = file_md5(path)?;
     let size_bytes = std::fs::metadata(path).map(|m| m.len() as i64)?;
-
-    let img = image::open(path).map_err(|source| IngestError::Image {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let (width, height) = img.dimensions();
-    let phash = crate::phash::phash(&img);
-    let clarity = crate::clarity::clarity(&img);
     let format = extension_of(path).unwrap_or_else(|| "unknown".to_string());
+
+    // 解码（失败降级，不阻塞导入）
+    let (width, height, phash, clarity) = match image::open(path) {
+        Ok(img) => {
+            let (w, h) = img.dimensions();
+            (
+                w,
+                h,
+                crate::phash::phash(&img),
+                crate::clarity::clarity(&img),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "图片解码失败，降级入库");
+            (0, 0, 0, 0.0)
+        }
+    };
     let exif_datetime = crate::exif::exif_datetime(path);
 
     Ok(ImageFeatures {
@@ -57,6 +67,45 @@ pub fn extract_features(path: &Path) -> Result<ImageFeatures, IngestError> {
         clarity,
         exif_datetime,
     })
+}
+
+/// 读取 AI 生成图片的元信息（PNG tEXt chunks：parameters / prompt 等）。
+/// webui 写 `parameters`，comfyui 写 `prompt` + `workflow`。best-effort。
+pub fn read_ai_metadata(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    // PNG 签名
+    if data.len() < 8 || &data[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let mut pos = 8usize;
+    let mut meta: Vec<String> = Vec::new();
+    while pos + 8 <= data.len() {
+        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let ctype = &data[pos + 4..pos + 8];
+        let chunk_start = pos + 8;
+        if chunk_start + len > data.len() {
+            break;
+        }
+        if ctype == b"tEXt" {
+            let chunk = &data[chunk_start..chunk_start + len];
+            if let Some(sep) = chunk.iter().position(|&b| b == 0) {
+                let key = String::from_utf8_lossy(&chunk[..sep]).to_string();
+                let val = String::from_utf8_lossy(&chunk[sep + 1..]).to_string();
+                if matches!(key.as_str(), "parameters" | "prompt" | "workflow" | "Description" | "Comment") {
+                    meta.push(format!("[{key}] {val}"));
+                }
+            }
+        }
+        if ctype == b"IEND" {
+            break;
+        }
+        pos = chunk_start + len + 4; // + CRC
+    }
+    if meta.is_empty() {
+        None
+    } else {
+        Some(meta.join("\n"))
+    }
 }
 
 /// 取小写扩展名（无点）。

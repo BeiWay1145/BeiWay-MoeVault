@@ -16,12 +16,35 @@ use crate::state::AppState;
 
 use super::{db_error_response, error_response};
 
+/// GET /api/v1/logs：读取后端日志尾部（便于查看问题）。
+async fn get_logs(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let log_dir = state.data_dir.join("logs");
+    let content = tokio::task::spawn_blocking(move || {
+        let log_path = log_dir.join("app.log");
+        std::fs::read_to_string(&log_path).ok().map(|s| {
+            // 取末尾 200 行
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(200);
+            lines[start..].join("\n")
+        })
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
+    Ok(Json(json!({
+        "path": state.data_dir.join("logs").join("app.log").display().to_string(),
+        "content": content.unwrap_or_else(|| "日志文件不存在".to_string()),
+    })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/tagging/run", post(run_tagging))
         .route("/api/v1/tagging/stats", get(tagging_stats))
         .route("/api/v1/tagging/keys", get(key_status))
         .route("/api/v1/tags", get(list_tags))
+        .route("/api/v1/logs", get(get_logs))
         .route("/api/v1/images/{id}/tags", get(image_tags))
         .route("/api/v1/images/{id}/retag", post(retag_image))
 }
