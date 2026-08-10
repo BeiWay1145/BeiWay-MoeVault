@@ -43,8 +43,8 @@ pub fn run() {
 }
 
 /// 启动后端进程。
-/// - debug：直接跑 backend 的编译产物
-/// - release：跑打包的 sidecar（externalBin 同名的 target/release/moevault-app.exe）
+/// - debug：直接跑 backend 的编译产物，静态目录 = workspace frontend/dist
+/// - release：跑打包的 sidecar，静态目录 = exe 旁 resources/frontend（bundle.resources 打包）
 /// 使用 CREATE_NO_WINDOW 隐藏控制台；日志重定向到 <cwd>/backend.log 便于排查。
 fn start_backend() -> std::io::Result<Child> {
   let exe = backend_exe_path();
@@ -61,6 +61,13 @@ fn start_backend() -> std::io::Result<Child> {
     .current_dir(&dir)
     .stdout(Stdio::from(log_file.try_clone()?))
     .stderr(Stdio::from(log_file));
+  // 设置静态资源目录（后端托管前端 → 根路径 / 返回 index.html）
+  if let Some(static_dir) = frontend_static_dir() {
+    cmd.env("MOEVAULT_STATIC_DIR", &static_dir);
+    eprintln!("[MoeVault] 前端静态目录: {}", static_dir.display());
+  } else {
+    eprintln!("[MoeVault] 警告: 未找到前端静态目录，根路径将 404");
+  }
   // Windows：隐藏后端控制台窗口
   #[cfg(target_os = "windows")]
   {
@@ -70,6 +77,29 @@ fn start_backend() -> std::io::Result<Child> {
   }
   eprintln!("[MoeVault] 启动后端: {} (cwd: {}, log: {})", exe.display(), dir.display(), log_path.display());
   cmd.spawn()
+}
+
+/// 定位前端静态资源目录。
+/// - debug：workspace 根 frontend/dist
+/// - release：exe 同目录 frontend/（Tauri bundle.resources map 目标键复制产物）
+fn frontend_static_dir() -> Option<PathBuf> {
+  if cfg!(debug_assertions) {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    let p = PathBuf::from(manifest).join("..").join("frontend").join("dist");
+    return p.is_dir().then_some(p);
+  }
+  let exe_dir = std::env::current_exe()
+    .ok()
+    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    .unwrap_or_else(|| PathBuf::from("."));
+  // Tauri 2 资源复制到 exe 同级的 map 目标目录（frontend/）
+  let p = exe_dir.join("frontend");
+  if p.is_dir() {
+    return Some(p);
+  }
+  // 备选：resources/frontend（安装包布局）
+  let p2 = exe_dir.join("resources").join("frontend");
+  p2.is_dir().then_some(p2)
 }
 
 /// 定位后端 exe：
