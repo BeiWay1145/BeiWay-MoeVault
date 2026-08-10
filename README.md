@@ -28,8 +28,8 @@
 - [x] 多 API key 轮换调度：`ApiKeyPool`（round-robin 轮换 + 冷却容错延时 + 短/日配额追踪 + 日配额预警<10 停用）、配额状态 JSON 持久化（`data/sauce_keys.json`，重启恢复）、`GET /api/v1/tagging/keys` 查看状态
 - [x] 不可溯源标记：`images.no_auto_sauce`（相似度不足或无结果自动标记）、自动打标跳过、`retag` 手动强制；`cargo test` 33 过 / `clippy` 0 警告
 - [x] M5 美学评分流水线：本地 Q-Align（trojblue/distill-q-align-aesthetic-siglip2-base）批量评分写库；`/api/v1/aesthetic/run|stats` + `/images/{id}/rescore`；`cargo test` 33 过 / `clippy` 0 警告
-- [ ] 搜索筛选（组合筛选/排序 API + 前端）
-- [ ] Tauri 桌面壳（M8）
+- [x] M6 搜索筛选：`/api/v1/images` 组合筛选（标签 AND/排除、关键字、日期、美学/清晰度范围、来源、格式、尺寸、冗余候选）+ 排序（imported/date/aesthetic/clarity/size/random）；前端图库/搜索页接真实 API + 缩略图显示；`cargo test` 34 过 / `clippy` 0 警告
+- [ ] 标签管理 API（自定义标签/合并/黑名单）+ Tauri 桌面壳（M8）
 
 ## 启动
 

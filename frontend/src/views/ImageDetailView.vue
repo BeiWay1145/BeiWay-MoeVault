@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { useLibraryStore } from '@/stores/library'
+import { useLibraryStore, thumbUrl } from '@/stores/library'
 
 const route = useRoute()
 const library = useLibraryStore()
@@ -14,11 +14,16 @@ const star = ref(image.value?.aesthetic ?? 0)
 <template>
   <div v-if="image" class="detail">
     <div class="viewer">
-      <div
-        class="stage"
-        :style="`background: linear-gradient(135deg, hsl(${image.hue} 70% 78%), hsl(${(image.hue + 40) % 360} 70% 62%))`"
-      >
-        <span class="placeholder-name">{{ image.name }}</span>
+      <div class="stage">
+        <el-image
+          :src="thumbUrl(image.thumbRel)"
+          fit="contain"
+          class="stage-img"
+        >
+          <template #error>
+            <span class="placeholder-name">{{ image.name }}</span>
+          </template>
+        </el-image>
       </div>
       <div class="viewer-toolbar">
         <el-button>◀ 上一张</el-button>
@@ -29,12 +34,7 @@ const star = ref(image.value?.aesthetic ?? 0)
       <div class="similar">
         <span class="similar-title">相似图片</span>
         <div class="similar-row">
-          <div
-            v-for="n in 6"
-            :key="n"
-            class="similar-thumb"
-            :style="`background: hsl(${(image.hue + n * 31) % 360} 60% 72%)`"
-          />
+          <div v-for="n in 6" :key="n" class="similar-thumb" :style="`background: hsl(${(n * 31) % 360} 60% 72%)`" />
         </div>
       </div>
     </div>

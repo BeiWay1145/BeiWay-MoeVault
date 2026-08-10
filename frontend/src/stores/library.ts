@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { get } from '@/api/client'
 
-/** 图库浏览状态：筛选条件、排序、视图模式、选中集合（骨架阶段含 mock 数据） */
+/** 图库浏览状态：筛选条件、排序、视图模式、选中集合。数据来自 /api/v1/images。 */
 
 export interface ImageItem {
   id: number
@@ -12,35 +13,30 @@ export interface ImageItem {
   clarity: number
   aesthetic: number | null
   isRedundant: boolean
-  /** 导入时间（epoch 秒），骨架用 mock */
+  /** 导入时间（epoch 秒） */
   importedAt: number
-  /** 骨架占位：缩略图用 hue 生成渐变背景 */
-  hue: number
+  /** 缩略图相对路径（Windows 反斜杠→正斜杠，供 /thumbs 访问） */
+  thumbRel: string
 }
 
 export type ViewMode = 'grid' | 'waterfall' | 'list'
-export type SortKey = 'imported' | 'aesthetic' | 'clarity' | 'size' | 'date'
+export type SortKey = 'imported' | 'aesthetic' | 'clarity' | 'size' | 'date' | 'random'
 
-function makeMockImages(n: number): ImageItem[] {
-  const names = ['夏风', '海边', '少女与猫', '雨夜', '落日', '森林', '城市夜景', '花园', '星空', '街角']
-  const list: ImageItem[] = []
-  for (let i = 0; i < n; i++) {
-    const w = 480 + ((i * 137) % 1600)
-    const h = 480 + ((i * 89) % 2000)
-    list.push({
-      id: i + 1,
-      name: `${names[i % names.length]}_${String(i + 1).padStart(4, '0')}.png`,
-      width: w,
-      height: h,
-      sizeBytes: 512_000 + ((i * 731) % 8_000_000),
-      clarity: +(3 + ((i * 37) % 70) / 10).toFixed(1),
-      aesthetic: i % 7 === 0 ? null : +(2.5 + ((i * 13) % 30) / 10).toFixed(1),
-      isRedundant: i % 11 === 0,
-      importedAt: 1_717_000_000 + i * 3600,
-      hue: (i * 47) % 360,
-    })
-  }
-  return list
+/** 缩略图 URL。 */
+export function thumbUrl(thumbRel: string | null | undefined): string | undefined {
+  if (!thumbRel) return undefined
+  return `/thumbs/${thumbRel.replace(/\\/g, '/')}`
+}
+
+export interface LibraryFilter {
+  q?: string
+  tags?: string[]
+  excludeTags?: string[]
+  aestheticMin?: number
+  clarityMin?: number
+  source?: string
+  format?: string
+  isRedundant?: boolean
 }
 
 export const useLibraryStore = defineStore('library', () => {
@@ -48,11 +44,60 @@ export const useLibraryStore = defineStore('library', () => {
   const sortKey = ref<SortKey>('imported')
   const sortAsc = ref(false)
   const selected = ref<Set<number>>(new Set())
+  const filter = ref<LibraryFilter>({})
 
-  // 骨架 mock；接入后端后改为从 /api/v1/images 拉取
-  const images = ref<ImageItem[]>(makeMockImages(60))
-  const total = ref(60)
+  const images = ref<ImageItem[]>([])
+  const total = ref(0)
   const loading = ref(false)
+
+  /** 拉取图片列表（按当前筛选/排序）。 */
+  async function fetchImages(limit = 200) {
+    loading.value = true
+    try {
+      const params = new URLSearchParams()
+      params.set('limit', String(limit))
+      if (sortKey.value) params.set('sort', sortKey.value)
+      if (sortAsc.value) params.set('order', 'asc')
+      const f = filter.value
+      if (f.q) params.set('q', f.q)
+      if (f.tags?.length) params.set('tags', f.tags.join(','))
+      if (f.excludeTags?.length) params.set('exclude_tags', f.excludeTags.join(','))
+      if (f.aestheticMin != null) params.set('aesthetic_min', String(f.aestheticMin))
+      if (f.clarityMin != null) params.set('clarity_min', String(f.clarityMin))
+      if (f.source) params.set('source', f.source)
+      if (f.format) params.set('format', f.format)
+      if (f.isRedundant != null) params.set('is_redundant', f.isRedundant ? '1' : '0')
+
+      const d = await get<{ items: Array<Record<string, unknown>>; total: number }>(
+        `/images?${params.toString()}`,
+      )
+      images.value = d.items.map((it) => ({
+        id: it.id as number,
+        name: decodeURIComponent((it.rel_path as string).split('/').pop() ?? ''),
+        width: it.width as number,
+        height: it.height as number,
+        sizeBytes: it.size_bytes as number,
+        clarity: it.clarity_score as number,
+        aesthetic: it.aesthetic_score as number | null,
+        isRedundant: it.is_redundant as boolean,
+        importedAt: it.imported_at as number,
+        thumbRel: (it.thumb_rel as string) ?? '',
+      }))
+      total.value = d.total
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /** 设置筛选并刷新。 */
+  async function applyFilter(patch: Partial<LibraryFilter>) {
+    filter.value = { ...filter.value, ...patch }
+    await fetchImages()
+  }
+
+  function clearFilter() {
+    filter.value = {}
+  }
 
   function toggleSelect(id: number) {
     const s = new Set(selected.value)
@@ -65,5 +110,19 @@ export const useLibraryStore = defineStore('library', () => {
     selected.value = new Set()
   }
 
-  return { viewMode, sortKey, sortAsc, selected, images, total, loading, toggleSelect, clearSelect }
+  return {
+    viewMode,
+    sortKey,
+    sortAsc,
+    selected,
+    filter,
+    images,
+    total,
+    loading,
+    fetchImages,
+    applyFilter,
+    clearFilter,
+    toggleSelect,
+    clearSelect,
+  }
 })

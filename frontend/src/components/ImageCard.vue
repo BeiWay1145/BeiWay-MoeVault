@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { ImageItem } from '@/stores/library'
+import { thumbUrl } from '@/stores/library'
 
 const props = defineProps<{
   image: ImageItem
@@ -15,10 +16,7 @@ const emit = defineEmits<{
   recycle: [image: ImageItem]
 }>()
 
-// 骨架占位：用 hue 渐变模拟缩略图；接入后端后替换为 <img :src="thumbUrl">
-const thumbStyle = computed(
-  () => `background: linear-gradient(135deg, hsl(${props.image.hue} 70% 78%), hsl(${(props.image.hue + 40) % 360} 70% 62%));`,
-)
+const src = computed(() => thumbUrl(props.image.thumbRel))
 
 function fmtSize(bytes: number) {
   if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`
@@ -32,7 +30,19 @@ function fmtSize(bytes: number) {
     :class="{ selected, 'list-mode': listMode }"
     @click="emit('click', image)"
   >
-    <div class="thumb" :style="thumbStyle">
+    <div class="thumb">
+      <el-image
+        v-if="src"
+        :src="src"
+        fit="cover"
+        class="thumb-img"
+        lazy
+      >
+        <template #error>
+          <div class="thumb-fallback">无图</div>
+        </template>
+      </el-image>
+      <div v-else class="thumb-fallback">无图</div>
       <span v-if="image.isRedundant" class="badge redundant" title="冗余候选（同组存在更清晰图）">⚠ 模糊</span>
       <span v-if="image.aesthetic" class="badge aesthetic" title="美学评分">⭐ {{ image.aesthetic.toFixed(1) }}</span>
       <div class="hover-actions">
@@ -73,6 +83,21 @@ function fmtSize(bytes: number) {
   align-items: center;
   justify-content: center;
   color: #fff;
+  background: var(--el-fill-color-light);
+}
+.thumb-img {
+  width: 100%;
+  height: 100%;
+}
+.thumb-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+  font-size: 12px;
 }
 .list-mode .thumb {
   aspect-ratio: auto;

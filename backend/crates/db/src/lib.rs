@@ -10,8 +10,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use moevault_core::models::{
-    DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageListItem,
-    ImageTagView, ImportBatch, RecycledItem, Stats, TaggingState,
+    DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageFilter,
+    ImageListItem, ImageTagView, ImportBatch, RecycledItem, SortKey, Stats, TaggingState,
 };
 use moevault_core::{AppError, ErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -68,31 +68,148 @@ impl Db {
         migration::run(&conn)
     }
 
-    /// 图库列表（骨架版：按 id 游标分页，status 过滤）。
+    /// 图库列表（组合筛选 + 排序 + 游标分页）。
     ///
     /// 返回 `(items, next_cursor_id)`；next_cursor_id 为 None 表示没有更多。
-    pub fn list_images(
+    /// 筛选/排序字段均为白名单列名 + 参数绑定，无 SQL 注入风险。
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_images_filtered(
         &self,
         status: &str,
+        filter: &ImageFilter,
+        sort: SortKey,
+        sort_asc: bool,
         limit: i64,
         cursor_id: Option<i64>,
     ) -> Result<(Vec<ImageListItem>, Option<i64>), DbError> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 500);
-        let mut stmt = conn.prepare(
-            "SELECT id, md5, rel_path, width, height, format, size_bytes,
-                    exif_datetime, clarity_score, aesthetic_score,
-                    is_redundant, source, imported_at
-             FROM images
-             WHERE status = ?1 AND (?2 IS NULL OR id > ?2)
-             ORDER BY id
-             LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![status, cursor_id, limit], row_to_item)?;
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
+
+        let mut sql = String::from(
+            "SELECT i.id, i.md5, i.rel_path, i.width, i.height, i.format, i.size_bytes,
+                    i.exif_datetime, i.clarity_score, i.aesthetic_score,
+                    i.is_redundant, i.source, i.imported_at, i.thumb_rel
+             FROM images i",
+        );
+        let mut conds: Vec<String> = vec!["i.status = ?1".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(status.to_string())];
+
+        // 标签筛选（AND 语义：每标签一个 EXISTS）
+        for tag in &filter.tags {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!(
+                "EXISTS (SELECT 1 FROM image_tags it JOIN tags tg ON tg.id = it.tag_id
+                 WHERE it.image_id = i.id AND tg.name = {t})"
+            ));
+            params.push(Box::new(tag.clone()));
         }
+        // 排除标签
+        for tag in &filter.exclude_tags {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!(
+                "NOT EXISTS (SELECT 1 FROM image_tags it2 JOIN tags tg2 ON tg2.id = it2.tag_id
+                 WHERE it2.image_id = i.id AND tg2.name = {t})"
+            ));
+            params.push(Box::new(tag.clone()));
+        }
+        // 关键字（文件名 LIKE）
+        if let Some(q) = &filter.q {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.rel_path LIKE {t}"));
+            params.push(Box::new(format!("%{q}%")));
+        }
+        // 日期范围（exif_datetime 回退 file_mtime 语义：用 COALESCE）
+        if let Some(v) = filter.date_from {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("COALESCE(i.exif_datetime, i.file_mtime) >= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.date_to {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("COALESCE(i.exif_datetime, i.file_mtime) <= {t}"));
+            params.push(Box::new(v));
+        }
+        // 美学/清晰度范围
+        if let Some(v) = filter.aesthetic_min {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.aesthetic_score >= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.aesthetic_max {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.aesthetic_score <= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.clarity_min {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.clarity_score >= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.clarity_max {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.clarity_score <= {t}"));
+            params.push(Box::new(v));
+        }
+        // 来源/格式/尺寸/冗余
+        if let Some(v) = &filter.source {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.source = {t}"));
+            params.push(Box::new(v.clone()));
+        }
+        if let Some(v) = &filter.format {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.format = {t}"));
+            params.push(Box::new(v.clone()));
+        }
+        if let Some(v) = filter.min_width {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.width >= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.min_height {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.height >= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.is_redundant {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.is_redundant = {t}"));
+            params.push(Box::new(v as i64));
+        }
+
+        // 游标（id 偏移，配合排序保证稳定分页）
+        if let Some(c) = cursor_id {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("i.id > {t}"));
+            params.push(Box::new(c));
+        }
+
+        sql.push_str(&format!(" WHERE {}", conds.join(" AND ")));
+
+        // 排序（白名单列）
+        if sort == SortKey::Random {
+            sql.push_str(" ORDER BY RANDOM()");
+        } else {
+            let dir = if sort_asc { "ASC" } else { "DESC" };
+            sql.push_str(&format!(" ORDER BY {} {}", sort.sql_col(), dir));
+            sql.push_str(", i.id ASC"); // 稳定 tie-break
+        }
+        sql.push_str(" LIMIT ?");
+        let limit_placeholder_idx = params.len() + 1;
+        sql.push_str(&limit_placeholder_idx.to_string());
+        params.push(Box::new(limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        // 参数绑定（按索引）
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            items.push(row_to_item(row)?);
+        }
+
         let next = if items.len() as i64 == limit {
             items.last().map(|i| i.id)
         } else {
@@ -885,12 +1002,15 @@ fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {
         is_redundant: r.get::<_, i64>(10)? != 0,
         source: r.get(11)?,
         imported_at: r.get(12)?,
+        thumb_rel: r.get(13)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moevault_core::models::{STATUS_ACTIVE};
+    use moevault_core::models::SOURCE_LOCAL;
 
     fn test_db() -> Db {
         let path = std::env::temp_dir().join(format!(
@@ -926,10 +1046,70 @@ mod tests {
     #[test]
     fn list_images_empty_and_filtered() {
         let db = test_db();
-        let (items, next) = db.list_images("active", 100, None).expect("列表失败");
+        let filter = ImageFilter::default();
+        let (items, next) = db
+            .list_images_filtered("active", &filter, SortKey::Imported, false, 100, None)
+            .expect("列表失败");
         assert!(items.is_empty());
         assert_eq!(next, None);
         let n = db.count_images("active").expect("计数失败");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn filter_by_aesthetic_range() {
+        let db = test_db();
+        // 插入 3 张不同美学分的图
+        let mut imgs = Vec::new();
+        for (i, score) in [(1.0, 2.5), (2.0, 4.0), (3.0, 3.2)] {
+            imgs.push(Image {
+                id: 0,
+                md5: format!("md5_{i}"),
+                phash: i as i64,
+                rel_path: format!("p{i}.png"),
+                width: 100,
+                height: 100,
+                format: "png".into(),
+                size_bytes: 1,
+                file_mtime: 0,
+                exif_datetime: None,
+                clarity_score: 5.0,
+                aesthetic_score: Some(score),
+                dedup_group: None,
+                is_redundant: false,
+                status: STATUS_ACTIVE.into(),
+                source: SOURCE_LOCAL.into(),
+                source_url: None,
+                no_auto_sauce: false,
+                thumb_rel: format!("p{i}.webp"),
+                imported_at: i as i64,
+            });
+        }
+        db.insert_images(&imgs).unwrap();
+
+        // 美学分 >= 3.0
+        let filter = ImageFilter {
+            aesthetic_min: Some(3.0),
+            ..Default::default()
+        };
+        let (items, _) = db
+            .list_images_filtered("active", &filter, SortKey::Aesthetic, false, 100, None)
+            .unwrap();
+        assert_eq!(items.len(), 2, "应筛出 4.0 和 3.2 两张");
+        // 按美学降序：第一张应是 4.0
+        assert_eq!(items[0].aesthetic_score, Some(4.0));
+
+        // 标签筛选：给 img1 打标签后按标签过滤
+        let tag_id = db.upsert_tag("1girl", "general").unwrap();
+        db.insert_image_tags(2, &[(tag_id, None)], "auto_local").unwrap();
+        let filter = ImageFilter {
+            tags: vec!["1girl".to_string()],
+            ..Default::default()
+        };
+        let (items, _) = db
+            .list_images_filtered("active", &filter, SortKey::Imported, false, 100, None)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].md5, "md5_2");
     }
 }

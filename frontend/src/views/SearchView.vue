@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { Search } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { useLibraryStore } from '@/stores/library'
 import ImageWall from '@/components/ImageWall.vue'
 import { useRouter } from 'vue-router'
@@ -8,14 +9,38 @@ import { useRouter } from 'vue-router'
 const router = useRouter()
 const library = useLibraryStore()
 const keyword = ref('')
-const aestheticMin = ref(3.0)
-const dateRange = ref<[string, string] | null>(null)
+const aestheticMin = ref<number | null>(null)
+const source = ref('')
+const onlyRedundant = ref(false)
+const tagsInput = ref('')
 
-// 骨架占位：关键字直接过滤 mock 名称，组合筛选器待接入后端
-const filtered = () =>
-  library.images.filter(
-    (i) => !keyword.value || i.name.toLowerCase().includes(keyword.value.toLowerCase()),
-  )
+onMounted(() => {
+  library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
+})
+
+async function doSearch() {
+  await library
+    .applyFilter({
+      q: keyword.value || undefined,
+      aestheticMin: aestheticMin.value ?? undefined,
+      source: source.value || undefined,
+      isRedundant: onlyRedundant.value ? true : undefined,
+      tags: tagsInput.value
+        ? tagsInput.value.split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined,
+    })
+    .catch((e: Error) => ElMessage.error(e.message))
+}
+
+async function clearSearch() {
+  keyword.value = ''
+  aestheticMin.value = null
+  source.value = ''
+  onlyRedundant.value = false
+  tagsInput.value = ''
+  library.clearFilter()
+  await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
+}
 </script>
 
 <template>
@@ -24,42 +49,46 @@ const filtered = () =>
       <el-input
         v-model="keyword"
         size="large"
-        placeholder="搜索标签 / 文件名（FTS）"
+        placeholder="搜索文件名关键字"
         :prefix-icon="Search"
         clearable
+        @keyup.enter="doSearch"
       />
     </div>
 
     <div class="filter-panel">
       <el-form label-width="70px" inline>
-        <el-form-item label="美学分">
-          <el-slider v-model="aestheticMin" :min="1" :max="5" :step="0.1" style="width: 180px" show-input />
+        <el-form-item label="标签">
+          <el-input v-model="tagsInput" placeholder="逗号分隔，如 1girl,blue_archive" style="width: 240px" clearable />
         </el-form-item>
-        <el-form-item label="日期">
-          <el-date-picker v-model="dateRange" type="daterange" start-placeholder="开始" end-placeholder="结束" />
+        <el-form-item label="美学分≥">
+          <el-input-number v-model="aestheticMin" :min="1" :max="5" :step="0.1" placeholder="不限" />
         </el-form-item>
         <el-form-item label="来源">
-          <el-checkbox-group>
-            <el-checkbox value="danbooru" checked>danbooru</el-checkbox>
-            <el-checkbox value="gelbooru">gelbooru</el-checkbox>
-            <el-checkbox value="local">本地</el-checkbox>
-          </el-checkbox-group>
+          <el-select v-model="source" clearable placeholder="不限" style="width: 130px">
+            <el-option value="danbooru" label="danbooru" />
+            <el-option value="gelbooru" label="gelbooru" />
+            <el-option value="local" label="本地" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="冗余候选">
+          <el-switch v-model="onlyRedundant" />
         </el-form-item>
       </el-form>
       <div class="filter-actions">
-        <el-button type="primary">保存为智能视图（骨架占位）</el-button>
-        <el-button>清空筛选</el-button>
+        <el-button type="primary" @click="doSearch">搜索</el-button>
+        <el-button @click="clearSearch">清空筛选</el-button>
       </div>
     </div>
 
     <div class="result-head">
-      <span>共 <b class="num-mono">{{ filtered().length }}</b> 张</span>
-      <span class="hint">组合筛选器与 FTS 搜索将在接入后端后生效（docs/UI_DESIGN.md 4.4）</span>
+      <span>共 <b class="num-mono">{{ library.total }}</b> 张</span>
+      <span class="hint">按 标签/美学分/来源/冗余候选 组合筛选（后端排序）</span>
     </div>
 
     <div class="wall-container">
       <ImageWall
-        :images="filtered()"
+        :images="library.images"
         :view-mode="library.viewMode"
         @click="(img: any) => router.push(`/library/${img.id}`)"
       />

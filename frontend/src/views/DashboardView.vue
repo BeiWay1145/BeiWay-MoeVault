@@ -3,7 +3,7 @@ import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDedupStore } from '@/stores/dedup'
 import { useTaskStore } from '@/stores/tasks'
-import { useLibraryStore } from '@/stores/library'
+import { useLibraryStore, thumbUrl } from '@/stores/library'
 
 const router = useRouter()
 const dedupStore = useDedupStore()
@@ -14,6 +14,7 @@ onMounted(() => {
   // 真实 API（失败静默，不阻塞总览渲染）
   dedupStore.refreshStats().catch(() => {})
   taskStore.loadMock()
+  libraryStore.fetchImages(12).catch(() => {})
 })
 
 const quickLinks = [
@@ -83,11 +84,16 @@ const quickLinks = [
     <el-card class="block" header="最近导入">
       <div class="recent">
         <el-tooltip v-for="img in libraryStore.images.slice(0, 12)" :key="img.id" :content="img.name">
-          <div
+          <el-image
             class="recent-thumb"
-            :style="`background: linear-gradient(135deg, hsl(${img.hue} 70% 78%), hsl(${(img.hue + 40) % 360} 70% 62%))`"
+            :src="thumbUrl(img.thumbRel)"
+            fit="cover"
             @click="router.push(`/library/${img.id}`)"
-          />
+          >
+            <template #error>
+              <div class="recent-thumb" style="background: var(--el-fill-color-light)" />
+            </template>
+          </el-image>
         </el-tooltip>
       </div>
     </el-card>

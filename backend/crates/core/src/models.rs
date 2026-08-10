@@ -74,6 +74,62 @@ pub struct ImageListItem {
     pub is_redundant: bool,
     pub source: String,
     pub imported_at: i64,
+    /// 缩略图相对路径（data/thumbs 下）。
+    pub thumb_rel: String,
+}
+
+/// 组合筛选参数（/api/v1/images 查询参数，可任意组合）。
+#[derive(Debug, Clone, Default)]
+pub struct ImageFilter {
+    /// 关键字（文件名/标签名 LIKE 搜索）。
+    pub q: Option<String>,
+    /// 包含标签（逗号分隔，AND 语义——必须同时含所有）。
+    pub tags: Vec<String>,
+    /// 排除标签（逗号分隔，命中任一即排除）。
+    pub exclude_tags: Vec<String>,
+    /// EXIF 日期范围（epoch 秒，或文件时间回退）。
+    pub date_from: Option<i64>,
+    pub date_to: Option<i64>,
+    /// 美学分范围（1-5）。
+    pub aesthetic_min: Option<f64>,
+    pub aesthetic_max: Option<f64>,
+    /// 清晰度范围。
+    pub clarity_min: Option<f64>,
+    pub clarity_max: Option<f64>,
+    /// 来源（danbooru/gelbooru/local）。
+    pub source: Option<String>,
+    /// 格式（jpg/png/webp...）。
+    pub format: Option<String>,
+    /// 最小宽/高。
+    pub min_width: Option<i64>,
+    pub min_height: Option<i64>,
+    /// 只看冗余候选。
+    pub is_redundant: Option<bool>,
+}
+
+/// 排序键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Imported,
+    Date,
+    Aesthetic,
+    Clarity,
+    Size,
+    Random,
+}
+
+impl SortKey {
+    /// 对应 SQL 排序列（白名单，防注入）。
+    pub fn sql_col(&self) -> &'static str {
+        match self {
+            SortKey::Imported => "imported_at",
+            SortKey::Date => "exif_datetime",
+            SortKey::Aesthetic => "aesthetic_score",
+            SortKey::Clarity => "clarity_score",
+            SortKey::Size => "size_bytes",
+            SortKey::Random => "id", // random 由调用方 ORDER BY RANDOM()
+        }
+    }
 }
 
 /// 总览统计（/api/v1/stats）。
