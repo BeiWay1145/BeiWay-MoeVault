@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use moevault_core::models::{
     DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageListItem,
-    ImportBatch, RecycledItem, Stats,
+    ImageTagView, ImportBatch, RecycledItem, Stats, TaggingState,
 };
 use moevault_core::{AppError, ErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -32,6 +32,9 @@ impl From<DbError> for AppError {
         AppError::new(ErrorKind::Db, e.to_string())
     }
 }
+
+/// 溯源缓存记录：`(similarity, source, source_url)`。
+pub type SauceCacheEntry = (f64, Option<String>, Option<String>);
 
 /// SQLite 数据库封装。单连接 + Mutex：SQLite 写串行化，WAL 下读并发足够。
 #[derive(Clone)]
@@ -505,7 +508,7 @@ impl Db {
         conn.query_row(
             "SELECT id, md5, phash, rel_path, width, height, format, size_bytes, file_mtime,
                     exif_datetime, clarity_score, aesthetic_score, dedup_group, is_redundant,
-                    status, source, source_url, thumb_rel, imported_at
+                    status, source, source_url, no_auto_sauce, thumb_rel, imported_at
              FROM images WHERE id = ?1",
             params![id],
             |r| {
@@ -527,8 +530,9 @@ impl Db {
                     status: r.get(14)?,
                     source: r.get(15)?,
                     source_url: r.get(16)?,
-                    thumb_rel: r.get(17)?,
-                    imported_at: r.get(18)?,
+                    no_auto_sauce: r.get::<_, i64>(17)? != 0,
+                    thumb_rel: r.get(18)?,
+                    imported_at: r.get(19)?,
                 })
             },
         )
@@ -624,6 +628,210 @@ impl Db {
     pub fn delete_image_row(&self, image_id: i64) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM images WHERE id = ?1", params![image_id])?;
+        Ok(())
+    }
+
+    // ---------- 设置 ----------
+
+    /// 读取设置项（不存在返回 None）。
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    /// 写入设置项（UPSERT）。
+    pub fn put_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // ---------- 标签 ----------
+
+    /// 获取或创建标签，返回 tag id。
+    pub fn upsert_tag(&self, name: &str, category: &str) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(id) = conn
+            .query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get(0))
+            .optional()?
+        {
+            return Ok(id);
+        }
+        conn.execute(
+            "INSERT INTO tags (name, category, is_custom, is_blacklisted) VALUES (?1, ?2, 0, 0)",
+            params![name, category],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 批量写入图片-标签关联（单事务，source 相同）。
+    pub fn insert_image_tags(
+        &self,
+        image_id: i64,
+        tag_ids: &[(i64, Option<f64>)], // (tag_id, confidence)
+        source: &str,
+    ) -> Result<(), DbError> {
+        if tag_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO image_tags (image_id, tag_id, source, confidence, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (tid, conf) in tag_ids {
+                stmt.execute(params![image_id, tid, source, conf, now_secs()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 图片的标签视图（按来源分组排序）。
+    pub fn image_tags(&self, image_id: i64) -> Result<Vec<ImageTagView>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, t.name_cn, t.category, REPLACE(it.source, 'auto_', ''), it.confidence
+             FROM image_tags it JOIN tags t ON t.id = it.tag_id
+             WHERE it.image_id = ?1
+             ORDER BY it.source, t.name",
+        )?;
+        let rows = stmt.query_map(params![image_id], |r| {
+            Ok(ImageTagView {
+                tag_id: r.get(0)?,
+                name: r.get(1)?,
+                name_cn: r.get(2)?,
+                category: r.get(3)?,
+                source: r.get(4)?,
+                confidence: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 图片是否已有自动标签。
+    pub fn image_has_auto_tags(&self, image_id: i64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM image_tags
+             WHERE image_id = ?1 AND source IN ('auto_danbooru','auto_gelbooru','auto_local')",
+            params![image_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 单图打标状态。
+    pub fn image_tagging_state(&self, image_id: i64) -> Result<TaggingState, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let tags = self.image_tags(image_id)?;
+        let auto: Vec<_> = tags
+            .iter()
+            .filter(|t| matches!(t.source.as_str(), "danbooru" | "gelbooru" | "local"))
+            .collect();
+        let (source, source_url) = conn
+            .query_row(
+                "SELECT source, source_url FROM images WHERE id = ?1",
+                params![image_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .unwrap_or(("local".to_string(), None));
+        Ok(TaggingState {
+            image_id,
+            tagged: !auto.is_empty(),
+            source: Some(source),
+            source_url,
+            tag_count: auto.len(),
+        })
+    }
+
+    /// 未打标（无自动标签）的 active 图片 id 列表。
+    pub fn untagged_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 10000);
+        let mut stmt = conn.prepare(
+            "SELECT i.id FROM images i
+             WHERE i.status = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM image_tags it
+                 WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local')
+               )
+             ORDER BY i.id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 更新图片来源与溯源 URL。
+    pub fn set_image_source(&self, image_id: i64, source: &str, source_url: Option<&str>) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET source = ?2, source_url = ?3 WHERE id = ?1",
+            params![image_id, source, source_url],
+        )?;
+        Ok(())
+    }
+
+    /// 设置/清除不可自动溯源标记。
+    pub fn set_no_auto_sauce(&self, image_id: i64, flag: bool) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET no_auto_sauce = ?2 WHERE id = ?1",
+            params![image_id, flag as i64],
+        )?;
+        Ok(())
+    }
+
+    // ---------- SauceNAO 缓存 ----------
+
+    /// 读取溯源缓存。
+    pub fn get_sauce_cache(&self, md5: &str) -> Result<Option<SauceCacheEntry>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT similarity, source, source_url FROM sauce_cache WHERE image_md5 = ?1",
+            params![md5],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    /// 写入溯源缓存（md5 唯一，重复覆盖）。
+    pub fn put_sauce_cache(
+        &self,
+        md5: &str,
+        similarity: f64,
+        source: Option<&str>,
+        source_url: Option<&str>,
+        raw_json: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sauce_cache (image_md5, similarity, source, source_url, raw_json, hit_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![md5, similarity, source, source_url, raw_json, now_secs()],
+        )?;
         Ok(())
     }
 }

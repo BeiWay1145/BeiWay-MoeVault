@@ -181,6 +181,7 @@ mod tests {
             status: STATUS_ACTIVE.into(),
             source: SOURCE_LOCAL.into(),
             source_url: None,
+            no_auto_sauce: false,
             thumb_rel: format!("{md5}.webp"),
             imported_at: 0,
         }

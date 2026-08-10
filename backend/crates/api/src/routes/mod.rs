@@ -4,6 +4,7 @@ pub mod dedup;
 pub mod health;
 pub mod images;
 pub mod import;
+pub mod tagging;
 pub mod trash;
 pub mod ws;
 

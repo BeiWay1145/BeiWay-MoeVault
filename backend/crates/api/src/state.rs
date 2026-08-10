@@ -1,10 +1,12 @@
 //! API 共享状态与 WS 事件广播。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use moevault_db::Db;
-use tokio::sync::broadcast;
+use moevault_tagger::ApiKeyPool;
+use tokio::sync::{broadcast, RwLock};
 
 /// WS 事件：JSON 字符串（结构见 docs/TECH_DETAILS.md 第 3 节）。
 pub type WsEvent = String;
@@ -15,17 +17,23 @@ pub struct AppState {
     pub db: Db,
     /// 运行时数据目录（library/ thumbs/ 的父目录）。
     pub data_dir: PathBuf,
+    /// Python 推理服务基地址（本地打标回退用）。
+    pub infer_base_url: String,
+    /// SauceNAO 多 key 调度器（全局单例，配额/冷却跨请求保持）。
+    pub sauce_pool: Arc<RwLock<Option<Arc<ApiKeyPool>>>>,
     /// WS 事件广播通道。
     pub ws_tx: broadcast::Sender<WsEvent>,
     pub started_at: Instant,
 }
 
 impl AppState {
-    pub fn new(db: Db, data_dir: PathBuf) -> Self {
+    pub fn new(db: Db, data_dir: PathBuf, infer_base_url: String) -> Self {
         let (ws_tx, _) = broadcast::channel(256);
         Self {
             db,
             data_dir,
+            infer_base_url,
+            sauce_pool: Arc::new(RwLock::new(None)),
             ws_tx,
             started_at: Instant::now(),
         }

@@ -15,6 +15,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::import::router())
         .merge(routes::dedup::router())
         .merge(routes::trash::router())
+        .merge(routes::tagging::router())
         .merge(routes::ws::router())
         .with_state(state)
 }

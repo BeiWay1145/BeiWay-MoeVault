@@ -31,6 +31,8 @@ pub struct Image {
     pub status: String,
     pub source: String,
     pub source_url: Option<String>,
+    /// 不可自动溯源标记（确认无法溯源到 booru 的图，自动打标跳过）。
+    pub no_auto_sauce: bool,
     pub thumb_rel: String,
     pub imported_at: i64,
 }
@@ -161,4 +163,26 @@ pub struct DedupStats {
     /// 参与查重的图片数（有组归属的 active 图）。
     pub involved_images: i64,
     pub redundant_count: i64,
+}
+
+/// 图片-标签关联（含标签信息，供详情页展示）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageTagView {
+    pub tag_id: i64,
+    pub name: String,
+    pub name_cn: Option<String>,
+    pub category: String,
+    /// 来源：danbooru/gelbooru/local/manual。
+    pub source: String,
+    pub confidence: Option<f64>,
+}
+
+/// 单图打标状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaggingState {
+    pub image_id: i64,
+    pub tagged: bool,
+    pub source: Option<String>,
+    pub source_url: Option<String>,
+    pub tag_count: usize,
 }

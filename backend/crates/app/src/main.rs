@@ -38,7 +38,7 @@ async fn main() {
     };
     tracing::info!("数据库就绪: {}", config.db_path.display());
 
-    let state = AppState::new(db, config.data_dir.clone());
+    let state = AppState::new(db, config.data_dir.clone(), config.infer_base_url.clone());
     let mut app = build_router(state);
 
     // 缩略图静态托管：/thumbs/<thumb_rel>

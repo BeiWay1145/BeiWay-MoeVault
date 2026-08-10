@@ -1,5 +1,5 @@
 [package]
-name = "moevault-api"
+name = "moevault-tagger"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,12 +7,10 @@ license.workspace = true
 [dependencies]
 moevault-core = { path = "../core" }
 moevault-db = { path = "../db" }
-moevault-ingest = { path = "../ingest" }
-moevault-dedup = { path = "../dedup" }
-moevault-tagger = { path = "../tagger" }
-axum = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tower-http = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
