@@ -29,7 +29,8 @@
 - [x] 不可溯源标记：`images.no_auto_sauce`（相似度不足或无结果自动标记）、自动打标跳过、`retag` 手动强制；`cargo test` 33 过 / `clippy` 0 警告
 - [x] M5 美学评分流水线：本地 Q-Align（trojblue/distill-q-align-aesthetic-siglip2-base）批量评分写库；`/api/v1/aesthetic/run|stats` + `/images/{id}/rescore`；`cargo test` 33 过 / `clippy` 0 警告
 - [x] M6 搜索筛选：`/api/v1/images` 组合筛选（标签 AND/排除、关键字、日期、美学/清晰度范围、来源、格式、尺寸、冗余候选）+ 排序（imported/date/aesthetic/clarity/size/random）；前端图库/搜索页接真实 API + 缩略图显示；`cargo test` 34 过 / `clippy` 0 警告
-- [ ] 标签管理 API（自定义标签/合并/黑名单）+ Tauri 桌面壳（M8）
+- [x] M8 Tauri 桌面壳：窗口加载后端 URL（启动时自动拉起后端 sidecar）；构建产出 MSI + NSIS 安装包
+- [ ] 标签管理 API（自定义标签/合并/黑名单）
 
 ## 启动
 
@@ -53,6 +54,20 @@ cd frontend && npm install && npm run dev
 > **端口**：主服务默认 `9178`（M1 曾用 8000 因本机 node.exe 占用弃用）。
 > npm 全局缓存目录 `D:\Node\cache` 权限异常，安装依赖时需指定缓存：
 > `npm install --cache "$PWD/.npm-cache"`
+
+## 桌面壳（Tauri）
+
+```bash
+# 构建安装包（需 rustup + tauri-cli：cargo install tauri-cli --version ^2）
+cargo tauri build
+# 产出：
+#   src-tauri/target/release/bundle/msi/BeiWay-MoeVault_0.1.0_x64_en-US.msi
+#   src-tauri/target/release/bundle/nsis/BeiWay-MoeVault_0.1.0_x64-setup.exe
+```
+
+- 桌面壳启动时自动拉起后端 `moevault-app.exe`（sidecar），窗口加载 `http://127.0.0.1:9178`
+- 后端数据目录：生产模式为 exe 所在目录（安装后为安装目录），后续可改为用户数据目录
+- 推理服务（打标/美学）需另行启动（`python/run_server.bat`）；桌面壳暂不自动拉起
 
 ## 关键外部依赖（本地）
 
