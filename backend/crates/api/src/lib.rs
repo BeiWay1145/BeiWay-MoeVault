@@ -12,6 +12,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
         .merge(routes::images::router())
+        .merge(routes::import::router())
         .merge(routes::ws::router())
         .with_state(state)
 }

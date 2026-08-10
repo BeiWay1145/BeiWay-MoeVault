@@ -9,7 +9,7 @@ use crate::error::{AppError, ErrorKind};
 pub struct Config {
     /// 监听地址，默认 127.0.0.1（本地应用，不对外暴露）。
     pub host: String,
-    /// 监听端口，默认 8000。
+    /// 监听端口，默认 9178。
     pub port: u16,
     /// 运行时数据目录（library/ thumbs/ recycle/ 的父目录），默认 ./data。
     pub data_dir: PathBuf,
@@ -25,7 +25,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".into(),
-            port: 8000,
+            port: 9178,
             data_dir: PathBuf::from("data"),
             db_path: PathBuf::from("data/app.db"),
             static_dir: None,

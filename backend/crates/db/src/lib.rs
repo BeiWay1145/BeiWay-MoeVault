@@ -9,7 +9,7 @@ mod migration;
 use std::path::Path;
 use std::sync::Mutex;
 
-use moevault_core::models::{ImageListItem, Stats};
+use moevault_core::models::{Image, ImageListItem, ImportBatch, Stats};
 use moevault_core::{AppError, ErrorKind};
 use rusqlite::{params, Connection, Row};
 use thiserror::Error;
@@ -132,6 +132,140 @@ impl Db {
             total_tags,
         })
     }
+
+    // ---------- 导入批次 ----------
+
+    /// 创建导入批次，返回新 id。
+    pub fn create_import_batch(&self, source_path: &str) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO import_batches (source_path, total, done, failed, duplicate, state, created_at)
+             VALUES (?1, 0, 0, 0, 0, 'pending', ?2)",
+            params![source_path, now_secs()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 更新批次计数与状态。
+    pub fn update_import_batch(
+        &self,
+        id: i64,
+        total: i64,
+        done: i64,
+        failed: i64,
+        duplicate: i64,
+        state: &str,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE import_batches SET total = ?1, done = ?2, failed = ?3, duplicate = ?4, state = ?5
+             WHERE id = ?6",
+            params![total, done, failed, duplicate, state, id],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_batch(r: &Row) -> rusqlite::Result<ImportBatch> {
+        Ok(ImportBatch {
+            id: r.get(0)?,
+            source_path: r.get(1)?,
+            total: r.get(2)?,
+            done: r.get(3)?,
+            failed: r.get(4)?,
+            duplicate: r.get(5)?,
+            state: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    }
+
+    /// 查询单个批次。
+    pub fn get_import_batch(&self, id: i64) -> Result<Option<ImportBatch>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, source_path, total, done, failed, duplicate, state, created_at
+             FROM import_batches WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::row_to_batch)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// 批次列表（按创建时间倒序）。
+    pub fn list_import_batches(&self, limit: i64) -> Result<Vec<ImportBatch>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 200);
+        let mut stmt = conn.prepare(
+            "SELECT id, source_path, total, done, failed, duplicate, state, created_at
+             FROM import_batches ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], Self::row_to_batch)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ---------- 图片写入 ----------
+
+    /// 判断 md5 是否已存在。
+    pub fn md5_exists(&self, md5: &str) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM images WHERE md5 = ?1)",
+            params![md5],
+            |r| r.get(0),
+        )?;
+        Ok(n != 0)
+    }
+
+    /// 批量插入图片（单事务，失败整体回滚）。
+    pub fn insert_images(&self, images: &[Image]) -> Result<(), DbError> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO images
+                 (md5, phash, rel_path, width, height, format, size_bytes, file_mtime,
+                  exif_datetime, clarity_score, aesthetic_score, dedup_group, is_redundant,
+                  status, source, source_url, thumb_rel, imported_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            )?;
+            for img in images {
+                stmt.execute(params![
+                    img.md5,
+                    img.phash,
+                    img.rel_path,
+                    img.width,
+                    img.height,
+                    img.format,
+                    img.size_bytes,
+                    img.file_mtime,
+                    img.exif_datetime,
+                    img.clarity_score,
+                    img.aesthetic_score,
+                    img.dedup_group,
+                    img.is_redundant as i64,
+                    img.status,
+                    img.source,
+                    img.source_url,
+                    img.thumb_rel,
+                    img.imported_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {

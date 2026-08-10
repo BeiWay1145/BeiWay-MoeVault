@@ -92,3 +92,17 @@ pub struct Page<T> {
     pub next_cursor: Option<String>,
     pub total: i64,
 }
+
+/// 导入批次（import_batches 表一行）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportBatch {
+    pub id: i64,
+    pub source_path: String,
+    pub total: i64,
+    pub done: i64,
+    pub failed: i64,
+    /// 重复跳过计数（md5 已存在）。
+    pub duplicate: i64,
+    pub state: String,
+    pub created_at: i64,
+}

@@ -38,7 +38,7 @@ async fn main() {
     };
     tracing::info!("数据库就绪: {}", config.db_path.display());
 
-    let state = AppState::new(db);
+    let state = AppState::new(db, config.data_dir.clone());
     let mut app = build_router(state);
 
     // 生产模式：托管前端构建产物（SPA fallback 到 index.html）

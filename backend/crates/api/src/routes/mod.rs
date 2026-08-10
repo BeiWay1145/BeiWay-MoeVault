@@ -2,6 +2,7 @@
 
 pub mod health;
 pub mod images;
+pub mod import;
 pub mod ws;
 
 use axum::Json;

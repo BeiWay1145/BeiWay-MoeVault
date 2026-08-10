@@ -12,6 +12,7 @@ use super::DbError;
 /// 迁移清单：`(版本名, SQL)`。新增迁移时在此追加并更新序号。
 const MIGRATIONS: &[(&str, &str)] = &[
     ("V1__init", include_str!("../migrations/V1__init.sql")),
+    ("V2__import_duplicate", include_str!("../migrations/V2__import_duplicate.sql")),
 ];
 
 fn now_secs() -> i64 {

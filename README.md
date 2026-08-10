@@ -16,13 +16,14 @@
 - **主后端**：Rust（axum + SQLite，workspace 见 `backend/`）
 - **推理服务**：Python FastAPI（`python/`），承载 cl_tagger 打标 + Q-Align 美学评分
 
-## 当前状态（M1 骨架完成）
+## 当前状态（M2 导入与索引完成）
 
 - [x] 规划文档（3 份）
 - [x] 前端骨架：9 个路由页面、布局、图片墙组件、mock 数据，`npm run build` 通过
 - [x] 推理服务骨架：`/health`、`/infer/tags`、`/infer/aesthetic`（含批量），已验证可启动
-- [x] Rust 主后端（M1）：workspace（core/db/api/app）+ SQLite 迁移 + `/health` `/api/v1/images` `/api/v1/stats` `/ws` + 前端静态托管，`cargo test`/`clippy` 通过
-- [ ] 导入/查重/打标/评分流水线（M2–M5）
+- [x] Rust 主后端（M1）：workspace（core/db/api/app）+ SQLite 迁移 + `/health` `/api/v1/images` `/api/v1/stats` `/ws` + 前端静态托管
+- [x] M2 导入与索引：扫描/移动进库（哈希分片）/MD5/pHash/清晰度/EXIF/WebP 缩略图/批量入库/去重计数，`POST /api/v1/import` + 批次查询 + WS `batch.done` 广播，`cargo test` 19 过 / `clippy` 0 警告
+- [ ] 查重/打标/评分流水线（M3–M5）
 - [ ] Tauri 桌面壳（M8）
 
 ## 启动
@@ -30,10 +31,10 @@
 ```bash
 # 1) 主后端（Rust，需已安装 rustup 工具链）
 cd backend
-cargo run                      # 默认 http://127.0.0.1:8000
+cargo run                      # 默认 http://127.0.0.1:9178
 # 环境变量：MOEVAULT_PORT / MOEVAULT_DATA_DIR / MOEVAULT_DB_PATH /
 #           MOEVAULT_STATIC_DIR（前端 dist 目录）/ MOEVAULT_INFER_BASE
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:9178/health
 
 # 2) 推理服务（需 Python 3.10+，推荐用 cl_tagger 的 .venv 或自建 .venv）
 cd python && run_server.bat    # 或 python -m uvicorn server.main:app --port 8001
@@ -44,9 +45,7 @@ cd frontend && npm install && npm run dev
 # 打开 http://localhost:5173
 ```
 
-> **端口注意**：本机 8000 端口曾被一个 node.exe 进程占用（os error 10048），
-> 若启动后端报端口被占，用 `MOEVAULT_PORT=<其他端口>` 覆盖，并同步改
-> `frontend/vite.config.ts` 的 proxy 目标。
+> **端口**：主服务默认 `9178`（M1 曾用 8000 因本机 node.exe 占用弃用）。
 > npm 全局缓存目录 `D:\Node\cache` 权限异常，安装依赖时需指定缓存：
 > `npm install --cache "$PWD/.npm-cache"`
 

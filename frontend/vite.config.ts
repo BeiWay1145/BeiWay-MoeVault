@@ -10,9 +10,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // 开发期代理到 Rust 主服务（骨架阶段后端未就绪，先留代理配置）
-      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/ws': { target: 'ws://127.0.0.1:8000', ws: true },
+      // 开发期代理到 Rust 主服务（默认端口 9178）
+      '/api': { target: 'http://127.0.0.1:9178', changeOrigin: true },
+      '/ws': { target: 'ws://127.0.0.1:9178', ws: true },
     },
   },
   build: {

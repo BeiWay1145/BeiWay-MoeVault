@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Plus, Sunny, List } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import { post } from '@/api/client'
 
 const router = useRouter()
 const importVisible = ref(false)
@@ -11,19 +12,30 @@ const importMode = ref<'move' | 'copy'>('move')
 const submitting = ref(false)
 
 function onImportConfirm() {
-  // 骨架阶段：仅前端占位。接入后端后 POST /api/v1/import {paths}
   if (!importPaths.value.trim()) {
     ElMessage.warning('请输入文件/文件夹路径')
     return
   }
+  if (importMode.value === 'copy') {
+    ElMessage.warning('复制导入暂未支持（M2 仅支持移动导入）')
+    return
+  }
+  const paths = importPaths.value
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean)
   submitting.value = true
-  // TODO(backend): post('/import', { paths: parsePaths() })
-  setTimeout(() => {
-    submitting.value = false
-    importVisible.value = false
-    ElMessage.success('导入任务已创建（骨架占位，未实际入库）')
-    router.push('/tasks')
-  }, 400)
+  post<{ batch_id: number }>('/import', { paths, mode: importMode.value })
+    .then((res) => {
+      ElMessage.success(`导入任务 #${res.batch_id} 已创建（移动进库）`)
+      importVisible.value = false
+      importPaths.value = ''
+      router.push('/tasks')
+    })
+    .catch((e: Error) => ElMessage.error(e.message))
+    .finally(() => {
+      submitting.value = false
+    })
 }
 </script>
 
