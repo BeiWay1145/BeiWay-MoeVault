@@ -148,8 +148,9 @@ pub(crate) fn filter_eligible(
             .any(|t| matches!(t.source.as_str(), "auto_danbooru" | "auto_gelbooru" | "auto_local"));
         let is_sauced = img.source_url.is_some() || (img.source != "local" && !img.source.is_empty());
         let eligible = match kind {
-            "tag" => !is_ai && !has_auto_tags && !img.no_auto_sauce,
-            // force_sauce=true 时忽略不可溯源标记（强制重试）
+            // 打标：AI 图也参与（无 prompt 标签时本地模型打标），仅跳过已有标签/不可溯源/GIF
+            "tag" => !has_auto_tags && !img.no_auto_sauce,
+            // 溯源：AI 图无需溯源（无来源），跳过
             "sauce" => !is_ai && (!img.no_auto_sauce || force_sauce) && !is_sauced,
             "aesthetic" => img.aesthetic_score.is_none(),
             _ => true,
@@ -251,15 +252,14 @@ async fn tag_one(
         .ok_or_else(|| TaggerError::Invalid(format!("图片 {image_id} 不存在")))?;
     let file_path = library_dir.join(&img.rel_path);
 
-    // AI 生成图：prompt 比打标准确、溯源无意义 → 跳过打标与溯源
-    // （已通过 ai-info 写入 source=ai 标签的图）
+    // AI 生成图：有 prompt 标签则用（不再跳过）；无标签则提取 prompt 或本地模型打标
     let has_ai_tag = db
         .image_tags(image_id)?
         .iter()
         .any(|t| t.source == "ai");
     if img.ai_metadata.is_some() || has_ai_tag {
         if !has_ai_tag {
-            // 已标记 AI 但未提取标签：尝试提取（尽力而为）
+            // 已标记 AI 但未提取标签：尝试提取 prompt 标签
             if let Some(meta) = moevault_ingest::features::read_ai_metadata(&file_path) {
                 if !meta.tags.is_empty() {
                     let tag_ids: Vec<(i64, Option<f64>)> = meta
@@ -268,11 +268,17 @@ async fn tag_one(
                         .map(|t| db.upsert_tag(t, "general").map(|tid| (tid, None)))
                         .collect::<Result<_, _>>()?;
                     db.insert_image_tags(image_id, &tag_ids, "ai")?;
+                    info!(image_id, tag_count = meta.tags.len(), "AI 图提取 prompt 标签");
+                    return Ok(());
                 }
             }
+        } else {
+            info!(image_id, "AI 图已有 prompt 标签，跳过打标");
+            return Ok(());
         }
-        info!(image_id, "AI 生成图，跳过打标与溯源（prompt 标签已用）");
-        return Ok(());
+        // 无 prompt 标签的 AI 图：走本地模型打标（AI 图不溯源，直接本地推理）
+        info!(image_id, "AI 图无 prompt 标签，本地模型打标");
+        return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
     }
 
     // 不可溯源标记检查：已标记的图不自动溯源（用户手动 force 时跳过此检查）

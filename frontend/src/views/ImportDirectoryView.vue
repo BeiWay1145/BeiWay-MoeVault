@@ -8,6 +8,9 @@ import { useTaskStore } from '@/stores/tasks'
 import { get, post } from '@/api/client'
 import ImageCard from '@/components/ImageCard.vue'
 
+// keep-alive 缓存名（与路由 name 一致，保证跨板块状态保存）
+defineOptions({ name: 'imports' })
+
 const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()

@@ -10,6 +10,9 @@ import { post } from '@/api/client'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 
+// keep-alive 缓存名（与路由 name 一致）
+defineOptions({ name: 'library' })
+
 const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()

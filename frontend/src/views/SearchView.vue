@@ -9,6 +9,9 @@ import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 import { useRouter } from 'vue-router'
 
+// keep-alive 缓存名（与路由 name 一致）
+defineOptions({ name: 'search' })
+
 const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()

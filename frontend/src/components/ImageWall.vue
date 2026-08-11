@@ -17,7 +17,7 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <!-- 瀑布流：CSS columns 多列，卡片按自身比例高度（break-inside 避免截断） -->
+  <!-- 瀑布流：grid 多列，按行排序（从左到右、从上到下） -->
   <TransitionGroup v-if="viewMode === 'waterfall'" name="flip" tag="div" class="waterfall">
     <div v-for="img in images" :key="img.id" class="waterfall-item" :data-image-id="img.id">
       <ImageCard
@@ -87,14 +87,14 @@ const emit = defineEmits<{
   width: 100%;
 }
 
-/* 瀑布流：多列 + 卡片按比例高度 */
+/* 瀑布流：grid 多列按行排序（从左到右、从上到下），卡片按自身比例高度 */
 .waterfall {
-  columns: 5 220px;
-  column-gap: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
 }
 .waterfall-item {
-  break-inside: avoid;
-  margin-bottom: 12px;
+  margin-bottom: 0;
 }
 
 /* 删除/新增补位动效（瀑布流、网格、列表通用） */
