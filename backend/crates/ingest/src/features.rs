@@ -39,8 +39,8 @@ pub fn extract_features(path: &Path) -> Result<ImageFeatures, IngestError> {
     let size_bytes = std::fs::metadata(path).map(|m| m.len() as i64)?;
     let format = extension_of(path).unwrap_or_else(|| "unknown".to_string());
 
-    // 解码（失败降级，不阻塞导入）
-    let (width, height, phash, clarity) = match image::open(path) {
+    // 解码（按文件头嗅探格式，不依赖扩展名——修复 jpg 实际是 PNG 时解码失败）
+    let (width, height, phash, clarity) = match decode_image(path) {
         Ok(img) => {
             let (w, h) = img.dimensions();
             (
@@ -67,6 +67,32 @@ pub fn extract_features(path: &Path) -> Result<ImageFeatures, IngestError> {
         clarity,
         exif_datetime,
     })
+}
+
+/// 按文件头嗅探图片格式解码（不依赖扩展名）。
+/// 修复：.jpg 扩展名但实际是 PNG/WebP 等内容的文件，image::open 会失败。
+pub fn decode_image(path: &Path) -> Result<image::DynamicImage, IngestError> {
+    use image::ImageReader;
+    use std::io::{BufReader, Read, Seek};
+    let mut file = std::fs::File::open(path).map_err(IngestError::Io)?;
+    // 读文件头 16 字节嗅探格式
+    let mut header = [0u8; 16];
+    let n = file.read(&mut header).unwrap_or(0);
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(IngestError::Io)?;
+    let format = image::guess_format(&header[..n]).ok();
+    let mut reader = ImageReader::new(BufReader::new(file));
+    reader.no_limits();
+    if let Some(f) = format {
+        reader.set_format(f);
+    }
+    let img = reader
+        .decode()
+        .map_err(|source| IngestError::Image {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(img)
 }
 
 /// AI 生成图片的解析结果。
@@ -309,6 +335,27 @@ mod tests {
         assert_eq!(feats.height, 48);
         assert_eq!(feats.md5.len(), 32);
         assert!(feats.clarity.is_finite());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decode_png_content_with_jpg_extension() {
+        // 回归：.jpg 扩展名但实际是 PNG 内容，decode_image 应能解码（不依赖扩展名）
+        let dir = std::env::temp_dir().join(format!(
+            "moevault_feat_mismatch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fake.jpg"); // PNG 内容 + jpg 扩展名
+        let img = image::RgbImage::from_pixel(64, 48, image::Rgb([10, 200, 30]));
+        img.save(&path).unwrap();
+
+        let dyn_img = decode_image(&path).expect("decode_image 应能解 jpg 扩展名的 PNG 内容");
+        assert_eq!(dyn_img.dimensions(), (64, 48));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

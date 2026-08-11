@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ArrowDown, ArrowRight } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowRight, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, type ImageItem } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
@@ -255,15 +255,32 @@ function fmtDate(date: string) {
 }
 
 watch([sauceFilter, tagFilter, aiFilter], loadTree)
-// 导入完成后刷新主目录（新图自动分组出现）
+// 导入完成后刷新主目录（新图自动分组出现）；keep-alive 切回时也刷新
 onMounted(() => {
   library.fetchImages(50).catch(() => {})
   loadTree()
   window.addEventListener('moevault:import-done', loadTree)
 })
+onActivated(loadTree)
 onUnmounted(() => {
   window.removeEventListener('moevault:import-done', loadTree)
 })
+
+/** 手动刷新主目录。 */
+function refresh() {
+  loadTree()
+}
+
+/** 重新解析解码失败的图片（width=0），修复基本信息/缩略图。 */
+async function reprocessBroken() {
+  try {
+    const r = await post<{ reprocessed: number; failed: number }>('/images/reprocess')
+    ElMessage.success(`重新解析完成：成功 ${r.reprocessed} 张${r.failed > 0 ? `，失败 ${r.failed} 张（多为文件缺失）` : ''}`)
+    loadTree()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
 </script>
 
 <template>
@@ -289,6 +306,8 @@ onUnmounted(() => {
         </el-select>
       </div>
       <div class="spacer" />
+      <el-button :icon="Refresh" circle title="刷新" @click="refresh" />
+      <el-button plain @click="reprocessBroken" title="重新解析解码失败的图片（修复基本信息/缩略图）">重新解析</el-button>
       <template v-if="selectedCount > 0">
         <el-button type="danger" plain @click="onBatchDelete">删除所选 ({{ selectedCount }})</el-button>
         <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>

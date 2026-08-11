@@ -14,7 +14,7 @@ pub mod phash;
 pub mod scan;
 
 pub use features::{extract_features, ImageFeatures};
-pub use importer::{run_import, ImportProgress};
+pub use importer::{reprocess_broken_images, run_import, ImportProgress};
 pub use scan::collect_images;
 
 /// 支持的图片扩展名（小写）。

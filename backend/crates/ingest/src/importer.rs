@@ -211,10 +211,8 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), IngestError> {
 /// 生成 512px WebP 缩略图（best-effort：失败仅告警，不阻塞入库）。
 fn generate_thumbnail(src: &Path, dst: &Path) {
     let result = (|| -> Result<(), IngestError> {
-        let img = image::open(src).map_err(|source| IngestError::Image {
-            path: src.display().to_string(),
-            source,
-        })?;
+        // 按文件头嗅探解码（修复 jpg 实际是 PNG 时缩略图失败）
+        let img = crate::features::decode_image(src)?;
         let (w, h) = img.dimensions();
         let scale = (THUMB_CARD_PX as f64 / w.max(h) as f64).min(1.0);
         let thumb = if scale < 1.0 {
@@ -247,6 +245,43 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 重新解析解码失败的图片（width=0 或 height=0）。
+/// 用按文件头嗅探的新解码逻辑重新提取尺寸/清晰度/phash，并重新生成缩略图。
+/// 返回处理成功的数量。
+pub fn reprocess_broken_images(
+    db: &Db,
+    library_dir: &Path,
+    thumbs_dir: &Path,
+) -> Result<(usize, usize), IngestError> {
+    let ids = db.list_broken_images(1000)?;
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for id in ids {
+        let Some(img) = db.get_image_by_id(id)? else { continue };
+        let src = library_dir.join(&img.rel_path);
+        // 解码（新逻辑：按文件头嗅探）
+        match crate::features::decode_image(&src) {
+            Ok(dyn_img) => {
+                let (w, h) = dyn_img.dimensions();
+                let clarity = crate::clarity::clarity(&dyn_img);
+                let phash = crate::phash::phash(&dyn_img) as i64;
+                db.update_image_dimensions(id, w as i64, h as i64, clarity, phash)?;
+                // 重新生成缩略图
+                let thumb_rel = img.thumb_rel.clone();
+                let thumb_path = thumbs_dir.join(&thumb_rel);
+                generate_thumbnail(&src, &thumb_path);
+                ok += 1;
+                info!(image_id = id, w, h, "重新解析成功");
+            }
+            Err(e) => {
+                warn!(image_id = id, error = %e, "重新解析仍失败");
+                failed += 1;
+            }
+        }
+    }
+    Ok((ok, failed))
 }
 
 #[cfg(test)]

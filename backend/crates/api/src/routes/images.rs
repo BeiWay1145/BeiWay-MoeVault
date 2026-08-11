@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/images/{id}/ai-info", post(read_ai_info))
         .route("/api/v1/images/{id}/mark-ai", post(mark_ai))
         .route("/api/v1/images/{id}/source-url", put(update_source_url))
+        .route("/api/v1/images/reprocess", post(reprocess_images))
 }
 
 /// GET /api/v1/images/{id}/file：返回原图（stream）。
@@ -446,4 +447,21 @@ async fn stats(
         .map_err(join_error_response)?
         .map_err(db_error_response)?;
     Ok(Json(s))
+}
+
+/// POST /api/v1/images/reprocess：重新解析解码失败的图片（width=0 的图），
+/// 重新提取尺寸/清晰度并生成缩略图。
+async fn reprocess_images(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let library = state.library_dir();
+    let thumbs = state.thumbs_dir();
+    let (ok, failed) = tokio::task::spawn_blocking(move || {
+        moevault_ingest::reprocess_broken_images(&db, &library, &thumbs)
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
+    Ok(Json(json!({ "ok": true, "reprocessed": ok, "failed": failed })))
 }

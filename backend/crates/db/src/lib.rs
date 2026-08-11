@@ -1162,6 +1162,38 @@ impl Db {
         Ok(())
     }
 
+    /// 更新图片尺寸/清晰度/phash（重新解析后写回）。
+    pub fn update_image_dimensions(
+        &self,
+        image_id: i64,
+        width: i64,
+        height: i64,
+        clarity: f64,
+        phash: i64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET width = ?2, height = ?3, clarity_score = ?4, phash = ?5 WHERE id = ?1",
+            params![image_id, width, height, clarity, phash],
+        )?;
+        Ok(())
+    }
+
+    /// 解码失败的图片（width=0 或 height=0 的 active 图）。
+    pub fn list_broken_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 1000);
+        let mut stmt = conn.prepare(
+            "SELECT id FROM images WHERE status = 'active' AND (width = 0 OR height = 0) ORDER BY id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// 标签列表（含关联图数，按图数降序）。
     /// 修改标签分类（artist/copyright/character/general）。
     pub fn set_tag_category(&self, tag_id: i64, category: &str) -> Result<(), DbError> {
