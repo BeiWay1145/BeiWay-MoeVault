@@ -111,7 +111,7 @@ pub struct RetagRequest {
 /// 从 settings 表读取打标配置。返回 (api_keys, min_sim, tag_threshold, model_dir)。
 /// 多 key 优先读 saucenao_keys JSON（含名称/等级），回退旧逗号分隔。
 #[allow(clippy::type_complexity)]
-fn read_tag_config(
+pub(crate) fn read_tag_config_public(
     db: &moevault_db::Db,
 ) -> Result<(Vec<moevault_core::models::SauceNaoKey>, f64, f64, Option<String>), (axum::http::StatusCode, Json<Value>)> {
     // 多 key：优先 saucenao_keys JSON
@@ -163,7 +163,7 @@ fn read_tag_config(
 /// - 首次：尝试从快照文件恢复（key 匹配则恢复配额），否则新建
 /// - 设置持久化路径（状态变更自动保存）
 /// - 复用已初始化的 pool（配额/冷却跨请求保持）
-async fn get_or_init_pool(
+pub(crate) async fn init_pool_public(
     state: &AppState,
     keys_cfg: &[moevault_core::models::SauceNaoKey],
 ) -> Result<Arc<ApiKeyPool>, (axum::http::StatusCode, Json<Value>)> {
@@ -217,7 +217,7 @@ async fn run_tagging(
     // 从 settings 读配置（spawn_blocking 包同步 DB 访问）
     let db_for_config = state.db.clone();
     let (api_keys, min_sim, tag_threshold, model_dir) = tokio::task::spawn_blocking(move || {
-        read_tag_config(&db_for_config)
+        read_tag_config_public(&db_for_config)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -245,7 +245,7 @@ async fn run_tagging(
     // 同步打标模型目录到推理服务
     sync_tagger_model(&state, &model_dir).await;
 
-    let pool = get_or_init_pool(&state, &api_keys).await?;
+    let pool = init_pool_public(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
     let infer = InferClient::new(infer_base);
     let library_dir = st.library_dir();
@@ -296,7 +296,7 @@ async fn run_sauce(
     // 配置
     let db_for_config = state.db.clone();
     let (api_keys, min_sim, _, _) = tokio::task::spawn_blocking(move || {
-        read_tag_config(&db_for_config)
+        read_tag_config_public(&db_for_config)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -319,7 +319,7 @@ async fn run_sauce(
     .map_err(join_error_response)?
     .map_err(db_error_response)?;
 
-    let pool = get_or_init_pool(&state, &api_keys).await?;
+    let pool = init_pool_public(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
     let infer = InferClient::new(st.infer_base_url.clone());
     let library_dir = st.library_dir();
@@ -335,13 +335,21 @@ async fn run_sauce(
             &library_dir,
             min_sim,
             force_ids,
+            Some(job_id),
         )
         .await;
         let (status, done, failed, error) = match &result {
             Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
-        let _ = db.update_job(job_id, status, done, failed, error.as_deref());
+        // 若任务已被取消（中断），保持 cancelled 状态（不覆盖为 done）
+        let final_status =
+            if db.get_job(job_id).ok().flatten().map(|j| j.status) == Some("cancelled".into()) {
+                "cancelled"
+            } else {
+                status
+            };
+        let _ = db.update_job(job_id, final_status, done, failed, error.as_deref());
         let event = match result {
             Ok(progress) => json!({
                 "type": "task.done",
@@ -452,7 +460,7 @@ async fn retag_image(
     // 配置
     let db_for_config = state.db.clone();
     let (api_keys, min_sim, tag_threshold, model_dir) = tokio::task::spawn_blocking(move || {
-        read_tag_config(&db_for_config)
+        read_tag_config_public(&db_for_config)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -474,7 +482,7 @@ async fn retag_image(
     // 同步打标模型目录到推理服务
     sync_tagger_model(&state, &model_dir).await;
 
-    let pool = get_or_init_pool(&state, &api_keys).await?;
+    let pool = init_pool_public(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
     let infer = InferClient::new(infer_base);
     let library_dir = st.library_dir();

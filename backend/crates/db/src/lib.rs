@@ -1153,6 +1153,26 @@ impl Db {
         )?;
         Ok(n as i64)
     }
+
+    /// 标记任务为 cancelled（供中断）。
+    pub fn cancel_job(&self, job_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'cancelled', finished_at = ?2, updated_at = ?2 WHERE id = ?1 AND status IN ('pending','running')",
+            params![job_id, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// 重新标记任务为 pending（供继续，重置计数并清错误）。
+    pub fn resume_job(&self, job_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'pending', done = 0, failed = 0, error = NULL, finished_at = NULL, updated_at = ?2 WHERE id = ?1",
+            params![job_id, now_secs()],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_job(r: &Row) -> rusqlite::Result<Job> {

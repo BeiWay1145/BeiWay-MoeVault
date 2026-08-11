@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use moevault_core::ErrorKind;
@@ -20,6 +20,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/tasks", get(list_tasks).delete(clear_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
+        .route("/api/v1/tasks/{id}/cancel", post(cancel_task))
+        .route("/api/v1/tasks/{id}/resume", post(resume_task))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -133,4 +135,130 @@ async fn clear_tasks(
         .map_err(join_error_response)?
         .map_err(db_error_response)?;
     Ok(Json(json!({ "ok": true, "cleared": n })))
+}
+
+/// POST /api/v1/tasks/{id}/cancel：中断任务（置 cancelled，worker 检测后停止）。
+async fn cancel_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        // 校验任务存在
+        if db.get_job(id).map_err(db_error_response)?.is_none() {
+            return Err(error_response(ErrorKind::NotFound, format!("任务 {id} 不存在")));
+        }
+        db.cancel_job(id).map_err(db_error_response)?;
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(json!({ "ok": true, "cancelled": true, "job_id": id })))
+}
+
+/// POST /api/v1/tasks/{id}/resume：继续被中断的任务（重新从 payload 的 image_ids 入队，
+/// 已处理的图由 filter_eligible 自动跳过）。
+async fn resume_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let st = state.clone();
+    let job = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.get_job(id)
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(db_error_response)?;
+    let Some(job) = job else {
+        return Err(error_response(ErrorKind::NotFound, format!("任务 {id} 不存在")));
+    };
+    if job.status != "cancelled" {
+        return Err(error_response(ErrorKind::InvalidInput, "只有已中断（cancelled）的任务可以继续"));
+    }
+    // 从 payload 提取 image_ids
+    let ids: Vec<i64> = job
+        .payload
+        .as_deref()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("image_ids").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<i64>>(v).ok())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Err(error_response(ErrorKind::InvalidInput, "任务负载中没有图片 id，无法继续"));
+    }
+    // 重新置为 pending（清空计数），重新启动溯源管线
+    tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.resume_job(id)
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(db_error_response)?;
+
+    // 读取配置并启动管线（与 run_sauce 相同逻辑，但用已存 ids）
+    let db_for_config = state.db.clone();
+    let (api_keys, min_sim, _, _) = tokio::task::spawn_blocking(move || {
+        super::tagging::read_tag_config_public(&db_for_config)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    if api_keys.is_empty() {
+        return Err(error_response(ErrorKind::InvalidInput, "未配置 SauceNAO API key"));
+    }
+    let pool = {
+        let slot = st.sauce_pool.read().await;
+        match slot.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                // 尚未初始化：用配置初始化
+                drop(slot);
+                super::tagging::init_pool_public(&st, &api_keys).await?
+            }
+        }
+    };
+    let sauce = std::sync::Arc::new(moevault_tagger::SauceNaoClient::new(min_sim));
+    let infer = moevault_tagger::InferClient::new(st.infer_base_url.clone());
+    let library_dir = st.library_dir();
+    let ids_len = ids.len();
+
+    tokio::spawn(async move {
+        let db = st.db.clone();
+        let _ = db.start_job(id, ids_len as i64);
+        let result = moevault_tagger::run_sauce_pipeline(
+            &db,
+            &sauce,
+            &pool,
+            &infer,
+            &library_dir,
+            min_sim,
+            Some(ids),
+            Some(id),
+        )
+        .await;
+        let (status, done, failed, error) = match &result {
+            Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
+            Err(e) => ("failed", 0, 0, Some(e.to_string())),
+        };
+        let final_status =
+            if db.get_job(id).ok().flatten().map(|j| j.status) == Some("cancelled".into()) {
+                "cancelled"
+            } else {
+                status
+            };
+        let _ = db.update_job(id, final_status, done, failed, error.as_deref());
+        let event = match result {
+            Ok(progress) => json!({
+                "type": "task.done",
+                "payload": { "job_id": id, "kind": "sauce", "done": progress.done, "failed": progress.failed, "total": progress.total },
+            }),
+            Err(e) => json!({
+                "type": "task.failed",
+                "payload": { "job_id": id, "kind": "sauce", "error": e.to_string() },
+            }),
+        };
+        st.broadcast(event.to_string());
+    });
+
+    Ok(Json(json!({ "ok": true, "resumed": true, "job_id": id, "ids": ids_len })))
 }

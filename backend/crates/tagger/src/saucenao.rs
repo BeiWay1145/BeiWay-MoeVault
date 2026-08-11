@@ -39,6 +39,7 @@ pub struct QuotaHeaders {
 }
 
 /// SauceNAO 客户端（无状态，key 由调用方传入）。
+#[derive(Clone)]
 pub struct SauceNaoClient {
     http: reqwest::Client,
     min_sim: f64,

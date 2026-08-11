@@ -76,6 +76,7 @@ function fmtSize(bytes: number) {
       <span v-if="image.isRedundant" class="badge redundant" title="冗余候选（同组存在更清晰图）">⚠ 模糊</span>
       <span v-if="image.aesthetic" class="badge aesthetic" title="美学评分">⭐ {{ image.aesthetic.toFixed(1) }}</span>
       <span v-if="image.isAi" class="badge ai" title="AI 生成">AI</span>
+      <span v-else class="badge not-ai" title="非 AI 生成">非AI</span>
       <button
         class="delete-btn"
         :class="{ armed }"
@@ -166,6 +167,12 @@ function fmtSize(bytes: number) {
   bottom: 6px;
   top: auto;
   background: rgba(103, 194, 58, 0.9);
+}
+.badge.not-ai {
+  left: 6px;
+  bottom: 6px;
+  top: auto;
+  background: rgba(144, 147, 153, 0.85);
 }
 /* 右下角 32px 半透明圆底叉号（增强2）：单击变色待确认，再点删除；Shift+点击直接删除 */
 .delete-btn {

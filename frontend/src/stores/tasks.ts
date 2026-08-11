@@ -139,6 +139,18 @@ export const useTaskStore = defineStore('tasks', () => {
     notified.value = new Set()
   }
 
+  /** 中断任务（置 cancelled，worker 检测后停止）。 */
+  async function cancelTask(id: number) {
+    await post(`/tasks/${id}/cancel`)
+    load()
+  }
+
+  /** 继续被中断的任务（重新从 payload 入队，已处理图自动跳过）。 */
+  async function resumeTask(id: number) {
+    await post(`/tasks/${id}/resume`)
+    load()
+  }
+
   return {
     tasks,
     running,
@@ -149,6 +161,8 @@ export const useTaskStore = defineStore('tasks', () => {
     enqueueTag,
     enqueueAesthetic,
     enqueueSauce,
+    cancelTask,
+    resumeTask,
     resetNotified,
   }
 })

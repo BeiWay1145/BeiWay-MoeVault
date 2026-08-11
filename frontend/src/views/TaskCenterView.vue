@@ -54,6 +54,35 @@ const statusText = (s: string) =>
 const runningTasks = computed(() => taskStore.tasks.filter((t) => t.status === 'running' || t.status === 'pending'))
 const failedTasks = computed(() => taskStore.tasks.filter((t) => t.status === 'failed'))
 const doneTasks = computed(() => taskStore.tasks.filter((t) => t.status === 'done'))
+const cancelledTasks = computed(() => taskStore.tasks.filter((t) => t.status === 'cancelled'))
+
+/** 中断任务。 */
+async function onCancel(id: number) {
+  try {
+    await ElMessageBox.confirm('中断该任务？已处理的图片保留，未处理的可稍后「继续」。', '中断任务', {
+      type: 'warning',
+      confirmButtonText: '中断',
+    })
+  } catch {
+    return
+  }
+  try {
+    await taskStore.cancelTask(id)
+    ElMessage.success('任务已中断')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 继续被中断的任务。 */
+async function onResume(id: number) {
+  try {
+    await taskStore.resumeTask(id)
+    ElMessage.success('任务已重新开始，已处理的图片将自动跳过')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
 
 function fmtTime(ts: number | null | undefined) {
   if (!ts) return '—'
@@ -73,6 +102,7 @@ function fmtTime(ts: number | null | undefined) {
         <div class="task-head">
           <span>{{ t.typeLabel }} #{{ t.id }}</span>
           <span class="num-mono">{{ t.done }}/{{ t.total }}</span>
+          <el-button size="small" type="danger" plain @click="onCancel(t.id)">中断</el-button>
         </div>
         <el-progress :percentage="t.total > 0 ? Math.round((t.done / t.total) * 100) : 0" :stroke-width="10" />
       </div>
@@ -90,6 +120,31 @@ function fmtTime(ts: number | null | undefined) {
         <el-table-column prop="error" label="错误信息" />
         <el-table-column label="时间" width="150">
           <template #default="{ row }">{{ fmtTime(row.createdAt) }}</template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card class="block" header="已中断（可继续）">
+      <el-empty
+        v-if="cancelledTasks.length === 0"
+        description="无已中断任务"
+        :image-size="60"
+      />
+      <el-table :data="cancelledTasks">
+        <el-table-column prop="id" label="ID" width="70" />
+        <el-table-column prop="typeLabel" label="类型" width="110" />
+        <el-table-column label="进度" width="120">
+          <template #default="{ row }">
+            <span class="num-mono">{{ row.done }}/{{ row.total }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="创建时间" width="150">
+          <template #default="{ row }">{{ fmtTime(row.createdAt) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="110">
+          <template #default="{ row }">
+            <el-button size="small" type="primary" plain @click="onResume(row.id)">继续</el-button>
+          </template>
         </el-table-column>
       </el-table>
     </el-card>

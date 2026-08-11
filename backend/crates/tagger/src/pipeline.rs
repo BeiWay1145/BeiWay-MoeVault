@@ -280,7 +280,8 @@ async fn tag_one(
     }
 
     // 2. 溯源（SauceNAO + booru 爬标签）；None = 未命中/失败（回退本地打标）
-    let hit = match sauce_one(db, sauce, pool, infer, library_dir, min_sim, image_id).await? {
+    let (api_key, key_idx) = pool.acquire().await;
+    let hit = match sauce_one(db, sauce, pool, infer, library_dir, min_sim, image_id, api_key, key_idx).await? {
         Some(h) => h,
         None => {
             return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
@@ -295,7 +296,7 @@ async fn tag_one(
     Ok(())
 }
 
-/// 单图 SauceNAO 溯源 + booru 爬标签。
+/// 单图 SauceNAO 溯源 + booru 爬标签（key 由调用方传入——并发调度器已 acquire）。
 /// 返回 Some(命中) 或 None（未命中/失败，已写缓存与不可溯源标记；调用方决定回退策略）。
 /// AI 生成图直接返回 Ok(None)（不消耗配额）。
 #[allow(clippy::too_many_arguments)]
@@ -307,6 +308,8 @@ async fn sauce_one(
     library_dir: &Path,
     min_sim: f64,
     image_id: i64,
+    api_key: String,
+    key_idx: usize,
 ) -> Result<Option<SauceHit>, TaggerError> {
     let img = db
         .get_image_by_id(image_id)?
@@ -326,9 +329,6 @@ async fn sauce_one(
         return Ok(None);
     }
 
-    // 从调度器获取可用 key
-    let (api_key, key_idx) = pool.acquire().await;
-
     // SauceNAO 溯源（带 key）；失败也携带配额头，用于更新调度器
     let (result, quota) = match sauce.search_file(&file_path, &api_key).await {
         Ok(r) => r,
@@ -345,9 +345,9 @@ async fn sauce_one(
             return Ok(None);
         }
     };
-    // 成功：更新配额头 + 进入短冷却（保守 5s，防连发撞限流）
+    // 成功：更新配额头 + 进入短窗口冷却（30s，SauceNAO 免费账号真实限制）
     pool.update(key_idx, quota.short_remaining, quota.long_remaining).await;
-    pool.start_cooldown(key_idx, 5).await;
+    pool.start_cooldown(key_idx, 30).await;
 
     // 有效判定：相似度 ≥ 阈值 且 ext_urls 含 booru 链接
     if result.similarity < min_sim {
@@ -372,6 +372,9 @@ async fn sauce_one(
 
 /// 溯源专用管线：只做 SauceNAO 溯源 + booru 爬标签（失败不本地打标）。
 /// - `image_ids`：None = 全部未溯源 active 图；Some = 指定图（强制重新溯源）。
+/// - 并发调度：按可用 key 数起 worker，每个 worker 从共享队列取图处理，
+///   单 key 串行（30s 短窗口冷却），多 key 并行推进——大批量不再被单 key 冷却拖死。
+/// - `job_id`：传入时每处理完一张检查 job 状态，cancelled 则停止（供中断）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sauce_pipeline(
     db: &Db,
@@ -381,6 +384,7 @@ pub async fn run_sauce_pipeline(
     library_dir: &Path,
     min_sim: f64,
     image_ids: Option<Vec<i64>>,
+    job_id: Option<i64>,
 ) -> Result<SauceProgress, TaggerError> {
     let ids = match image_ids {
         Some(ids) => {
@@ -402,34 +406,128 @@ pub async fn run_sauce_pipeline(
     for id in &ids {
         db.set_no_auto_sauce(*id, false)?;
     }
-    let mut progress = SauceProgress {
+
+    // 共享工作队列 + 进度（并发 worker 共同消费）
+    let queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(ids.iter().copied().collect()));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(SauceProgress {
         total: ids.len(),
         ..Default::default()
-    };
+    }));
 
-    for image_id in &ids {
-        match sauce_one(db, sauce, pool, infer, library_dir, min_sim, *image_id).await {
-            Ok(Some(hit)) => {
-                // 写标签 + source
-                save_tags(db, *image_id, &hit.source, Some(&hit.source_url), &hit.tags, hit.similarity)?;
-                if let Ok(Some(img)) = db.get_image_by_id(*image_id) {
-                    db.put_sauce_cache(&img.md5, hit.similarity, Some(&hit.source), Some(&hit.source_url), None)?;
+    // worker 数 = 可用 key 数（至少 1）
+    let worker_count = pool.len().await.max(1);
+    // SauceNaoClient / InferClient 无 Sync 要求但需 'static：Arc 包装
+    let sauce = std::sync::Arc::new(sauce.clone());
+    let infer = std::sync::Arc::new(infer.clone());
+    let mut handles = Vec::new();
+    for _ in 0..worker_count {
+        let queue = queue.clone();
+        let progress = progress.clone();
+        let db = db.clone();
+        let sauce = sauce.clone();
+        let pool = pool.clone();
+        let infer = infer.clone();
+        let library_dir = library_dir.to_path_buf();
+        handles.push(tokio::spawn(async move {
+            loop {
+                // 中断检查：任务被取消则停止（每轮处理前查一次 DB）
+                if let Some(jid) = job_id {
+                    if let Ok(Some(job)) = db.get_job(jid) {
+                        if job.status == "cancelled" {
+                            break;
+                        }
+                    }
                 }
-                db.set_image_source(*image_id, &hit.source, Some(&hit.source_url))?;
-                progress.done += 1;
+                // 取下一张图
+                let image_id = {
+                    let mut q = queue.lock().unwrap();
+                    q.pop_front()
+                };
+                let Some(image_id) = image_id else { break };
+
+                // acquire 会等待可用 key（含 30s 冷却结束后放行）
+                let (api_key, key_idx) = pool.acquire().await;
+                match sauce_one(
+                    &db,
+                    &sauce,
+                    &pool,
+                    &infer,
+                    &library_dir,
+                    min_sim,
+                    image_id,
+                    api_key,
+                    key_idx,
+                )                .await
+                {
+                    Ok(Some(hit)) => {
+                        // 写标签 + source
+                        save_tags(&db, image_id, &hit.source, Some(&hit.source_url), &hit.tags, hit.similarity)?;
+                        if let Ok(Some(img)) = db.get_image_by_id(image_id) {
+                            db.put_sauce_cache(&img.md5, hit.similarity, Some(&hit.source), Some(&hit.source_url), None)?;
+                        }
+                        db.set_image_source(image_id, &hit.source, Some(&hit.source_url))?;
+                        let mut p = progress.lock().unwrap();
+                        p.done += 1;
+                        let (d, f) = (p.done, p.failed);
+                        drop(p);
+                        // 实时写回 job 进度（任务中心能看到推进）
+                        if let Some(jid) = job_id {
+                            let _ = db.update_job(jid, "running", d as i64, f as i64, None);
+                        }
+                    }
+                    Ok(None) => {
+                        info!(image_id, "溯源无命中");
+                        let mut p = progress.lock().unwrap();
+                        p.failed += 1;
+                        let (d, f) = (p.done, p.failed);
+                        drop(p);
+                        if let Some(jid) = job_id {
+                            let _ = db.update_job(jid, "running", d as i64, f as i64, None);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(image_id, error = %e, "溯源失败");
+                        let mut p = progress.lock().unwrap();
+                        p.failed += 1;
+                        let (d, f) = (p.done, p.failed);
+                        drop(p);
+                        if let Some(jid) = job_id {
+                            let _ = db.update_job(jid, "running", d as i64, f as i64, None);
+                        }
+                    }
+                }
             }
-            Ok(None) => {
-                info!(image_id, "溯源无命中");
-                progress.failed += 1;
-            }
-            Err(e) => {
-                warn!(image_id, error = %e, "溯源失败");
-                progress.failed += 1;
+            Ok::<(), TaggerError>(())
+        }));
+    }
+    // 等待所有 worker 完成（任一个出错则停止整体）
+    let mut first_err: Option<TaggerError> = None;
+    for h in handles {
+        if let Err(e) = h.await {
+            let msg = if e.is_panic() {
+                "溯源 worker panic".to_string()
+            } else {
+                format!("溯源 worker 失败: {e}")
+            };
+            if first_err.is_none() {
+                first_err = Some(TaggerError::Invalid(msg));
             }
         }
     }
-    info!(done = progress.done, failed = progress.failed, "溯源管线完成");
-    Ok(progress)
+    // 中断：剩余未处理数 = 队列剩余
+    let remaining = queue.lock().unwrap().len();
+    let progress = progress.lock().unwrap();
+    info!(
+        done = progress.done,
+        failed = progress.failed,
+        remaining,
+        "溯源管线结束"
+    );
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(*progress)
 }
 
 /// 保存标签（tags upsert + image_tags 写入）。
