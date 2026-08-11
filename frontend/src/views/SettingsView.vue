@@ -136,6 +136,10 @@ onMounted(async () => {
           <el-form-item label="库目录">
             <el-input v-model="settings.settings.library_dir" placeholder="data/library" />
           </el-form-item>
+          <el-form-item label="关闭时最小化到托盘">
+            <el-switch v-model="settings.settings.close_to_tray" active-text="开启" inactive-text="关闭" />
+            <span class="hint">开启后点关闭按钮最小化到系统托盘（后台任务继续），托盘图标可恢复/退出</span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 

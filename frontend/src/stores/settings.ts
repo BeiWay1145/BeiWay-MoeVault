@@ -23,6 +23,8 @@ export interface SettingsState {
   /** E6: 画廊/搜索分页模式（默认关闭） */
   pagination_enabled: boolean
   page_size: number
+  /** 关闭窗口时最小化到托盘（默认关闭=正常退出） */
+  close_to_tray: boolean
 }
 
 const defaults: SettingsState = {
@@ -38,6 +40,7 @@ const defaults: SettingsState = {
   library_dir: 'data/library',
   pagination_enabled: false,
   page_size: 50,
+  close_to_tray: false,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -62,6 +65,7 @@ export const useSettingsStore = defineStore('settings', () => {
         library_dir: String(s.library_dir ?? defaults.library_dir),
         pagination_enabled: s.pagination_enabled === true || s.pagination_enabled === 'true',
         page_size: s.page_size != null ? Number(s.page_size) : defaults.page_size,
+        close_to_tray: s.close_to_tray === true || s.close_to_tray === 'true',
       }
       loaded.value = true
     } catch {
@@ -83,6 +87,7 @@ export const useSettingsStore = defineStore('settings', () => {
       library_dir: settings.value.library_dir,
       pagination_enabled: String(settings.value.pagination_enabled),
       page_size: String(settings.value.page_size),
+      close_to_tray: String(settings.value.close_to_tray),
     })
   }
 

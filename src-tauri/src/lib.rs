@@ -8,8 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use tauri::Manager;
-use tauri::WindowEvent;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
 
 const BACKEND_URL: &str = "http://127.0.0.1:9178";
 const BACKEND_PORT: u16 = 9178;
@@ -18,15 +18,66 @@ const BACKEND_PORT: u16 = 9178;
 pub fn run() {
   tauri::Builder::default()
     .on_window_event(|window, event| {
-      // 增强：关闭窗口 = 最小化到任务栏（后台批量处理不被中断）；再次单击任务栏图标恢复
+      // 关闭窗口：根据后端设置 close_to_tray 决定 最小化到托盘 or 正常退出
       if let WindowEvent::CloseRequested { api, .. } = event {
         if window.label() == "main" {
-          let _ = window.minimize();
-          api.prevent_close();
+          let close_to_tray = read_close_to_tray_setting();
+          if close_to_tray {
+            let _ = window.hide();
+            api.prevent_close();
+          }
+          // 关闭=正常退出：不 prevent_close，窗口关闭后应用退出（后端子进程随之清理）
         }
       }
     })
     .setup(|app| {
+      // 托盘图标：单击恢复窗口，右键菜单 显示/退出
+      use tauri::menu::{Menu, MenuItem};
+      let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+      let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+      let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+      let _tray = TrayIconBuilder::new()
+        .icon(
+          app
+            .default_window_icon()
+            .cloned()
+            .expect("默认窗口图标缺失"),
+        )
+        .tooltip("BeiWay-MoeVault")
+        .on_tray_icon_event(|tray, event| {
+          if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+          } = event
+          {
+            let app = tray.app_handle();
+            if let Some(win) = app.get_webview_window("main") {
+              let _ = win.show();
+              let _ = win.unminimize();
+              let _ = win.set_focus();
+            }
+          }
+        })
+        .menu(&tray_menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+          "show" => {
+            if let Some(win) = app.get_webview_window("main") {
+              let _ = win.show();
+              let _ = win.unminimize();
+              let _ = win.set_focus();
+            }
+          }
+          "quit" => {
+            app.exit(0);
+          }
+          _ => {}
+        })
+        .build(app)
+        .expect("托盘图标创建失败");
+      std::mem::forget(_tray); // 防止 drop 移除托盘图标
+
       // 启动后端
       match start_backend() {
         Ok(child) => {
@@ -50,6 +101,40 @@ pub fn run() {
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+/// 读取后端设置 close_to_tray（同步 HTTP GET，localhost 延迟可忽略）。
+/// 后端未就绪/读取失败时返回 false（正常退出，避免意外隐藏窗口）。
+fn read_close_to_tray_setting() -> bool {
+  use std::io::{Read, Write};
+  if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+    &format!("127.0.0.1:{BACKEND_PORT}").parse().unwrap(),
+    std::time::Duration::from_millis(500),
+  ) {
+    let _ = stream.write_all(
+      b"GET /api/v1/settings HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+      match stream.read(&mut chunk) {
+        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+        _ => break,
+      }
+    }
+    // 提取 JSON body（最后一个 \r\n\r\n 之后）
+    if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+      let body = &buf[idx + 4..];
+      if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return v
+          .get("close_to_tray")
+          .and_then(|x| x.as_str())
+          .map(|s| s == "true")
+          .unwrap_or(false);
+      }
+    }
+  }
+  false
 }
 
 /// 启动后端进程。

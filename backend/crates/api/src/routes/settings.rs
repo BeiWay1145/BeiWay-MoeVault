@@ -34,6 +34,7 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "library_dir",
     "pagination_enabled",
     "page_size",
+    "close_to_tray",
 ];
 
 pub fn router() -> Router<AppState> {
