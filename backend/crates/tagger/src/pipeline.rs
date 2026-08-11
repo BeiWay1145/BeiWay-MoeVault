@@ -38,7 +38,7 @@ pub struct SauceProgress {
 pub struct SauceHit {
     pub source: String,
     pub source_url: String,
-    pub tags: Vec<String>,
+    pub tags: Vec<crate::booru::BooruTag>,
     pub similarity: f64,
 }
 
@@ -122,6 +122,40 @@ impl InferClient {
     }
 }
 
+/// 任务过滤：批量模式下排除无需处理的图片（不浪费配额）。
+/// - `tag`：排除 AI 生成、已有自动标签、不可溯源
+/// - `sauce`：排除 AI 生成、不可溯源、已溯源（有 source_url 或非 local 来源）
+/// - `aesthetic`：排除已有美学分
+pub(crate) fn filter_eligible(
+    db: &Db,
+    kind: &str,
+    ids: &[i64],
+) -> Result<Vec<i64>, TaggerError> {
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(img) = db.get_image_by_id(*id)? else { continue };
+        let tags = db.image_tags(*id).unwrap_or_default();
+        let is_ai = img.ai_metadata.is_some()
+            || tags.iter().any(|t| t.source == "ai");
+        let has_auto_tags = tags
+            .iter()
+            .any(|t| matches!(t.source.as_str(), "auto_danbooru" | "auto_gelbooru" | "auto_local"));
+        let is_sauced = img.source_url.is_some() || (img.source != "local" && !img.source.is_empty());
+        let eligible = match kind {
+            "tag" => !is_ai && !has_auto_tags && !img.no_auto_sauce,
+            "sauce" => !is_ai && !img.no_auto_sauce && !is_sauced,
+            "aesthetic" => img.aesthetic_score.is_none(),
+            _ => true,
+        };
+        if eligible {
+            out.push(*id);
+        } else {
+            tracing::info!(image_id = *id, kind, "批量任务跳过（无需处理）");
+        }
+    }
+    Ok(out)
+}
+
 /// 执行打标流水线。
 ///
 /// - `db`：SQLite
@@ -145,7 +179,14 @@ pub async fn run_tag_pipeline(
 ) -> Result<TagProgress, TaggerError> {
     let is_force = image_ids.is_some();
     let ids = match image_ids {
-        Some(ids) => ids,
+        Some(ids) => {
+            // 批量（>1 张）过滤无需处理的图；单张（详情页手动）保留强制语义
+            if ids.len() > 1 {
+                filter_eligible(db, "tag", &ids)?
+            } else {
+                ids
+            }
+        }
         None => db.untagged_active_images(10000)?,
     };
     if ids.is_empty() {
@@ -336,7 +377,14 @@ pub async fn run_sauce_pipeline(
     image_ids: Option<Vec<i64>>,
 ) -> Result<SauceProgress, TaggerError> {
     let ids = match image_ids {
-        Some(ids) => ids,
+        Some(ids) => {
+            // 批量（>1 张）过滤无需处理的图；单张（详情页手动）保留强制语义
+            if ids.len() > 1 {
+                filter_eligible(db, "sauce", &ids)?
+            } else {
+                ids
+            }
+        }
         None => db.untagged_active_images(10000)?,
     };
     if ids.is_empty() {
@@ -380,18 +428,19 @@ pub async fn run_sauce_pipeline(
 
 /// 保存标签（tags upsert + image_tags 写入）。
 /// image_tags.source 遵守 CHECK 约束（auto_danbooru/auto_gelbooru/auto_local/manual）。
+/// category 按 danbooru 分类落库（artist/copyright/character/general）。
 fn save_tags(
     db: &Db,
     image_id: i64,
     source: &str,
     source_url: Option<&str>,
-    tags: &[String],
+    tags: &[crate::booru::BooruTag],
     _similarity: f64,
 ) -> Result<(), TaggerError> {
     let db_source = format!("auto_{source}");
     let mut tag_ids = Vec::new();
-    for name in tags {
-        let id = db.upsert_tag(name, "general")?;
+    for t in tags {
+        let id = db.upsert_tag(&t.name, &t.category)?;
         tag_ids.push((id, None));
     }
     db.insert_image_tags(image_id, &tag_ids, &db_source)?;

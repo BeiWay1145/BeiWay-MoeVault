@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { Plus } from '@element-plus/icons-vue'
+import { Plus, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { get } from '@/api/client'
+import { get, put } from '@/api/client'
 
 interface TagItem {
   id: number
@@ -18,16 +18,52 @@ const tags = ref<TagItem[]>([])
 const loading = ref(false)
 const cnDict = ref(false)
 const newName = ref('')
+const keyword = ref('')
+
+const categoryOptions = [
+  { value: 'artist', label: '画师' },
+  { value: 'copyright', label: '系列/作品' },
+  { value: 'character', label: '角色' },
+  { value: 'general', label: '常规' },
+]
+
+const categoryTagType: Record<string, 'danger' | 'warning' | 'success' | 'primary' | 'info'> = {
+  artist: 'danger',
+  copyright: 'warning',
+  character: 'success',
+  general: 'primary',
+}
 
 async function loadTags() {
   loading.value = true
   try {
-    const d = await get<{ items: TagItem[]; total: number }>('/tags')
+    const d = await get<{ items: TagItem[]; total: number }>(
+      `/tags${keyword.value.trim() ? `?q=${encodeURIComponent(keyword.value.trim())}` : ''}`,
+    )
     tags.value = d.items
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
     loading.value = false
+  }
+}
+
+/** E2: 搜索标签（输入防抖）。 */
+let searchTimer: number | undefined
+function onSearchInput() {
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(loadTags, 300)
+}
+
+/** E1: 修改标签分类。 */
+async function changeCategory(t: TagItem, category: string) {
+  if (category === t.category) return
+  try {
+    await put(`/tags/${t.id}/category`, { category })
+    t.category = category
+    ElMessage.success(`「${t.name}」分类已改为 ${categoryOptions.find((c) => c.value === category)?.label}`)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
   }
 }
 
@@ -53,6 +89,15 @@ onMounted(loadTags)
     <div class="toolbar">
       <el-input v-model="newName" placeholder="新建自定义标签名" style="width: 200px" @keyup.enter="createTag" />
       <el-button type="primary" :icon="Plus" @click="createTag">新建</el-button>
+      <el-input
+        v-model="keyword"
+        placeholder="搜索标签（名称/中文）"
+        style="width: 220px"
+        :prefix-icon="Search"
+        clearable
+        @input="onSearchInput"
+        @clear="loadTags"
+      />
       <div class="spacer" />
       <el-switch v-model="cnDict" active-text="中文字典" inactive-text="英文" />
     </div>
@@ -61,7 +106,18 @@ onMounted(loadTags)
       <el-table v-if="tags.length > 0" :data="tags">
         <el-table-column prop="name" label="名称(EN)" />
         <el-table-column prop="name_cn" label="中文" width="140" />
-        <el-table-column prop="category" label="分类" width="120" />
+        <el-table-column label="分类" width="150">
+          <template #default="{ row }">
+            <el-select
+              :model-value="row.category"
+              size="small"
+              style="width: 120px"
+              @change="(c: string) => changeCategory(row, c)"
+            >
+              <el-option v-for="o in categoryOptions" :key="o.value" :label="o.label" :value="o.value" />
+            </el-select>
+          </template>
+        </el-table-column>
         <el-table-column prop="image_count" label="关联图数" width="120">
           <template #default="{ row }">
             <span class="num-mono">{{ row.image_count }}</span>

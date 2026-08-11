@@ -973,30 +973,64 @@ impl Db {
     }
 
     /// 标签列表（含关联图数，按图数降序）。
+    /// 修改标签分类（artist/copyright/character/general）。
+    pub fn set_tag_category(&self, tag_id: i64, category: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tags SET category = ?2 WHERE id = ?1",
+            params![tag_id, category],
+        )?;
+        Ok(())
+    }
+
+    /// 标签列表（支持关键字搜索，按关联图数倒序）。
     pub fn list_tags(&self, limit: i64) -> Result<Vec<TagWithCount>, DbError> {
+        self.list_tags_filtered(limit, None)
+    }
+
+    /// 标签列表（q 关键字过滤）。
+    pub fn list_tags_filtered(
+        &self,
+        limit: i64,
+        q: Option<&str>,
+    ) -> Result<Vec<TagWithCount>, DbError> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 1000);
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT t.id, t.name, t.name_cn, t.category, t.is_custom, t.is_blacklisted,
                     (SELECT COUNT(DISTINCT it.image_id) FROM image_tags it WHERE it.tag_id = t.id)
-             FROM tags t
-             ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |r| {
-            Ok(TagWithCount {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                name_cn: r.get(2)?,
-                category: r.get(3)?,
-                is_custom: r.get::<_, i64>(4)? != 0,
-                is_blacklisted: r.get::<_, i64>(5)? != 0,
-                image_count: r.get(6)?,
-            })
-        })?;
+             FROM tags t",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(q) = q {
+            if !q.trim().is_empty() {
+                sql.push_str(" WHERE t.name LIKE ?1 OR t.name_cn LIKE ?1");
+                params.push(Box::new(format!("%{}%", q.trim())));
+            }
+        }
+        sql.push_str(
+            " ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC
+             LIMIT ?",
+        );
+        let limit_ph = params.len() + 1;
+        sql.push_str(&limit_ph.to_string());
+        params.push(Box::new(limit));
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        while let Some(row) = rows.next()? {
+            out.push(TagWithCount {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                name_cn: row.get(2)?,
+                category: row.get(3)?,
+                is_custom: row.get::<_, i64>(4)? != 0,
+                is_blacklisted: row.get::<_, i64>(5)? != 0,
+                image_count: row.get(6)?,
+            });
         }
         Ok(out)
     }

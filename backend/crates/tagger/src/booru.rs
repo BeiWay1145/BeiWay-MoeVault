@@ -53,12 +53,19 @@ pub fn extract_booru(urls: &[String]) -> Option<(&'static str, u64)> {
     None
 }
 
+/// 标签 + 分类（danbooru 分类：artist/copyright/character/general）。
+#[derive(Debug, Clone)]
+pub struct BooruTag {
+    pub name: String,
+    pub category: String,
+}
+
 /// 从 SauceNAO 结果中爬取标签。
 /// 返回 (source, source_url, tags)。
 pub async fn fetch_tags(
     http: &Client,
     urls: &[String],
-) -> Result<(&'static str, String, Vec<String>), TaggerError> {
+) -> Result<(&'static str, String, Vec<BooruTag>), TaggerError> {
     let Some((source, post_id)) = extract_booru(urls) else {
         return Err(TaggerError::NoSource("ext_urls 中无 danbooru/gelbooru 链接".into()));
     };
@@ -82,9 +89,17 @@ pub async fn fetch_tags(
 #[derive(Debug, Deserialize)]
 struct DanbooruPost {
     tag_string: String,
+    #[serde(default)]
+    tag_string_artist: String,
+    #[serde(default)]
+    tag_string_copyright: String,
+    #[serde(default)]
+    tag_string_character: String,
+    #[serde(default)]
+    tag_string_general: String,
 }
 
-async fn fetch_danbooru(http: &Client, url: &str) -> Result<Vec<String>, TaggerError> {
+async fn fetch_danbooru(http: &Client, url: &str) -> Result<Vec<BooruTag>, TaggerError> {
     let resp = http.get(url).header("User-Agent", "MoeVault/0.1").send().await?;
     if !resp.status().is_success() {
         return Err(TaggerError::Invalid(format!(
@@ -93,11 +108,36 @@ async fn fetch_danbooru(http: &Client, url: &str) -> Result<Vec<String>, TaggerE
         )));
     }
     let post: DanbooruPost = resp.json().await?;
-    Ok(post
-        .tag_string
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect())
+    // 分类字段优先；缺失时从 tag_string 按前缀推断
+    let mut out = Vec::new();
+    let push = |s: &str, cat: &str, out: &mut Vec<BooruTag>| {
+        for t in s.split_whitespace() {
+            let (name, cat) = if let Some(stripped) = t.strip_prefix("artist:") {
+                (stripped, "artist")
+            } else if let Some(stripped) = t.strip_prefix("copyright:") {
+                (stripped, "copyright")
+            } else if let Some(stripped) = t.strip_prefix("character:") {
+                (stripped, "character")
+            } else {
+                (t, cat)
+            };
+            if !name.is_empty() {
+                out.push(BooruTag {
+                    name: name.to_string(),
+                    category: cat.to_string(),
+                });
+            }
+        }
+    };
+    push(&post.tag_string_artist, "artist", &mut out);
+    push(&post.tag_string_copyright, "copyright", &mut out);
+    push(&post.tag_string_character, "character", &mut out);
+    push(&post.tag_string_general, "general", &mut out);
+    if out.is_empty() {
+        // 兜底：从 tag_string 全量解析（含前缀推断）
+        push(&post.tag_string, "general", &mut out);
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,7 +151,7 @@ struct GelbooruPost {
     tags: Option<String>,
 }
 
-async fn fetch_gelbooru(http: &Client, url: &str) -> Result<Vec<String>, TaggerError> {
+async fn fetch_gelbooru(http: &Client, url: &str) -> Result<Vec<BooruTag>, TaggerError> {
     let resp = http.get(url).header("User-Agent", "MoeVault/0.1").send().await?;
     if !resp.status().is_success() {
         return Err(TaggerError::Invalid(format!(
@@ -127,7 +167,10 @@ async fn fetch_gelbooru(http: &Client, url: &str) -> Result<Vec<String>, TaggerE
         .unwrap_or_default();
     Ok(tags
         .split_whitespace()
-        .map(|s| s.to_string())
+        .map(|s| BooruTag {
+            name: s.to_string(),
+            category: "general".to_string(),
+        })
         .collect())
 }
 

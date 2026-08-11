@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
-    routing::{get, post},
+    extract::{Path, Query, State},
+    routing::{get, post, put},
     Json, Router,
 };
 use moevault_core::ErrorKind;
@@ -45,21 +45,56 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/tagging/keys", get(key_status))
         .route("/api/v1/sauce/run", post(run_sauce))
         .route("/api/v1/tags", get(list_tags))
+        .route("/api/v1/tags/{id}/category", put(update_tag_category))
         .route("/api/v1/logs", get(get_logs))
         .route("/api/v1/images/{id}/tags", get(image_tags))
         .route("/api/v1/images/{id}/retag", post(retag_image))
 }
 
-/// GET /api/v1/tags：标签列表（含关联图数）。
+/// GET /api/v1/tags：标签列表（含关联图数，支持 q 搜索）。
 async fn list_tags(
     State(state): State<AppState>,
+    Query(params): Query<ListTagsParams>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let db = state.db.clone();
-    let tags = tokio::task::spawn_blocking(move || db.list_tags(1000))
+    let q = params.q.clone();
+    let tags = tokio::task::spawn_blocking(move || db.list_tags_filtered(1000, q.as_deref()))
         .await
         .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
         .map_err(db_error_response)?;
     Ok(Json(json!({ "items": tags, "total": tags.len() })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListTagsParams {
+    /// 关键字（名称或中文名 LIKE）。
+    pub q: Option<String>,
+}
+
+/// PUT /api/v1/tags/{id}/category：修改标签分类。
+async fn update_tag_category(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let Some(cat) = req.get("category").and_then(|v| v.as_str()) else {
+        return Err(error_response(ErrorKind::InvalidInput, "缺少 category"));
+    };
+    let cat = cat.trim().to_string();
+    if !["artist", "copyright", "character", "general"].contains(&cat.as_str()) {
+        return Err(error_response(
+            ErrorKind::InvalidInput,
+            format!("category 仅支持 artist/copyright/character/general，收到: {cat}"),
+        ));
+    }
+    let db = state.db.clone();
+    let cat_for_db = cat.clone();
+    tokio::task::spawn_blocking(move || {
+        db.set_tag_category(id, &cat_for_db).map_err(db_error_response)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(json!({ "ok": true, "tag_id": id, "category": cat })))
 }
 
 #[derive(Debug, Deserialize)]

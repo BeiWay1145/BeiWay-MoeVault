@@ -22,20 +22,19 @@ const fullscreen = ref(false)
 
 const originalSrc = computed(() => (image.value ? originalUrl(image.value.id) : undefined))
 
-// E3: 标签按 danbooru 分类（画师/系列/角色/常规），名称前缀分类
-type TagView = { name: string; name_cn: string | null; source: string }
+// E3: 标签按 danbooru 分类（画师/系列/角色/常规），按后端 category 字段分组
 const tagGroups = computed(() => {
-  const groups: Record<'artist' | 'copyright' | 'character' | 'general', TagView[]> = {
+  const groups: Record<'artist' | 'copyright' | 'character' | 'general', typeof tags.value> = {
     artist: [],
     copyright: [],
     character: [],
     general: [],
   }
   for (const t of tags.value) {
-    const name = t.name
-    if (name.startsWith('artist:')) groups.artist.push({ ...t, name: name.slice(7) })
-    else if (name.startsWith('copyright:')) groups.copyright.push({ ...t, name: name.slice(10) })
-    else if (name.startsWith('character:')) groups.character.push({ ...t, name: name.slice(10) })
+    const cat = t.category
+    if (cat === 'artist') groups.artist.push(t)
+    else if (cat === 'copyright') groups.copyright.push(t)
+    else if (cat === 'character') groups.character.push(t)
     else groups.general.push(t)
   }
   return groups

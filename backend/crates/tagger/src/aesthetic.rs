@@ -10,6 +10,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::TaggerError;
+use crate::pipeline::filter_eligible;
 
 /// 美学评分进度统计。
 #[derive(Debug, Clone, Default, Copy)]
@@ -32,7 +33,14 @@ pub async fn run_aesthetic_pipeline(
     image_ids: Option<Vec<i64>>,
 ) -> Result<AestheticProgress, TaggerError> {
     let ids = match image_ids {
-        Some(ids) => ids,
+        Some(ids) => {
+            // 批量（>1 张）过滤已有美学分的图；单张（详情页手动重评）保留强制语义
+            if ids.len() > 1 {
+                filter_eligible(db, "aesthetic", &ids)?
+            } else {
+                ids
+            }
+        }
         None => db.unscored_active_images(10000)?,
     };
     if ids.is_empty() {
