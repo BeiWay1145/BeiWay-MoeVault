@@ -78,6 +78,8 @@ async fn update_tag_category(
 pub struct RunTaggingRequest {
     /// 指定 image_ids 强制重打；None = 全部未打标 active 图。
     pub force_ids: Option<Vec<i64>>,
+    /// 溯源时是否忽略不可溯源标记（强制重试）。
+    pub force_sauce: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,11 +309,12 @@ async fn run_sauce(
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
     let infer = InferClient::new(st.infer_base_url.clone());
     let library_dir = st.library_dir();
+    let force_sauce = req.force_sauce.unwrap_or(false);
 
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
-        let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
+        let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id} 启动（{} 张{}）", force_ids.as_ref().map_or(0, |v| v.len()), if force_sauce { "，强制重试不可溯源图" } else { "" }));
         let result = moevault_tagger::run_sauce_pipeline(
             &db,
             &sauce,
@@ -321,6 +324,7 @@ async fn run_sauce(
             min_sim,
             force_ids,
             Some(job_id),
+            force_sauce,
         )
         .await;
         let (status, done, failed, error) = match &result {

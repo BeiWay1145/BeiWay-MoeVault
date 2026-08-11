@@ -181,12 +181,15 @@ async function onBatchSauce() {
   }).length
   if (skip > 0) ElMessage.info(`其中 ${skip} 张 AI 生成图将自动跳过溯源`)
   try {
-    await taskStore.enqueueSauce(ids)
+    await taskStore.enqueueSauce(ids, forceSauce.value)
     library.clearSelect()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
+
+/** 批量溯源是否强制重试不可溯源图。 */
+const forceSauce = ref(false)
 
 /** 批量检测 AI（逐张读 PNG tEXt；自动跳过已标记 AI 的图）。 */
 async function onBatchDetectAi() {
@@ -264,6 +267,7 @@ async function onToggleAiFilter(val: boolean | string | number) {
         <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>
         <el-button type="success" plain @click="onBatchAesthetic">批量美学</el-button>
         <el-button plain @click="onBatchSauce">批量溯源</el-button>
+        <el-checkbox v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
         <el-button plain @click="onBatchDetectAi">批量检测 AI</el-button>
         <el-button @click="library.clearSelect()">取消选择</el-button>
       </template>

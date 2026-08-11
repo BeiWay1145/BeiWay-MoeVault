@@ -156,6 +156,10 @@ async function clearLogs() {
 }
 
 function exportLogs() {
+  if (logs.value.length === 0) {
+    ElMessage.warning('当前没有日志可导出')
+    return
+  }
   const lines = logs.value.map(
     (l) =>
       `[${new Date(l.created_at * 1000).toLocaleString()}] [${l.level}] [${l.category}] ${l.message}`,
@@ -164,8 +168,14 @@ function exportLogs() {
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = `moevault-logs-${Date.now()}.txt`
+  document.body.appendChild(a)
   a.click()
-  URL.revokeObjectURL(a.href)
+  // 延迟释放 URL，确保浏览器完成下载
+  setTimeout(() => {
+    URL.revokeObjectURL(a.href)
+    a.remove()
+  }, 500)
+  ElMessage.success(`已导出 ${lines.length} 条日志`)
 }
 
 const logLevelType = (l: string) =>

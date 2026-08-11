@@ -130,6 +130,7 @@ pub(crate) fn filter_eligible(
     db: &Db,
     kind: &str,
     ids: &[i64],
+    force_sauce: bool,
 ) -> Result<Vec<i64>, TaggerError> {
     let mut out = Vec::new();
     for id in ids {
@@ -148,7 +149,8 @@ pub(crate) fn filter_eligible(
         let is_sauced = img.source_url.is_some() || (img.source != "local" && !img.source.is_empty());
         let eligible = match kind {
             "tag" => !is_ai && !has_auto_tags && !img.no_auto_sauce,
-            "sauce" => !is_ai && !img.no_auto_sauce && !is_sauced,
+            // force_sauce=true 时忽略不可溯源标记（强制重试）
+            "sauce" => !is_ai && (!img.no_auto_sauce || force_sauce) && !is_sauced,
             "aesthetic" => img.aesthetic_score.is_none(),
             _ => true,
         };
@@ -188,7 +190,7 @@ pub async fn run_tag_pipeline(
         Some(ids) => {
             // 批量（>1 张）过滤无需处理的图；单张（详情页手动）保留强制语义
             if ids.len() > 1 {
-                filter_eligible(db, "tag", &ids)?
+                filter_eligible(db, "tag", &ids, false)?
             } else {
                 ids
             }
@@ -394,19 +396,32 @@ pub async fn run_sauce_pipeline(
     min_sim: f64,
     image_ids: Option<Vec<i64>>,
     job_id: Option<i64>,
+    force_sauce: bool,
 ) -> Result<SauceProgress, TaggerError> {
-    let ids = match image_ids {
-        Some(ids) => {
-            // 批量（>1 张）过滤无需处理的图；单张（详情页手动）保留强制语义
-            if ids.len() > 1 {
-                filter_eligible(db, "sauce", &ids)?
-            } else {
-                ids
-            }
-        }
+    let raw_ids = match image_ids {
+        Some(ids) => ids,
         None => db.untagged_active_images(10000)?,
     };
+    let ids = if raw_ids.len() > 1 {
+        // 批量（>1 张）过滤无需处理的图；单张（详情页手动）保留强制语义
+        let filtered = filter_eligible(db, "sauce", &raw_ids, force_sauce)?;
+        // 记录跳过原因（任务日志可见）
+        let skipped = raw_ids.len() - filtered.len();
+        if skipped > 0 && job_id.is_some() {
+            let _ = db.add_log(
+                "warn",
+                "sauce",
+                &format!("批量溯源过滤：请求 {} 张，跳过 {skipped} 张（AI 生成/不可溯源/已溯源/GIF）", raw_ids.len()),
+            );
+        }
+        filtered
+    } else {
+        raw_ids
+    };
     if ids.is_empty() {
+        if let Some(_jid) = job_id {
+            let _ = db.add_log("warn", "sauce", "批量溯源：所有图片均被跳过，无任务执行");
+        }
         return Ok(SauceProgress::default());
     }
     info!(count = ids.len(), "溯源管线：开始");

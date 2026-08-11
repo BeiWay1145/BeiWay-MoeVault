@@ -16,6 +16,7 @@ const keyword = ref('')
 const aestheticMin = ref<number | null>(null)
 const source = ref('')
 const onlyRedundant = ref(false)
+const forceSauce = ref(false)
 const tagsInput = ref('')
 
 // 预览
@@ -144,7 +145,7 @@ async function onBatchSauce() {
   const ids = [...library.selected]
   if (ids.length === 0) return
   try {
-    await taskStore.enqueueSauce(ids)
+    await taskStore.enqueueSauce(ids, forceSauce.value)
     library.clearSelect()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -222,6 +223,7 @@ async function onBatchDetectAi() {
           <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>
           <el-button type="success" plain @click="onBatchAesthetic">批量美学</el-button>
           <el-button plain @click="onBatchSauce">批量溯源</el-button>
+          <el-checkbox v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
           <el-button plain @click="onBatchDetectAi">批量检测 AI</el-button>
           <el-button @click="library.clearSelect()">取消选择</el-button>
         </template>

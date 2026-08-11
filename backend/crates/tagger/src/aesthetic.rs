@@ -37,7 +37,7 @@ pub async fn run_aesthetic_pipeline(
         Some(ids) => {
             // 批量（>1 张）过滤已有美学分的图；单张（详情页手动重评）保留强制语义
             if ids.len() > 1 {
-                filter_eligible(db, "aesthetic", &ids)?
+                filter_eligible(db, "aesthetic", &ids, false)?
             } else {
                 ids
             }

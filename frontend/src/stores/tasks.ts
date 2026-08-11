@@ -129,11 +129,14 @@ export const useTaskStore = defineStore('tasks', () => {
     return r
   }
 
-  /** 提交 SauceNAO 溯源任务。 */
-  async function enqueueSauce(ids: number[]) {
-    const r = await post<{ started: boolean; job_id: number; kind: string }>('/sauce/run', { force_ids: ids })
+  /** 提交 SauceNAO 溯源任务（force=true 时忽略不可溯源标记，强制重试）。 */
+  async function enqueueSauce(ids: number[], force = false) {
+    const r = await post<{ started: boolean; job_id: number; kind: string }>('/sauce/run', {
+      force_ids: ids,
+      force_sauce: force,
+    })
     notifyEnqueued(r.kind, r.job_id, ids.length)
-    reportLog(`提交批量溯源任务 #${r.job_id}（${ids.length} 张）`)
+    reportLog(`提交批量溯源任务 #${r.job_id}（${ids.length} 张${force ? '，强制重试' : ''}）`)
     load()
     return r
   }

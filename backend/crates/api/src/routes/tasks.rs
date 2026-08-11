@@ -241,6 +241,7 @@ async fn resume_task(
             min_sim,
             Some(ids),
             Some(id),
+            false,
         )
         .await;
         let (status, done, failed, error) = match &result {

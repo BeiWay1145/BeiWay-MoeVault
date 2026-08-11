@@ -41,6 +41,7 @@ const dirLoading = ref<Record<string, boolean>>({})
 // 选中（跨组）
 const selected = ref<Set<number>>(new Set())
 const selectedCount = computed(() => selected.value.size)
+const forceSauce = ref(false)
 
 /** 组唯一键：date + source_dir。 */
 function dirKey(d: DayGroup, g: DirGroup) {
@@ -212,7 +213,7 @@ async function onBatchSauce() {
   const ids = [...selected.value]
   if (ids.length === 0) return
   try {
-    await taskStore.enqueueSauce(ids)
+    await taskStore.enqueueSauce(ids, forceSauce.value)
     selected.value = new Set()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -287,6 +288,7 @@ onMounted(() => {
         <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>
         <el-button type="success" plain @click="onBatchAesthetic">批量美学</el-button>
         <el-button plain @click="onBatchSauce">批量溯源</el-button>
+        <el-checkbox v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
         <el-button plain @click="onBatchDetectAi">批量检测 AI</el-button>
         <el-button @click="selected = new Set()">取消选择</el-button>
       </template>
