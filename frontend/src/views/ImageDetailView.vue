@@ -172,10 +172,11 @@ async function recycle() {
   }
 }
 
-/** 返回来源页（画廊/搜索）——叉号点击直接返回，不受浏览多张影响。 */
+/** 返回来源页（画廊/搜索/主目录）——叉号点击直接返回，不受浏览多张影响。 */
 function goBack() {
   const from = library.detailPos?.from
   if (from === 'search') router.push('/search')
+  else if (from === 'imports') router.push('/imports')
   else router.push('/library')
 }
 

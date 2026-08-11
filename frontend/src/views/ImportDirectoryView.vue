@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowDown, ArrowRight } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -255,9 +255,14 @@ function fmtDate(date: string) {
 }
 
 watch([sauceFilter, tagFilter, aiFilter], loadTree)
+// 导入完成后刷新主目录（新图自动分组出现）
 onMounted(() => {
   library.fetchImages(50).catch(() => {})
   loadTree()
+  window.addEventListener('moevault:import-done', loadTree)
+})
+onUnmounted(() => {
+  window.removeEventListener('moevault:import-done', loadTree)
 })
 </script>
 
