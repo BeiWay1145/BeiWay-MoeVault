@@ -293,6 +293,7 @@ async function onToggleAiFilter(val: boolean | string | number) {
         :images="library.images"
         :view-mode="library.viewMode"
         :selected="library.selected"
+        :waterfall-columns="settingsStore.settings.waterfall_columns"
         @click="onCardClick"
         @toggle-select="library.toggleSelect($event.id)"
         @preview="openPreview"

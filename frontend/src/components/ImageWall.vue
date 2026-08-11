@@ -1,12 +1,22 @@
 <script setup lang="ts">
 import type { ImageItem, ViewMode } from '@/stores/library'
 import ImageCard from '@/components/ImageCard.vue'
+import { computed } from 'vue'
 
-defineProps<{
+const props = defineProps<{
   images: ImageItem[]
   viewMode: ViewMode
   selected?: Set<number>
+  /** 瀑布流列数：auto=传统瀑布流（columns 紧密错落）/ 2-6=固定列网格按行 */
+  waterfallColumns?: string
 }>()
+
+// auto → 传统瀑布流 class；固定数字 → 网格列数 class
+const waterfallClass = computed(() => {
+  const c = props.waterfallColumns ?? 'auto'
+  if (c === 'auto' || !['2', '3', '4', '5', '6'].includes(c)) return 'waterfall-auto'
+  return `waterfall-grid cols-${c}`
+})
 
 const emit = defineEmits<{
   click: [image: ImageItem]
@@ -17,8 +27,8 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <!-- 瀑布流：grid 多列，按行排序（从左到右、从上到下） -->
-  <TransitionGroup v-if="viewMode === 'waterfall'" name="flip" tag="div" class="waterfall">
+  <!-- 瀑布流：auto=传统（columns 紧密错落）/ 固定列=网格按行 -->
+  <TransitionGroup v-if="viewMode === 'waterfall'" name="flip" tag="div" :class="['waterfall', waterfallClass]">
     <div v-for="img in images" :key="img.id" class="waterfall-item" :data-image-id="img.id">
       <ImageCard
         :image="img"
@@ -87,14 +97,33 @@ const emit = defineEmits<{
   width: 100%;
 }
 
-/* 瀑布流：grid 多列按行排序（从左到右、从上到下），卡片按自身比例高度 */
-.waterfall {
+/* 瀑布流：auto=传统 columns（紧密错落，无空隙）；固定列=grid 按行（无空隙但等高） */
+.waterfall-auto {
+  columns: 5 220px;
+  column-gap: 12px;
+}
+.waterfall-auto .waterfall-item {
+  break-inside: avoid;
+  margin-bottom: 12px;
+}
+.waterfall-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 12px;
 }
-.waterfall-item {
-  margin-bottom: 0;
+.waterfall-grid.cols-2 {
+  grid-template-columns: repeat(2, 1fr);
+}
+.waterfall-grid.cols-3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+.waterfall-grid.cols-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+.waterfall-grid.cols-5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+.waterfall-grid.cols-6 {
+  grid-template-columns: repeat(6, 1fr);
 }
 
 /* 删除/新增补位动效（瀑布流、网格、列表通用） */

@@ -250,6 +250,17 @@ onMounted(async () => {
             <el-switch v-model="settings.settings.close_to_tray" active-text="开启" inactive-text="关闭" />
             <span class="hint">开启后点关闭按钮最小化到系统托盘（后台任务继续），托盘图标可恢复/退出</span>
           </el-form-item>
+          <el-form-item label="瀑布流列数">
+            <el-select v-model="settings.settings.waterfall_columns" style="width: 200px">
+              <el-option label="自动（传统瀑布流）" value="auto" />
+              <el-option label="2 列" value="2" />
+              <el-option label="3 列" value="3" />
+              <el-option label="4 列" value="4" />
+              <el-option label="5 列" value="5" />
+              <el-option label="6 列" value="6" />
+            </el-select>
+            <span class="hint">自动=传统瀑布流（紧密错落、按列填充）；固定列=网格按行排（无空隙）。影响图库/搜索</span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 

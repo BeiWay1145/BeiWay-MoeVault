@@ -4,6 +4,7 @@ import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, type ImageItem } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
+import { useSettingsStore } from '@/stores/settings'
 import { post } from '@/api/client'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
@@ -15,6 +16,7 @@ defineOptions({ name: 'search' })
 const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()
+const settingsStore = useSettingsStore()
 const keyword = ref('')
 const aestheticMin = ref<number | null>(null)
 const source = ref('')
@@ -253,6 +255,7 @@ async function onBatchDetectAi() {
         :images="library.images"
         :view-mode="library.viewMode"
         :selected="library.selected"
+        :waterfall-columns="settingsStore.settings.waterfall_columns"
         @click="onCardClick"
         @toggle-select="library.toggleSelect($event.id)"
         @preview="openPreview"

@@ -37,6 +37,7 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "pagination_enabled",
     "page_size",
     "close_to_tray",
+    "waterfall_columns",
 ];
 
 pub fn router() -> Router<AppState> {

@@ -28,6 +28,8 @@ export interface SettingsState {
   page_size: number
   /** 关闭窗口时最小化到托盘（默认关闭=正常退出） */
   close_to_tray: boolean
+  /** 瀑布流列数：auto/2/3/4/5/6（auto=传统瀑布流，固定=网格按行） */
+  waterfall_columns: string
 }
 
 const defaults: SettingsState = {
@@ -46,6 +48,7 @@ const defaults: SettingsState = {
   pagination_enabled: false,
   page_size: 50,
   close_to_tray: false,
+  waterfall_columns: 'auto',
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -73,6 +76,7 @@ export const useSettingsStore = defineStore('settings', () => {
         pagination_enabled: s.pagination_enabled === true || s.pagination_enabled === 'true',
         page_size: s.page_size != null ? Number(s.page_size) : defaults.page_size,
         close_to_tray: s.close_to_tray === true || s.close_to_tray === 'true',
+        waterfall_columns: String(s.waterfall_columns ?? defaults.waterfall_columns),
       }
       loaded.value = true
     } catch {
@@ -97,6 +101,7 @@ export const useSettingsStore = defineStore('settings', () => {
       pagination_enabled: String(settings.value.pagination_enabled),
       page_size: String(settings.value.page_size),
       close_to_tray: String(settings.value.close_to_tray),
+      waterfall_columns: settings.value.waterfall_columns,
     })
   }
 
