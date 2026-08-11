@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use moevault_core::ErrorKind;
@@ -24,6 +24,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/sauce/run", post(run_sauce))
         .route("/api/v1/tags", get(list_tags))
         .route("/api/v1/tags/{id}/category", put(update_tag_category))
+        .route("/api/v1/tags/{id}", delete(delete_tag))
+        .route("/api/v1/tags/{id}/blacklist", post(set_tag_blacklist))
+        .route("/api/v1/tags/batch-delete", post(batch_delete_tags))
+        .route("/api/v1/tags/batch-blacklist", post(batch_blacklist_tags))
         .route("/api/v1/images/{id}/tags", get(image_tags))
         .route("/api/v1/images/{id}/retag", post(retag_image))
 }
@@ -35,7 +39,9 @@ async fn list_tags(
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let db = state.db.clone();
     let q = params.q.clone();
-    let tags = tokio::task::spawn_blocking(move || db.list_tags_filtered(1000, q.as_deref()))
+    let offset = params.offset.unwrap_or(0).max(0);
+    let limit = params.limit.unwrap_or(500).clamp(1, 500);
+    let tags = tokio::task::spawn_blocking(move || db.list_tags_filtered(limit, q.as_deref(), offset))
         .await
         .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
         .map_err(db_error_response)?;
@@ -46,6 +52,9 @@ async fn list_tags(
 pub struct ListTagsParams {
     /// 关键字（名称或中文名 LIKE）。
     pub q: Option<String>,
+    /// 分页：offset/limit（默认 0/500，避免一次性加载全部导致卡死）。
+    pub offset: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 /// PUT /api/v1/tags/{id}/category：修改标签分类。
@@ -72,6 +81,78 @@ async fn update_tag_category(
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
     Ok(Json(json!({ "ok": true, "tag_id": id, "category": cat })))
+}
+
+/// DELETE /api/v1/tags/{id}：删除标签。
+async fn delete_tag(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.delete_tag(id))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /api/v1/tags/{id}/blacklist：拉黑/取消拉黑标签。body {blacklisted: bool}
+async fn set_tag_blacklist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let bl = req.get("blacklisted").and_then(|v| v.as_bool()).unwrap_or(true);
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.set_tag_blacklisted(id, bl))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true, "blacklisted": bl })))
+}
+
+/// POST /api/v1/tags/batch-delete：批量删除标签。body {ids: []}
+async fn batch_delete_tags(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let ids: Vec<i64> = req
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Err(error_response(ErrorKind::InvalidInput, "ids 不能为空"));
+    }
+    let ids_len = ids.len();
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.delete_tags(&ids))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true, "deleted": ids_len })))
+}
+
+/// POST /api/v1/tags/batch-blacklist：批量拉黑标签。body {ids: [], blacklisted: bool}
+async fn batch_blacklist_tags(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let ids: Vec<i64> = req
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Err(error_response(ErrorKind::InvalidInput, "ids 不能为空"));
+    }
+    let bl = req.get("blacklisted").and_then(|v| v.as_bool()).unwrap_or(true);
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.set_tags_blacklisted(&ids, bl))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true, "blacklisted": bl })))
 }
 
 #[derive(Debug, Deserialize)]

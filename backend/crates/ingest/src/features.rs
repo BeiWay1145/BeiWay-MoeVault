@@ -250,15 +250,23 @@ pub fn extract_prompt_tags(prompt: &str) -> Vec<String> {
 }
 
 /// 递归收集 ComfyUI workflow JSON 中所有含 `text` 的字符串（按出现顺序）。
+/// 跳过负面提示词节点（key 或相邻节点名含 negative 的），避免负面词混入标签。
 fn collect_prompt_texts(v: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     match v {
         serde_json::Value::Object(map) => {
             for (k, val) in map {
+                // 跳过负面节点（key 本身是 negative 相关，或值指向的节点名含 negative）
                 if k == "text" {
                     if let Some(s) = val.as_str() {
                         out.push(s.to_string());
                     }
+                } else if k.to_lowercase().contains("negative") {
+                    // 该 key 是负面相关（如 "negative_prompt"/"negative"）——其值可能是字符串或嵌套对象，跳过
+                    if let Some(s) = val.as_str() {
+                        let _ = s;
+                    }
+                    continue;
                 } else {
                     out.extend(collect_prompt_texts(val));
                 }

@@ -139,6 +139,17 @@ async fn read_ai_info(
                         .map_err(db_error_response)?;
                     db.insert_image_tags(id, &tag_ids, "ai").map_err(db_error_response)?;
                 }
+                // 清理历史录入的负面标签（名字出现在负面提示词里的 ai 标签）
+                if let Some(neg) = &m.negative_prompt {
+                    let neg_tags: Vec<String> = neg
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    if !neg_tags.is_empty() {
+                        let _ = db.remove_ai_negative_tags(id, &neg_tags);
+                    }
+                }
                 Ok::<_, (axum::http::StatusCode, Json<Value>)>(json!({
                     "ok": true, "is_ai": m.is_ai, "metadata": m.raw,
                     "prompt": m.prompt, "negative_prompt": m.negative_prompt,

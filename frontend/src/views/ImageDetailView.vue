@@ -301,7 +301,6 @@ onUnmounted(() => {
           <el-tag v-else-if="image.noAutoSauce || aiChecked" type="warning" plain style="margin-left: 6px">不可溯源</el-tag>
           <el-tag v-else type="info" plain style="margin-left: 6px">未溯源</el-tag>
           <el-tag v-if="tags.length > 0" type="success" plain style="margin-left: 6px">已打标</el-tag>
-          <el-tag v-else-if="aiChecked" type="info" plain style="margin-left: 6px">无需打标</el-tag>
           <el-tag v-else type="warning" plain style="margin-left: 6px">未打标</el-tag>
         </el-descriptions-item>
       </el-descriptions>

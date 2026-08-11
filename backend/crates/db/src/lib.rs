@@ -1171,6 +1171,24 @@ impl Db {
         Ok(())
     }
 
+    /// 删除该图 source=ai 且名字出现在负面提示词中的标签（清理误录的负面词）。
+    pub fn remove_ai_negative_tags(&self, image_id: i64, neg_tags: &[String]) -> Result<(), DbError> {
+        if neg_tags.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        // 逐词删除（数量少，直接循环）
+        for neg in neg_tags {
+            conn.execute(
+                "DELETE FROM image_tags
+                 WHERE image_id = ?1 AND source = 'ai'
+                   AND tag_id IN (SELECT id FROM tags WHERE name = ?2)",
+                params![image_id, neg],
+            )?;
+        }
+        Ok(())
+    }
+
     /// 未评分（aesthetic_score IS NULL）的 active 图片 id 列表。
     pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {        let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 10000);
@@ -1250,9 +1268,65 @@ impl Db {
         Ok(())
     }
 
+    /// 删除标签（连同图片关联）。
+    pub fn delete_tag(&self, tag_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM image_tags WHERE tag_id = ?1", params![tag_id])?;
+        conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
+        Ok(())
+    }
+
+    /// 批量删除标签。
+    pub fn delete_tags(&self, ids: &[i64]) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM image_tags WHERE tag_id = ?1")?;
+            for id in ids {
+                stmt.execute(params![id])?;
+            }
+            let mut stmt2 = tx.prepare("DELETE FROM tags WHERE id = ?1")?;
+            for id in ids {
+                stmt2.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 设置标签黑名单（true=拉黑：标签页/详情页不再显示，关联保留）。
+    pub fn set_tag_blacklisted(&self, tag_id: i64, blacklisted: bool) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tags SET is_blacklisted = ?2 WHERE id = ?1",
+            params![tag_id, blacklisted as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 批量设置黑名单。
+    pub fn set_tags_blacklisted(&self, ids: &[i64], blacklisted: bool) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE tags SET is_blacklisted = ?2 WHERE id = ?1")?;
+            for id in ids {
+                stmt.execute(params![id, blacklisted as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 标签列表（支持关键字搜索，按关联图数倒序）。
     pub fn list_tags(&self, limit: i64) -> Result<Vec<TagWithCount>, DbError> {
-        self.list_tags_filtered(limit, None)
+        self.list_tags_filtered(limit, None, 0)
     }
 
     /// 标签列表（q 关键字过滤）。
@@ -1260,9 +1334,11 @@ impl Db {
         &self,
         limit: i64,
         q: Option<&str>,
+        offset: i64,
     ) -> Result<Vec<TagWithCount>, DbError> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
         let mut sql = String::from(
             "SELECT t.id, t.name, t.name_cn, t.category, t.is_custom, t.is_blacklisted,
                     (SELECT COUNT(DISTINCT it.image_id) FROM image_tags it WHERE it.tag_id = t.id)
@@ -1277,11 +1353,14 @@ impl Db {
         }
         sql.push_str(
             " ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC
-             LIMIT ?",
+             LIMIT ? OFFSET ?",
         );
         let limit_ph = params.len() + 1;
         sql.push_str(&limit_ph.to_string());
         params.push(Box::new(limit));
+        let offset_ph = params.len() + 1;
+        sql.push_str(&offset_ph.to_string());
+        params.push(Box::new(offset));
         let mut stmt = conn.prepare(&sql)?;
         for (i, v) in params.iter().enumerate() {
             stmt.raw_bind_parameter(i + 1, v.as_ref())?;

@@ -29,7 +29,7 @@ const loading = ref(false)
 
 // 筛选状态（sauce/tag/ai）
 const sauceFilter = ref<'all' | 'sauced' | 'unsauced' | 'un-sauced'>('all')
-const tagFilter = ref<'all' | 'tagged' | 'untagged' | 'no_need'>('all')
+const tagFilter = ref<'all' | 'tagged' | 'untagged'>('all')
 const aiFilter = ref<'all' | 'ai' | 'not_ai'>('all')
 
 // 来源组展开状态 + 组内图片缓存 + 分页游标
@@ -360,7 +360,6 @@ async function onDedup() {
           <el-option label="打标：全部" value="all" />
           <el-option label="已打标" value="tagged" />
           <el-option label="未打标" value="untagged" />
-          <el-option label="无需打标(AI)" value="no_need" />
         </el-select>
         <el-select v-model="aiFilter" size="default" style="width: 150px">
           <el-option label="AI：全部" value="all" />
