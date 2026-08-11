@@ -281,6 +281,50 @@ async function reprocessBroken() {
     ElMessage.error((e as Error).message)
   }
 }
+
+/** 查重按钮状态：多选时对选中图查重，否则对当前筛选集查重。 */
+const dedupLoading = ref(false)
+
+/** 获取当前筛选/选中范围的全部图片 id。 */
+async function getScopeIds(): Promise<number[]> {
+  // 多选优先：用选中图
+  if (selected.value.size > 0) {
+    return [...selected.value]
+  }
+  // 否则用已加载的组内图片（当前筛选下用户看到的全部图）
+  const all = Object.values(dirImages.value).flat()
+  const ids = [...new Set(all.map((i) => i.id))]
+  if (ids.length === 0) {
+    // 尚未展开任何组：提示先展开或先多选
+    ElMessage.info('请先展开来源组或多选图片，再执行查重')
+  }
+  return ids
+}
+
+/** 查重：多选时查所选图，否则查当前筛选集。 */
+async function onDedup() {
+  const ids = await getScopeIds()
+  if (ids.length === 0) {
+    ElMessage.warning('当前范围没有可查重的图片')
+    return
+  }
+  dedupLoading.value = true
+  try {
+    const r = await post<{ groups_created: number; images_clustered: number; redundant_marked: number }>(
+      '/dedup/scan-scope',
+      { image_ids: ids },
+    )
+    ElMessage.success(
+      `查重完成：${r.groups_created} 组，${r.images_clustered} 张归入重复组，${r.redundant_marked} 张标记冗余`,
+    )
+    // 跳转到查重结果页
+    router.push('/dedup')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    dedupLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -306,6 +350,7 @@ async function reprocessBroken() {
         </el-select>
       </div>
       <div class="spacer" />
+      <el-button :loading="dedupLoading" @click="onDedup" title="对当前筛选集或选中图查重">查重</el-button>
       <el-button :icon="Refresh" circle title="刷新" @click="refresh" />
       <el-button plain @click="reprocessBroken" title="重新解析解码失败的图片（修复基本信息/缩略图）">重新解析</el-button>
       <template v-if="selectedCount > 0">

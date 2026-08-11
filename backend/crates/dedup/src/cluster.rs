@@ -132,6 +132,58 @@ pub fn full_recluster(db: &Db, threshold: u32) -> Result<ClusterStats, DedupErro
     Ok(stats)
 }
 
+/// 范围聚类：只对指定 ids 的图片聚类（主目录按筛选集/选中图查重用）。
+/// 先解除这些图的现有分组，再对它们内部两两聚类（不扫全库）。
+pub fn cluster_scope(db: &Db, ids: &[i64], threshold: u32) -> Result<ClusterStats, DedupError> {
+    if ids.is_empty() {
+        return Ok(ClusterStats::default());
+    }
+    // 解除现有分组
+    db.unassign_images(ids)?;
+    let scope = db.images_by_ids(ids)?;
+    info!(count = scope.len(), "范围聚类：开始");
+
+    let mut stats = ClusterStats::default();
+    let mut seeds: Vec<(i64, i64)> = Vec::new();
+    let mut touched: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+
+    for (image_id, phash, _clarity) in &scope {
+        let phash = *phash as u64;
+        let mut best_dist = u32::MAX;
+        let mut best_group: Option<i64> = None;
+        for (gid, seed) in &seeds {
+            let d = hamming(phash, *seed as u64);
+            if d < best_dist {
+                best_dist = d;
+                best_group = Some(*gid);
+            }
+        }
+        if let Some(gid) = best_group {
+            if best_dist <= threshold {
+                db.assign_to_group(*image_id, gid)?;
+                touched.insert(gid);
+                stats.images_clustered += 1;
+                continue;
+            }
+        }
+        let gid = db.create_dedup_group(phash as i64, *image_id)?;
+        db.assign_to_group(*image_id, gid)?;
+        seeds.push((gid, phash as i64));
+        touched.insert(gid);
+        stats.groups_created += 1;
+    }
+    for gid in &touched {
+        stats.redundant_marked += refresh_group(db, *gid)?;
+    }
+    info!(
+        groups_created = stats.groups_created,
+        images_clustered = stats.images_clustered,
+        redundant_marked = stats.redundant_marked,
+        "范围聚类完成"
+    );
+    Ok(stats)
+}
+
 /// 刷新单簇：按清晰度降序选 best，其余 active 成员标记冗余候选。
 /// 返回新标记为冗余的成员数。
 pub fn refresh_group(db: &Db, group_id: i64) -> Result<usize, DedupError> {

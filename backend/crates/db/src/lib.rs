@@ -596,6 +596,27 @@ impl Db {
         Ok(())
     }
 
+    /// 解除指定图片的查重分组（范围查重前调用），并清理空组。
+    pub fn unassign_images(&self, ids: &[i64]) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE images SET dedup_group = NULL, is_redundant = 0 WHERE id = ?1",
+            )?;
+            for id in ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        // 清理无成员的组
+        tx.execute("DELETE FROM dedup_groups WHERE id NOT IN (SELECT DISTINCT dedup_group FROM images WHERE dedup_group IS NOT NULL)", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 清空全部查重结果（全量重建前调用）。
     pub fn clear_dedup(&self) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
@@ -618,6 +639,30 @@ impl Db {
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 按 id 查图片（保留给定顺序）：`(id, phash, clarity)`。
+    pub fn images_by_ids(&self, ids: &[i64]) -> Result<Vec<(i64, i64, f64)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT id, phash, clarity_score FROM images
+             WHERE id IN ({}) ORDER BY id",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, id) in ids.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, id)?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
         }
         Ok(out)
     }

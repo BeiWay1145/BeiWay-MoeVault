@@ -8,7 +8,7 @@
 pub mod cluster;
 pub mod recycle;
 
-pub use cluster::{full_recluster, incremental_cluster, ClusterStats, DEFAULT_HAMMING_THRESHOLD};
+pub use cluster::{cluster_scope, full_recluster, incremental_cluster, ClusterStats, DEFAULT_HAMMING_THRESHOLD};
 pub use recycle::{purge_all, purge_image, recycle_image, restore_image};
 
 /// 查重/回收站错误。

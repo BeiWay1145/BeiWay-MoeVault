@@ -27,7 +27,7 @@ const menus = [
   { path: '/library', label: '图库', icon: Picture },
   { path: '/imports', label: '主目录', icon: FolderOpened },
   { path: '/search', label: '搜索', icon: Search },
-  { path: '/dedup', label: '查重', icon: Connection, badge: 'dedup' },
+  { path: '/dedup', label: '查重结果', icon: Connection, badge: 'dedup' },
   { path: '/trash', label: '回收站', icon: Delete },
   { path: '/tags', label: '标签', icon: CollectionTag },
 ]

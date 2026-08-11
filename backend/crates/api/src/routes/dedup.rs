@@ -8,13 +8,13 @@ use axum::{
     Json, Router,
 };
 use moevault_core::ErrorKind;
-use moevault_dedup::{full_recluster, incremental_cluster, DEFAULT_HAMMING_THRESHOLD};
+use moevault_dedup::{cluster_scope, full_recluster, incremental_cluster, DEFAULT_HAMMING_THRESHOLD};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, join_error_response};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/dedup/groups", get(list_groups))
         .route("/api/v1/dedup/groups/{id}", get(get_group))
         .route("/api/v1/dedup/scan", post(scan))
+        .route("/api/v1/dedup/scan-scope", post(scan_scope))
         .route("/api/v1/dedup/groups/{id}/resolve", post(resolve_group))
 }
 
@@ -164,6 +165,57 @@ async fn scan(
     });
 
     Ok(Json(json!({ "started": true, "full": full, "threshold": threshold })))
+}
+
+/// POST /api/v1/dedup/scan-scope：对指定 ids 范围聚类（主目录按筛选集/选中图查重）。
+/// 同步执行（范围小），返回统计。
+#[derive(Debug, Deserialize)]
+pub struct ScanScopeRequest {
+    pub image_ids: Vec<i64>,
+    pub threshold: Option<u32>,
+}
+
+async fn scan_scope(
+    State(state): State<AppState>,
+    Json(req): Json<ScanScopeRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    if req.image_ids.is_empty() {
+        return Err(error_response(ErrorKind::InvalidInput, "image_ids 不能为空"));
+    }
+    let threshold = req.threshold.unwrap_or(DEFAULT_HAMMING_THRESHOLD);
+    if threshold > 64 {
+        return Err(error_response(
+            ErrorKind::InvalidInput,
+            format!("threshold 应在 0..=64，收到 {threshold}"),
+        ));
+    }
+    let db = state.db.clone();
+    let db_for_stats = db.clone();
+    let ids = req.image_ids.clone();
+    let stats = tokio::task::spawn_blocking(move || cluster_scope(&db, &ids, threshold))
+        .await
+        .map_err(join_error_response)?
+        .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
+    let s = db_for_stats.dedup_stats().unwrap_or_default();
+    // 广播更新
+    state.broadcast(
+        json!({
+            "type": "dedup.updated",
+            "payload": {
+                "groups_created": stats.groups_created,
+                "images_clustered": stats.images_clustered,
+                "redundant_marked": stats.redundant_marked,
+                "group_count": s.group_count,
+                "redundant_count": s.redundant_count,
+            },
+        })
+        .to_string(),
+    );
+    Ok(Json(json!({
+        "groups_created": stats.groups_created,
+        "images_clustered": stats.images_clustered,
+        "redundant_marked": stats.redundant_marked,
+    })))
 }
 
 async fn resolve_group(
