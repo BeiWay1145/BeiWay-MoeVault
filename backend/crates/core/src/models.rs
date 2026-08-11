@@ -33,6 +33,8 @@ pub struct Image {
     pub source_url: Option<String>,
     /// 不可自动溯源标记（确认无法溯源到 booru 的图，自动打标跳过）。
     pub no_auto_sauce: bool,
+    /// AI 生成图片元信息（PNG tEXt 读取的 parameters/prompt 等）。
+    pub ai_metadata: Option<String>,
     pub thumb_rel: String,
     pub imported_at: i64,
 }
@@ -76,6 +78,8 @@ pub struct ImageListItem {
     pub imported_at: i64,
     /// 缩略图相对路径（data/thumbs 下）。
     pub thumb_rel: String,
+    /// 是否 AI 生成图片（读取到 ai_metadata）。
+    pub is_ai: bool,
 }
 
 /// 组合筛选参数（/api/v1/images 查询参数，可任意组合）。
@@ -105,6 +109,8 @@ pub struct ImageFilter {
     pub min_height: Option<i64>,
     /// 只看冗余候选。
     pub is_redundant: Option<bool>,
+    /// 只看 AI 生成图片。
+    pub is_ai: Option<bool>,
 }
 
 /// 排序键。

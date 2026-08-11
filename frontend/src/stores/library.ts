@@ -17,6 +17,8 @@ export interface ImageItem {
   importedAt: number
   /** 缩略图相对路径（Windows 反斜杠→正斜杠，供 /thumbs 访问） */
   thumbRel: string
+  /** 是否 AI 生成图片 */
+  isAi: boolean
 }
 
 export type ViewMode = 'grid' | 'waterfall' | 'list'
@@ -28,6 +30,11 @@ export function thumbUrl(thumbRel: string | null | undefined): string | undefine
   return `/thumbs/${thumbRel.replace(/\\/g, '/')}`
 }
 
+/** 原图 URL。 */
+export function originalUrl(id: number): string {
+  return `/api/v1/images/${id}/file`
+}
+
 export interface LibraryFilter {
   q?: string
   tags?: string[]
@@ -37,6 +44,7 @@ export interface LibraryFilter {
   source?: string
   format?: string
   isRedundant?: boolean
+  isAi?: boolean
 }
 
 export const useLibraryStore = defineStore('library', () => {
@@ -67,6 +75,7 @@ export const useLibraryStore = defineStore('library', () => {
       if (f.source) params.set('source', f.source)
       if (f.format) params.set('format', f.format)
       if (f.isRedundant != null) params.set('is_redundant', f.isRedundant ? '1' : '0')
+      if (f.isAi != null) params.set('is_ai', f.isAi ? '1' : '0')
 
       const d = await get<{ items: Array<Record<string, unknown>>; total: number }>(
         `/images?${params.toString()}`,
@@ -82,6 +91,7 @@ export const useLibraryStore = defineStore('library', () => {
         isRedundant: it.is_redundant as boolean,
         importedAt: it.imported_at as number,
         thumbRel: (it.thumb_rel as string) ?? '',
+        isAi: it.is_ai as boolean,
       }))
       total.value = d.total
     } finally {

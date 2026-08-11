@@ -172,6 +172,7 @@ fn process_one(
         source: SOURCE_LOCAL.to_string(),
         source_url: None,
         no_auto_sauce: false,
+        ai_metadata: None,
         thumb_rel: thumb_rel.to_string_lossy().into_owned(),
         imported_at: now,
     };

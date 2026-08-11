@@ -89,7 +89,8 @@ impl Db {
         let mut sql = String::from(
             "SELECT i.id, i.md5, i.rel_path, i.width, i.height, i.format, i.size_bytes,
                     i.exif_datetime, i.clarity_score, i.aesthetic_score,
-                    i.is_redundant, i.source, i.imported_at, i.thumb_rel
+                    i.is_redundant, i.source, i.imported_at, i.thumb_rel,
+                    (i.ai_metadata IS NOT NULL AND i.ai_metadata != '')
              FROM images i",
         );
         let mut conds: Vec<String> = vec!["i.status = ?1".to_string()];
@@ -175,6 +176,11 @@ impl Db {
         if let Some(v) = filter.is_redundant {
             let t = format!("?{}", params.len() + 1);
             conds.push(format!("i.is_redundant = {t}"));
+            params.push(Box::new(v as i64));
+        }
+        if let Some(v) = filter.is_ai {
+            let t = format!("?{}", params.len() + 1);
+            conds.push(format!("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') = {t}"));
             params.push(Box::new(v as i64));
         }
 
@@ -646,7 +652,7 @@ impl Db {
         conn.query_row(
             "SELECT id, md5, phash, rel_path, width, height, format, size_bytes, file_mtime,
                     exif_datetime, clarity_score, aesthetic_score, dedup_group, is_redundant,
-                    status, source, source_url, no_auto_sauce, thumb_rel, imported_at
+                    status, source, source_url, no_auto_sauce, ai_metadata, thumb_rel, imported_at
              FROM images WHERE id = ?1",
             params![id],
             |r| {
@@ -669,8 +675,9 @@ impl Db {
                     source: r.get(15)?,
                     source_url: r.get(16)?,
                     no_auto_sauce: r.get::<_, i64>(17)? != 0,
-                    thumb_rel: r.get(18)?,
-                    imported_at: r.get(19)?,
+                    ai_metadata: r.get(18)?,
+                    thumb_rel: r.get(19)?,
+                    imported_at: r.get(20)?,
                 })
             },
         )
@@ -941,6 +948,16 @@ impl Db {
         Ok(())
     }
 
+    /// 写入 AI 生成图片元信息。
+    pub fn set_ai_metadata(&self, image_id: i64, meta: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET ai_metadata = ?2 WHERE id = ?1",
+            params![image_id, meta],
+        )?;
+        Ok(())
+    }
+
     /// 未评分（aesthetic_score IS NULL）的 active 图片 id 列表。
     pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {        let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 10000);
@@ -1076,6 +1093,7 @@ fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {
         source: r.get(11)?,
         imported_at: r.get(12)?,
         thumb_rel: r.get(13)?,
+        is_ai: r.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -1154,6 +1172,7 @@ mod tests {
                 source: SOURCE_LOCAL.into(),
                 source_url: None,
                 no_auto_sauce: false,
+                ai_metadata: None,
                 thumb_rel: format!("p{i}.webp"),
                 imported_at: i as i64,
             });

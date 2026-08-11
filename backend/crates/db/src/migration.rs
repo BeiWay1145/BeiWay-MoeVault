@@ -14,6 +14,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("V1__init", include_str!("../migrations/V1__init.sql")),
     ("V2__import_duplicate", include_str!("../migrations/V2__import_duplicate.sql")),
     ("V3__no_auto_sauce", include_str!("../migrations/V3__no_auto_sauce.sql")),
+    ("V4__ai_metadata", include_str!("../migrations/V4__ai_metadata.sql")),
 ];
 
 fn now_secs() -> i64 {

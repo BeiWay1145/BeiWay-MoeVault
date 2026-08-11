@@ -23,6 +23,119 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/images/{id}/recycle", post(recycle_image))
         .route("/api/v1/images/{id}/sidecar", post(generate_sidecar))
+        .route("/api/v1/images/{id}/file", get(get_original_file))
+        .route("/api/v1/images/{id}/similar", get(similar_images))
+        .route("/api/v1/images/{id}/ai-info", post(read_ai_info))
+}
+
+/// GET /api/v1/images/{id}/file：返回原图（stream）。
+async fn get_original_file(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let library_dir = state.library_dir();
+    let img = tokio::task::spawn_blocking(move || db.get_image_by_id(id))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    let Some(img) = img else {
+        return Err(error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")));
+    };
+    let path = library_dir.join(&img.rel_path);
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            let mime = mime_for_ext(&img.format);
+            let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+            Ok(axum::response::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, mime)
+                .body(body)
+                .unwrap())
+        }
+        Err(_) => Err(error_response(ErrorKind::NotFound, "原图文件不存在".to_string())),
+    }
+}
+
+fn mime_for_ext(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// GET /api/v1/images/{id}/similar：pHash 邻近图（汉明距离升序）。
+async fn similar_images(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let limit = params.limit.unwrap_or(12).min(50);
+    let db = state.db.clone();
+    let items = tokio::task::spawn_blocking(move || {
+        let target = db.get_image_by_id(id).map_err(db_error_response)?;
+        let Some(target) = target else {
+            return Err(error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")));
+        };
+        let all = db.all_active_images().map_err(db_error_response)?;
+        // 汉明距离排序（排除自身）
+        let mut sims: Vec<(i64, u32)> = all
+            .iter()
+            .filter(|(iid, _, _)| *iid != id)
+            .map(|(iid, phash, _)| (*iid, (target.phash as u64 ^ *phash as u64).count_ones()))
+            .collect();
+        sims.sort_by_key(|(_, d)| *d);
+        sims.truncate(limit as usize);
+        let ids: Vec<i64> = sims.iter().map(|(iid, _)| *iid).collect();
+        let mut out = Vec::new();
+        for iid in ids {
+            if let Ok(Some(img)) = db.get_image_by_id(iid) {
+                out.push(json!({
+                    "id": img.id,
+                    "thumb_rel": img.thumb_rel,
+                    "rel_path": img.rel_path,
+                    "width": img.width,
+                    "height": img.height,
+                }));
+            }
+        }
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(out)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// POST /api/v1/images/{id}/ai-info：手动读取 AI 生成图片元信息（PNG tEXt）。
+async fn read_ai_info(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let library_dir = state.library_dir();
+    let result = tokio::task::spawn_blocking(move || {
+        let img = db
+            .get_image_by_id(id)
+            .map_err(db_error_response)?
+            .ok_or_else(|| error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")))?;
+        let path = library_dir.join(&img.rel_path);
+        let meta = moevault_ingest::features::read_ai_metadata(&path);
+        match &meta {
+            Some(m) => {
+                db.set_ai_metadata(id, m).map_err(db_error_response)?;
+                Ok::<_, (axum::http::StatusCode, Json<Value>)>(json!({
+                    "ok": true, "is_ai": true, "metadata": m,
+                }))
+            }
+            None => Ok(json!({ "ok": true, "is_ai": false, "metadata": null })),
+        }
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(result))
 }
 
 /// POST /api/v1/images/{id}/sidecar：生成 sidecar .txt（逗号分隔标签，与 cl_tagger 格式一致）。
@@ -113,6 +226,8 @@ pub struct ListParams {
     pub min_height: Option<i64>,
     /// 只看冗余候选（1/0/true/false）。
     pub is_redundant: Option<String>,
+    /// 只看 AI 生成图片（1/0/true/false）。
+    pub is_ai: Option<String>,
     /// 排序键：imported/date/aesthetic/clarity/size/random。
     pub sort: Option<String>,
     /// asc/desc。
@@ -181,7 +296,23 @@ impl ListParams {
             min_width: self.min_width,
             min_height: self.min_height,
             is_redundant: self.parse_redundant()?,
+            is_ai: self.parse_ai()?,
         })
+    }
+
+    fn parse_ai(&self) -> Result<Option<bool>, (axum::http::StatusCode, Json<Value>)> {
+        match &self.is_ai {
+            None => Ok(None),
+            Some(v) if v.trim().is_empty() => Ok(None),
+            Some(v) => match v.to_lowercase().as_str() {
+                "1" | "true" | "yes" => Ok(Some(true)),
+                "0" | "false" | "no" => Ok(Some(false)),
+                _ => Err(error_response(
+                    ErrorKind::InvalidInput,
+                    format!("is_ai 仅支持 1/0/true/false，收到: {v}"),
+                )),
+            },
+        }
     }
 }
 

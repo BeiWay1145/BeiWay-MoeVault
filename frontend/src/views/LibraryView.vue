@@ -23,9 +23,7 @@ const viewOptions: { key: ViewMode; icon: typeof Grid; label: string }[] = [
 
 const sortOptions = [
   { key: 'imported', label: '导入时间' },
-  { key: 'date', label: '拍摄日期' },
   { key: 'aesthetic', label: '美学分' },
-  { key: 'clarity', label: '清晰度' },
   { key: 'size', label: '文件大小' },
   { key: 'random', label: '随机' },
 ]
@@ -90,6 +88,13 @@ async function onRecycleSelected() {
 async function onSortChange() {
   await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
 }
+
+/** 切换"仅 AI 生成"筛选。 */
+async function onToggleAiFilter(val: boolean | string | number) {
+  await library
+    .applyFilter({ isAi: val === true || val === 'true' ? true : undefined })
+    .catch((e: Error) => ElMessage.error(e.message))
+}
 </script>
 
 <template>
@@ -108,6 +113,13 @@ async function onSortChange() {
       <el-button @click="onSortChange(); library.sortAsc = !library.sortAsc">
         {{ library.sortAsc ? '升序 ↑' : '降序 ↓' }}
       </el-button>
+
+      <el-checkbox
+        :model-value="library.filter.isAi === true"
+        @change="onToggleAiFilter"
+      >
+        仅 AI 生成
+      </el-checkbox>
 
       <div class="spacer" />
 

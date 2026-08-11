@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { Search } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { useLibraryStore } from '@/stores/library'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useLibraryStore, type ImageItem } from '@/stores/library'
+import { post } from '@/api/client'
 import ImageWall from '@/components/ImageWall.vue'
+import ImagePreview from '@/components/ImagePreview.vue'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
@@ -13,6 +15,32 @@ const aestheticMin = ref<number | null>(null)
 const source = ref('')
 const onlyRedundant = ref(false)
 const tagsInput = ref('')
+
+// 预览
+const previewVisible = ref(false)
+const previewImage = ref<ImageItem | null>(null)
+function openPreview(img: ImageItem) {
+  previewImage.value = img
+  previewVisible.value = true
+}
+
+async function onRecycle(img: ImageItem) {
+  try {
+    await ElMessageBox.confirm(`将「${img.name}」移入回收站？可随时恢复。`, '删除确认', {
+      type: 'warning',
+      confirmButtonText: '移入回收站',
+    })
+  } catch {
+    return
+  }
+  try {
+    await post(`/images/${img.id}/recycle`, { reason: 'manual' })
+    ElMessage.success('已移入回收站')
+    await library.fetchImages()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
 
 onMounted(() => {
   library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
@@ -90,9 +118,16 @@ async function clearSearch() {
       <ImageWall
         :images="library.images"
         :view-mode="library.viewMode"
+        :selected="library.selected"
         @click="(img: any) => router.push(`/library/${img.id}`)"
+        @toggle-select="library.toggleSelect($event.id)"
+        @preview="openPreview"
+        @recycle="onRecycle"
       />
     </div>
+
+    <!-- 大图预览 -->
+    <ImagePreview v-model="previewVisible" :image="previewImage" />
   </div>
 </template>
 
