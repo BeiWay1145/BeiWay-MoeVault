@@ -10,6 +10,7 @@ const router = createRouter({
       children: [
         { path: '', name: 'dashboard', component: () => import('@/views/DashboardView.vue'), meta: { title: '总览' } },
         { path: 'library', name: 'library', component: () => import('@/views/LibraryView.vue'), meta: { title: '图库' } },
+        { path: 'imports', name: 'imports', component: () => import('@/views/ImportDirectoryView.vue'), meta: { title: '主目录' } },
         { path: 'library/:id', name: 'image-detail', component: () => import('@/views/ImageDetailView.vue'), meta: { title: '图片详情' } },
         { path: 'search', name: 'search', component: () => import('@/views/SearchView.vue'), meta: { title: '搜索' } },
         { path: 'dedup', name: 'dedup', component: () => import('@/views/DedupView.vue'), meta: { title: '查重' } },

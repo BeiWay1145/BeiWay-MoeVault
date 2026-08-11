@@ -173,6 +173,11 @@ fn process_one(
         source_url: None,
         no_auto_sauce: false,
         ai_metadata: None,
+        // 来源文件夹名：取源文件所在目录名（主目录按来源分组）
+        source_dir: src
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned()),
         thumb_rel: thumb_rel.to_string_lossy().into_owned(),
         imported_at: now,
     };

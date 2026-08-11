@@ -185,6 +185,7 @@ mod tests {
             ai_metadata: None,
             thumb_rel: format!("{md5}.webp"),
             imported_at: 0,
+            source_dir: None,
         }
     }
 

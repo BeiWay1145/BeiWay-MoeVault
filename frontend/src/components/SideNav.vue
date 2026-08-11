@@ -9,6 +9,7 @@ import {
   Delete,
   CollectionTag,
   Setting,
+  FolderOpened,
 } from '@element-plus/icons-vue'
 import { useDedupStore } from '@/stores/dedup'
 
@@ -24,6 +25,7 @@ const activeMenu = computed(() => {
 const menus = [
   { path: '/', label: '总览', icon: DataAnalysis },
   { path: '/library', label: '图库', icon: Picture },
+  { path: '/imports', label: '主目录', icon: FolderOpened },
   { path: '/search', label: '搜索', icon: Search },
   { path: '/dedup', label: '查重', icon: Connection, badge: 'dedup' },
   { path: '/trash', label: '回收站', icon: Delete },

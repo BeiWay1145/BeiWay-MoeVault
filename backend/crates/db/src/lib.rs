@@ -53,6 +53,9 @@ pub struct Job {
     pub finished_at: Option<i64>,
 }
 
+/// 主目录某天的来源分组：`(来源文件夹名, 图片数)`。
+pub type ImportDirCount = (Option<String>, i64);
+
 /// SQLite 数据库封装。单连接 + Mutex：SQLite 写串行化，WAL 下读并发足够。
 #[derive(Clone)]
 pub struct Db {
@@ -303,6 +306,186 @@ impl Db {
         Ok(out)
     }
 
+    // ---------- 主目录（按天 → 来源分组） ----------
+
+    /// 主目录树：active 图片按导入日期（本地时区天）分组，组内按来源文件夹分组。
+    /// 返回 `[(date_str, [ImportDirCount])]`，日期倒序、来源组内按数量倒序。
+    /// 筛选参数（sauce/tag/ai 三元组）用于计数：空组自动隐藏。
+    pub fn import_tree(
+        &self,
+        sauce: Option<&str>,
+        tag: Option<&str>,
+        ai: Option<&str>,
+    ) -> Result<Vec<(String, Vec<ImportDirCount>)>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        // 条件：active + 筛选
+        let mut conds = vec!["i.status = 'active'".to_string()];
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(s) = sauce {
+            match s {
+                "sauced" => conds.push(
+                    "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')"
+                        .to_string(),
+                ),
+                "unsauced" => conds.push(
+                    "(i.source_url IS NULL OR i.source_url = '') AND (i.source = 'local' OR i.source = '')"
+                        .to_string(),
+                ),
+                _ => {}
+            }
+        }
+        if let Some(t) = tag {
+            match t {
+                "tagged" => conds.push(
+                    "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
+                        .to_string(),
+                ),
+                "untagged" => conds.push(
+                    "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
+                        .to_string(),
+                ),
+                "no_need" => conds.push(
+                    "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')"
+                        .to_string(),
+                ),
+                _ => {}
+            }
+        }
+        if let Some(a) = ai {
+            match a {
+                "ai" => conds.push("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '')".to_string()),
+                "not_ai" => conds.push("(i.ai_metadata IS NULL OR i.ai_metadata = '')".to_string()),
+                _ => {}
+            }
+        }
+        let where_sql = conds.join(" AND ");
+        // 按天 + 来源分组统计（日期用本地时区：date(imported_at, 'unixepoch', 'localtime')）
+        let sql = format!(
+            "SELECT date(i.imported_at, 'unixepoch', 'localtime') AS day,
+                    i.source_dir,
+                    COUNT(*) AS cnt
+             FROM images i
+             WHERE {where_sql}
+             GROUP BY day, i.source_dir
+             ORDER BY day DESC, cnt DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        // 聚合为 天 → [来源组]
+        let mut days: Vec<(String, Vec<ImportDirCount>)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let day: String = row.get(0)?;
+            let dir: Option<String> = row.get(1)?;
+            let cnt: i64 = row.get(2)?;
+            match days.last_mut() {
+                Some((d, dirs)) if *d == day => dirs.push((dir, cnt)),
+                _ => days.push((day, vec![(dir, cnt)])),
+            }
+        }
+        Ok(days)
+    }
+
+    /// 某来源组的图片（active，游标分页）。
+    /// 返回 (items, next_cursor)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_dir_images(
+        &self,
+        day: &str,
+        source_dir: Option<&str>,
+        sauce: Option<&str>,
+        tag: Option<&str>,
+        ai: Option<&str>,
+        limit: i64,
+        cursor_id: Option<i64>,
+    ) -> Result<(Vec<ImageListItem>, Option<i64>), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 200);
+        let mut conds = vec![
+            "i.status = 'active'".to_string(),
+            "date(i.imported_at, 'unixepoch', 'localtime') = ?1".to_string(),
+            "COALESCE(i.source_dir, '') = ?2".to_string(),
+        ];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(day.to_string()),
+            Box::new(source_dir.unwrap_or("").to_string()),
+        ];
+        // 复用与 tree 相同的筛选
+        if let Some(s) = sauce {
+            match s {
+                "sauced" => conds.push(
+                    "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')"
+                        .to_string(),
+                ),
+                "unsauced" => conds.push(
+                    "(i.source_url IS NULL OR i.source_url = '') AND (i.source = 'local' OR i.source = '')"
+                        .to_string(),
+                ),
+                _ => {}
+            }
+        }
+        if let Some(t) = tag {
+            match t {
+                "tagged" => conds.push(
+                    "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
+                        .to_string(),
+                ),
+                "untagged" => conds.push(
+                    "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
+                        .to_string(),
+                ),
+                "no_need" => conds.push(
+                    "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')"
+                        .to_string(),
+                ),
+                _ => {}
+            }
+        }
+        if let Some(a) = ai {
+            match a {
+                "ai" => conds.push("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '')".to_string()),
+                "not_ai" => conds.push("(i.ai_metadata IS NULL OR i.ai_metadata = '')".to_string()),
+                _ => {}
+            }
+        }
+        // 游标
+        let base_param_n = params.len() + 1;
+        if let Some(c) = cursor_id {
+            conds.push(format!("i.id > ?{base_param_n}"));
+            params.push(Box::new(c));
+        }
+        let where_sql = conds.join(" AND ");
+        let limit_ph = params.len() + 1;
+        let sql = format!(
+            "SELECT i.id, i.md5, i.rel_path, i.width, i.height, i.format, i.size_bytes,
+                    i.exif_datetime, i.clarity_score, i.aesthetic_score,
+                    i.is_redundant, i.source, i.source_url, i.imported_at, i.thumb_rel,
+                    (i.ai_metadata IS NOT NULL AND i.ai_metadata != '')
+             FROM images i
+             WHERE {where_sql}
+             ORDER BY i.id ASC
+             LIMIT ?{limit_ph}"
+        );
+        params.push(Box::new(limit));
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            items.push(row_to_item(row)?);
+        }
+        let next = if items.len() as i64 == limit {
+            items.last().map(|i| i.id)
+        } else {
+            None
+        };
+        Ok((items, next))
+    }
+
     // ---------- 图片写入 ----------
 
     /// 判断 md5 是否已存在。
@@ -328,8 +511,8 @@ impl Db {
                 "INSERT OR IGNORE INTO images
                  (md5, phash, rel_path, width, height, format, size_bytes, file_mtime,
                   exif_datetime, clarity_score, aesthetic_score, dedup_group, is_redundant,
-                  status, source, source_url, thumb_rel, imported_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                  status, source, source_url, thumb_rel, imported_at, source_dir)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             )?;
             for img in images {
                 stmt.execute(params![
@@ -351,6 +534,7 @@ impl Db {
                     img.source_url,
                     img.thumb_rel,
                     img.imported_at,
+                    img.source_dir,
                 ])?;
             }
         }
@@ -616,7 +800,8 @@ impl Db {
         conn.query_row(
             "SELECT id, md5, phash, rel_path, width, height, format, size_bytes, file_mtime,
                     exif_datetime, clarity_score, aesthetic_score, dedup_group, is_redundant,
-                    status, source, source_url, no_auto_sauce, ai_metadata, thumb_rel, imported_at
+                    status, source, source_url, no_auto_sauce, ai_metadata, thumb_rel, imported_at,
+                    source_dir
              FROM images WHERE id = ?1",
             params![id],
             |r| {
@@ -642,6 +827,7 @@ impl Db {
                     ai_metadata: r.get(18)?,
                     thumb_rel: r.get(19)?,
                     imported_at: r.get(20)?,
+                    source_dir: r.get(21)?,
                 })
             },
         )
@@ -1420,6 +1606,7 @@ mod tests {
                 ai_metadata: None,
                 thumb_rel: format!("p{i}.webp"),
                 imported_at: i as i64,
+                source_dir: None,
             });
         }
         db.insert_images(&imgs).unwrap();

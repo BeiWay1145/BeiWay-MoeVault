@@ -35,6 +35,8 @@ pub struct Image {
     pub no_auto_sauce: bool,
     /// AI 生成图片元信息（PNG tEXt 读取的 parameters/prompt 等）。
     pub ai_metadata: Option<String>,
+    /// 来源文件夹名（导入时从源路径提取，主目录按来源分组用）。
+    pub source_dir: Option<String>,
     pub thumb_rel: String,
     pub imported_at: i64,
 }
