@@ -279,53 +279,54 @@ onMounted(async () => {
         </el-form>
       </el-tab-pane>
 
-      <el-tab-pane label="打标" name="tagging">
-        <el-form label-width="160px" style="max-width: 720px">
-          <el-form-item label="打标模型">
-            <el-select
-              :model-value="settings.settings.tagger_model_name"
-              style="width: 260px"
-              @change="onModelSelect"
-            >
-              <el-option v-for="o in taggerModelOptions" :key="o.name" :label="o.name" :value="o.name" />
-            </el-select>
-            <el-button style="margin-left: 8px" @click="ElMessage.info('当前: ' + settings.settings.tagger_model_dir)">
-              模型路径
-            </el-button>
-          </el-form-item>
-          <el-form-item label="模型目录">
-            <el-input v-model="settings.settings.tagger_model_dir" placeholder="D:/Game/AI/cl_tagger/models" style="width: 400px" />
-          </el-form-item>
-          <el-form-item label="置信度阈值">
-            <el-slider v-model="settings.settings.tag_threshold" :min="0" :max="1" :step="0.05" show-input style="width: 260px" />
-          </el-form-item>
-          <el-form-item label="推理设备">
-            <el-select v-model="settings.settings.tagger_device" style="width: 260px">
-              <el-option v-for="d in taggerDevices" :key="d.id" :label="d.name" :value="d.id" />
-            </el-select>
-            <span class="hint">GPU 加速打标（下次任务生效）</span>
-          </el-form-item>
-        </el-form>
+      <el-tab-pane label="本地推理" name="inference">
+        <el-card header="打标" shadow="never" class="inf-card">
+          <el-form label-width="160px" style="max-width: 720px">
+            <el-form-item label="打标模型">
+              <el-select
+                :model-value="settings.settings.tagger_model_name"
+                style="width: 260px"
+                @change="onModelSelect"
+              >
+                <el-option v-for="o in taggerModelOptions" :key="o.name" :label="o.name" :value="o.name" />
+              </el-select>
+              <el-button style="margin-left: 8px" @click="ElMessage.info('当前: ' + settings.settings.tagger_model_dir)">
+                模型路径
+              </el-button>
+            </el-form-item>
+            <el-form-item label="模型目录">
+              <el-input v-model="settings.settings.tagger_model_dir" placeholder="D:/Game/AI/cl_tagger/models" style="width: 400px" />
+            </el-form-item>
+            <el-form-item label="置信度阈值">
+              <el-slider v-model="settings.settings.tag_threshold" :min="0" :max="1" :step="0.05" show-input style="width: 260px" />
+            </el-form-item>
+            <el-form-item label="推理设备">
+              <el-select v-model="settings.settings.tagger_device" style="width: 260px">
+                <el-option v-for="d in taggerDevices" :key="d.id" :label="d.name" :value="d.id" />
+              </el-select>
+              <span class="hint">GPU 加速打标（下次任务生效）</span>
+            </el-form-item>
+          </el-form>
+        </el-card>
+        <el-card header="美学评分" shadow="never" class="inf-card">
+          <el-form label-width="160px" style="max-width: 720px">
+            <el-form-item label="模型">
+              <el-input v-model="settings.settings.aesthetic_model" />
+            </el-form-item>
+            <el-form-item label="推理设备">
+              <el-select v-model="settings.settings.aesthetic_device" style="width: 260px">
+                <el-option v-for="d in aestheticDevices" :key="d.id" :label="d.name" :value="d.id" />
+              </el-select>
+              <span class="hint">GPU 加速美学评分（下次任务生效）</span>
+            </el-form-item>
+          </el-form>
+        </el-card>
       </el-tab-pane>
 
       <el-tab-pane label="查重" name="dedup">
         <el-form label-width="160px" style="max-width: 720px">
           <el-form-item label="pHash 汉明距离阈值">
             <el-slider v-model="settings.settings.dedup_hamming" :min="0" :max="64" show-input style="width: 260px" />
-          </el-form-item>
-        </el-form>
-      </el-tab-pane>
-
-      <el-tab-pane label="美学" name="aesthetic">
-        <el-form label-width="160px" style="max-width: 720px">
-          <el-form-item label="模型">
-            <el-input v-model="settings.settings.aesthetic_model" />
-          </el-form-item>
-          <el-form-item label="推理设备">
-            <el-select v-model="settings.settings.aesthetic_device" style="width: 260px">
-              <el-option v-for="d in aestheticDevices" :key="d.id" :label="d.name" :value="d.id" />
-            </el-select>
-            <span class="hint">GPU 加速美学评分（下次任务生效）</span>
           </el-form-item>
         </el-form>
       </el-tab-pane>
@@ -428,6 +429,9 @@ onMounted(async () => {
 }
 .key-tag {
   margin-right: 8px;
+}
+.inf-card {
+  margin-bottom: 12px;
 }
 .warn {
   color: var(--el-color-danger);

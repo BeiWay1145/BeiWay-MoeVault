@@ -202,7 +202,7 @@ function fmtTime(ts: number | null | undefined) {
             <code class="payload">{{ detail.payload }}</code>
           </el-descriptions-item>
         </el-descriptions>
-        <div v-if="(detail.keys_usage as unknown[])?.length" class="usage-block">
+        <div v-if="detail.type === 'sauce' && (detail.keys_usage as unknown[])?.length" class="usage-block">
           <div class="usage-title">SauceNAO 密钥额度消耗</div>
           <el-table :data="detail.keys_usage as unknown[]" size="small">
             <el-table-column prop="name" label="名称" width="100" />
