@@ -59,6 +59,37 @@ impl Config {
         if let Ok(v) = std::env::var("MOEVAULT_INFER_BASE") {
             cfg.infer_base_url = v;
         }
+        // 未显式指定时自动探测前端构建产物（frontend/dist），存在则托管，
+        // 便于纯浏览器访问 http://127.0.0.1:9178/ 直接打开 UI（Tauri 壳不受影响）。
+        if cfg.static_dir.is_none() {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            let mut push_upward = |base: PathBuf| {
+                let mut dir = Some(base);
+                let mut hops = 0;
+                while let Some(d) = dir {
+                    candidates.push(d.join("frontend").join("dist"));
+                    hops += 1;
+                    if hops > 5 {
+                        break;
+                    }
+                    dir = d.parent().map(|p| p.to_path_buf());
+                }
+            };
+            if let Ok(cwd) = std::env::current_dir() {
+                push_upward(cwd);
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    push_upward(dir.to_path_buf());
+                }
+            }
+            for c in candidates {
+                if c.join("index.html").is_file() {
+                    cfg.static_dir = Some(c);
+                    break;
+                }
+            }
+        }
         cfg
     }
 
