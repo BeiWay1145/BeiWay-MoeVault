@@ -56,12 +56,15 @@ impl SauceNaoClient {
     }
 
     /// 用本地文件溯源（指定 API key）。返回 (结果, 配额头)。
+    /// 错误时也携带配额头（Err 元组第二项），供调度器在失败/限流时更新配额。
     pub async fn search_file(
         &self,
         path: &Path,
         api_key: &str,
-    ) -> Result<(SauceNaoResult, QuotaHeaders), TaggerError> {
-        let bytes = tokio::fs::read(path).await?;
+    ) -> Result<(SauceNaoResult, QuotaHeaders), (TaggerError, QuotaHeaders)> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| (TaggerError::Io(e), QuotaHeaders::default()))?;
         let filename = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -76,27 +79,42 @@ impl SauceNaoClient {
             .text("numres", "5")
             .part("file", part);
 
-        let resp = self.http.post(SAUCENAO_ENDPOINT).multipart(form).send().await?;
-
-        // 配额头（X-Short-Remaining / X-Long-Remaining）
-        let quota = QuotaHeaders {
-            short_remaining: resp
-                .headers()
-                .get("X-Short-Remaining")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok()),
-            long_remaining: resp
-                .headers()
-                .get("X-Long-Remaining")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok()),
+        let resp = match self.http.post(SAUCENAO_ENDPOINT).multipart(form).send().await {
+            Ok(r) => r,
+            Err(e) => return Err((TaggerError::Http(e), QuotaHeaders::default())),
         };
-
-        let body: Value = resp.json().await?;
+        // 先取响应头配额（json() 会消费 resp），再解析 body
+        let header_short = resp
+            .headers()
+            .get("X-Short-Remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok());
+        let header_long = resp
+            .headers()
+            .get("X-Long-Remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok());
+        let body: Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => return Err((TaggerError::Http(e), QuotaHeaders::default())),
+        };
         tracing::debug!(
             "SauceNAO 原始响应（前 300 字符）: {}",
             &body.to_string()[..body.to_string().len().min(300)]
         );
+
+        // 配额：SauceNAO 实际放在 JSON body 的 header.short_remaining / header.long_remaining，
+        // 响应头 X-Short-Remaining / X-Long-Remaining 作为回退。
+        let body_short = body
+            .pointer("/header/short_remaining")
+            .and_then(|v| v.as_i64());
+        let body_long = body
+            .pointer("/header/long_remaining")
+            .and_then(|v| v.as_i64());
+        let quota = QuotaHeaders {
+            short_remaining: body_short.or(header_short),
+            long_remaining: body_long.or(header_long),
+        };
 
         let code = body
             .pointer("/header/status")
@@ -109,11 +127,17 @@ impl SauceNaoClient {
                 .unwrap_or("未知错误")
                 .to_string();
             return Err(if code == 3 {
-                TaggerError::RateLimited(
-                    body.pointer("/header/retry_in").and_then(|v| v.as_i64()).unwrap_or(30),
+                (
+                    TaggerError::RateLimited(
+                        body.pointer("/header/retry_in").and_then(|v| v.as_i64()).unwrap_or(30),
+                    ),
+                    quota,
                 )
             } else {
-                TaggerError::Invalid(format!("SauceNAO 返回错误 {code}: {msg}"))
+                (
+                    TaggerError::Invalid(format!("SauceNAO 返回错误 {code}: {msg}")),
+                    quota,
+                )
             });
         }
 
@@ -153,7 +177,7 @@ impl SauceNaoClient {
                 tracing::debug!(similarity = r.similarity, urls = r.ext_urls.len(), "SauceNAO 溯源成功");
                 Ok((r, quota))
             }
-            None => Err(TaggerError::NoSource("SauceNAO 无匹配结果".into())),
+            None => Err((TaggerError::NoSource("SauceNAO 无匹配结果".into()), quota)),
         }
     }
 }

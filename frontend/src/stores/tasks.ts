@@ -35,6 +35,8 @@ export const useTaskStore = defineStore('tasks', () => {
   const running = ref(0)
   /** 已通知过完成的任务 id 集合（避免重复弹窗）。 */
   const notified = ref<Set<number>>(new Set())
+  /** 首次加载已完成（初始化集合，不弹历史通知）。 */
+  let initialized = false
   let timer: number | undefined
 
   async function load() {
@@ -42,6 +44,15 @@ export const useTaskStore = defineStore('tasks', () => {
       const d = await get<{ items: TaskItem[] }>('/tasks?limit=100')
       tasks.value = d.items
       running.value = d.items.filter((t) => t.status === 'running' || t.status === 'pending').length
+      if (!initialized) {
+        // 首次加载：把现有完成/失败任务记入已通知集合（历史任务不再重复提示），
+        // 之后轮询只提示本会话新出现的完成/失败任务。
+        for (const t of d.items) {
+          if (t.status === 'done' || t.status === 'failed') notified.value.add(t.id)
+        }
+        initialized = true
+        return
+      }
       // 检测新完成的任务 → 顶部通知
       for (const t of d.items) {
         if ((t.status === 'done' || t.status === 'failed') && !notified.value.has(t.id)) {

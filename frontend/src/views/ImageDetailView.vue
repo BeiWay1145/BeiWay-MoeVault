@@ -172,6 +172,13 @@ async function recycle() {
   }
 }
 
+/** 返回来源页（画廊/搜索）——叉号点击直接返回，不受浏览多张影响。 */
+function goBack() {
+  const from = library.detailPos?.from
+  if (from === 'search') router.push('/search')
+  else router.push('/library')
+}
+
 // 手动打标（BUG3 任务化）：加入打标队列，进度见任务中心
 async function manualTag() {
   if (!image.value) return
@@ -242,7 +249,7 @@ onUnmounted(() => {
 <template>
   <div v-if="image" class="detail">
     <div class="viewer">
-      <button class="nav-close" title="返回" @click="router.back()">✕</button>
+      <button class="nav-close" title="返回" @click="goBack">✕</button>
       <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
       <div ref="stageRef" class="stage" @click="enterFullscreen">
         <el-image :src="originalSrc" fit="contain" class="stage-img" :preview-src-list="[]">

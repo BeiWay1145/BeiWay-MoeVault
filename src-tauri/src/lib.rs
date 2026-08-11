@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use tauri::Manager;
+use tauri::WindowEvent;
 
 const BACKEND_URL: &str = "http://127.0.0.1:9178";
 const BACKEND_PORT: u16 = 9178;
@@ -16,6 +17,15 @@ const BACKEND_PORT: u16 = 9178;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .on_window_event(|window, event| {
+      // 增强：关闭窗口 = 最小化到任务栏（后台批量处理不被中断）；再次单击任务栏图标恢复
+      if let WindowEvent::CloseRequested { api, .. } = event {
+        if window.label() == "main" {
+          let _ = window.minimize();
+          api.prevent_close();
+        }
+      }
+    })
     .setup(|app| {
       // 启动后端
       match start_backend() {

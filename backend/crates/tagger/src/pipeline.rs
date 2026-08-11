@@ -134,6 +134,11 @@ pub(crate) fn filter_eligible(
     let mut out = Vec::new();
     for id in ids {
         let Some(img) = db.get_image_by_id(*id)? else { continue };
+        // GIF 动图：打标/溯源/美学均跳过（帧图无意义，浪费配额/时间）
+        if img.format.eq_ignore_ascii_case("gif") {
+            tracing::info!(image_id = *id, "批量任务跳过（GIF 动图）");
+            continue;
+        }
         let tags = db.image_tags(*id).unwrap_or_default();
         let is_ai = img.ai_metadata.is_some()
             || tags.iter().any(|t| t.source == "ai");
@@ -324,11 +329,12 @@ async fn sauce_one(
     // 从调度器获取可用 key
     let (api_key, key_idx) = pool.acquire().await;
 
-    // SauceNAO 溯源（带 key）
+    // SauceNAO 溯源（带 key）；失败也携带配额头，用于更新调度器
     let (result, quota) = match sauce.search_file(&file_path, &api_key).await {
         Ok(r) => r,
-        Err(e) => {
-            // 请求失败：标记 key 失败（冷却），溯源失败
+        Err((e, err_quota)) => {
+            // 失败：先更新配额（若响应带配额），再标记 key 冷却
+            pool.update(key_idx, err_quota.short_remaining, err_quota.long_remaining).await;
             pool.on_failure(key_idx).await;
             let is_no_result = matches!(e, TaggerError::NoSource(_));
             warn!(image_id, error = %e, is_no_result, "溯源失败");
