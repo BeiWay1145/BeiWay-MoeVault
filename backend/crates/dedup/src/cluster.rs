@@ -235,9 +235,9 @@ mod tests {
         let stats = full_recluster(&db, 8).unwrap();
         assert_eq!(stats.groups_created, 3);
         assert_eq!(stats.images_clustered, 3); // a1,a2 入 a0；b1 入 b0
-        // 验证 A 簇：3 成员，最优为 a0（clarity 9），其余冗余
+        // 列表只返回有冗余的组：A（3成员 2冗余）+ B（2成员 1冗余），C 单图不返回
         let groups = db.list_dedup_groups(100, None).unwrap().0;
-        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.len(), 2, "无冗余组不应显示");
         let group_a = groups.iter().find(|g| g.size == 3).expect("A 组应存在");
         assert_eq!(group_a.redundant_count, 2);
         // B 组 2 成员 1 冗余
@@ -267,7 +267,8 @@ mod tests {
         let s2 = incremental_cluster(&db, 8).unwrap();
         assert_eq!(s2.groups_created, 1); // 只有 c0 开新簇
         assert_eq!(s2.images_clustered, 1); // a1 入 a0 簇
-        assert_eq!(db.dedup_stats().unwrap().group_count, 3);
+        // 统计口径与列表一致：只统计含冗余的组（a0/a1 组 1 冗余；b0、c0 单图不计）
+        assert_eq!(db.dedup_stats().unwrap().group_count, 1);
         // A 簇 best 仍是最清晰的 a0（已分组不重排）
         let groups = db.list_dedup_groups(100, None).unwrap().0;
         let ga = groups.iter().find(|g| g.size == 2).unwrap();

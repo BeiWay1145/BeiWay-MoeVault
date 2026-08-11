@@ -19,6 +19,8 @@ export interface ImageItem {
   thumbRel: string
   /** 是否 AI 生成图片 */
   isAi: boolean
+  /** 文件扩展名（如 jpg/png） */
+  format?: string
 }
 
 export type ViewMode = 'grid' | 'waterfall' | 'list'
@@ -92,6 +94,7 @@ export const useLibraryStore = defineStore('library', () => {
         importedAt: it.imported_at as number,
         thumbRel: (it.thumb_rel as string) ?? '',
         isAi: it.is_ai as boolean,
+        format: (it.format as string) ?? undefined,
       }))
       total.value = d.total
     } finally {
@@ -107,6 +110,15 @@ export const useLibraryStore = defineStore('library', () => {
 
   function clearFilter() {
     filter.value = {}
+  }
+
+  /** 从当前列表移除一张图（详情页删除后调用）。 */
+  function removeImageById(id: number) {
+    const idx = images.value.findIndex((i) => i.id === id)
+    if (idx >= 0) {
+      images.value.splice(idx, 1)
+      total.value = Math.max(0, total.value - 1)
+    }
   }
 
   function toggleSelect(id: number) {
@@ -132,6 +144,7 @@ export const useLibraryStore = defineStore('library', () => {
     fetchImages,
     applyFilter,
     clearFilter,
+    removeImageById,
     toggleSelect,
     clearSelect,
   }

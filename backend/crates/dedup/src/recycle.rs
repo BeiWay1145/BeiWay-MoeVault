@@ -89,6 +89,8 @@ pub fn purge_image(
 
     // 先删回收站记录（recycle_bin 外键无级联），再删图片行（image_tags 级联）
     db.delete_recycle_bin(image_id)?;
+    // 若该图是某查重组的 best_image，先解除引用（dedup_groups.best_image 无级联）
+    db.unset_group_best_ref(image_id)?;
     db.delete_image_row(image_id)?;
     debug!(image_id, "图片已永久删除");
     Ok(())

@@ -14,7 +14,6 @@ const tags = ref<Array<{ name: string; name_cn: string | null; category: string;
 const aiInfo = ref<string | null>(null)
 const aiTags = ref<string[]>([])
 const aiChecked = ref(false)
-const fullscreen = ref(false)
 const stageRef = ref<HTMLElement | null>(null)
 
 const originalSrc = computed(() => (image.value ? originalUrl(image.value.id) : undefined))
@@ -29,24 +28,11 @@ function gotoImage(delta: number) {
   router.push(`/library/${next.id}`)
 }
 
-// 键盘左右键切换（详情页 + 全屏）
+// 键盘左右键切换 + Del 删除（放入回收站）
 function onKeydown(e: KeyboardEvent) {
   if (e.key === 'ArrowLeft') gotoImage(-1)
   else if (e.key === 'ArrowRight') gotoImage(1)
-}
-
-// 全屏切换
-async function toggleFullscreen() {
-  if (fullscreen.value) {
-    await document.exitFullscreen().catch(() => {})
-    fullscreen.value = false
-  } else {
-    const el = stageRef.value
-    if (el) {
-      await el.requestFullscreen().catch((err) => ElMessage.warning(`全屏失败: ${err}`))
-      fullscreen.value = true
-    }
-  }
+  else if (e.key === 'Delete' || e.key === 'Del') recycle()
 }
 
 async function loadDetail() {
@@ -101,22 +87,42 @@ async function markAsAi() {
   }
 }
 
+// 放入回收站：无提示；删除后跳到上一张，无上一张则下一张，无则回图库
 async function recycle() {
   if (!image.value) return
+  const id = image.value.id
+  const list = [...library.images]
+  const idx = list.findIndex((i) => i.id === id)
   try {
-    await post(`/images/${image.value.id}/recycle`, { reason: 'manual' })
-    ElMessage.success('已移入回收站')
-    router.push('/library')
+    await post(`/images/${id}/recycle`, { reason: 'manual' })
+    // 从本地列表移除，避免 computed 失效
+    library.removeImageById(id)
+    // 目标：优先上一张，无则下一张，无则回图库
+    let target: { id: number } | undefined
+    if (idx > 0) target = list[idx - 1]
+    else if (idx === 0 && list.length > 1) target = list[1]
+    if (target) {
+      router.push(`/library/${target.id}`)
+    } else {
+      router.push('/library')
+    }
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-async function genSidecar() {
+// 手动打标：本地 cl_tagger 模型打标（替代原 sidecar 功能）
+async function manualTag() {
   if (!image.value) return
   try {
-    const r = await post<{ ok: boolean; path: string }>(`/images/${image.value.id}/sidecar`)
-    ElMessage.success(`已生成 sidecar: ${r.path}`)
+    const r = await post<{ ok: boolean; count?: number; message?: string }>(`/images/${image.value.id}/retag`, { force: true })
+    ElMessage.success(r.count != null ? `打标完成，写入 ${r.count} 个标签` : (r.message ?? '打标完成'))
+    tags.value = []
+    // 刷新标签
+    const t = await get<{ tags: Array<{ name: string; name_cn: string | null; category: string; source: string }> }>(
+      `/images/${image.value.id}/tags`,
+    )
+    tags.value = t.tags
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -133,9 +139,6 @@ function exportImage() {
 onMounted(() => {
   loadDetail()
   window.addEventListener('keydown', onKeydown)
-  document.addEventListener('fullscreenchange', () => {
-    fullscreen.value = !!document.fullscreenElement
-  })
 })
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
@@ -145,6 +148,8 @@ onUnmounted(() => {
 <template>
   <div v-if="image" class="detail">
     <div class="viewer">
+      <button class="nav-close" title="返回图库" @click="router.push('/library')">✕</button>
+      <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
       <div ref="stageRef" class="stage">
         <el-image :src="originalSrc" fit="contain" class="stage-img">
           <template #error>
@@ -152,16 +157,12 @@ onUnmounted(() => {
           </template>
         </el-image>
       </div>
-      <div class="viewer-toolbar">
-        <el-button @click="gotoImage(-1)">◀ 上一张</el-button>
-        <el-button @click="gotoImage(1)">下一张 ▶</el-button>
-        <el-button @click="toggleFullscreen">{{ fullscreen ? '退出全屏' : '全屏' }}</el-button>
-        <el-button @click="router.push('/library')">返回图库</el-button>
-      </div>
+      <button class="nav-arrow right" title="下一张" @click="gotoImage(1)">›</button>
     </div>
 
     <div class="panel">
       <el-descriptions :column="1" title="基本信息" border>
+        <el-descriptions-item label="格式">{{ image.format?.toUpperCase() ?? (image.name.split('.').pop() ?? '').toUpperCase() }}</el-descriptions-item>
         <el-descriptions-item label="尺寸">{{ image.width }} × {{ image.height }}</el-descriptions-item>
         <el-descriptions-item label="清晰度">
           <span class="num-mono">{{ image.clarity.toFixed(1) }}</span>
@@ -201,7 +202,7 @@ onUnmounted(() => {
         <div class="panel-title">操作</div>
         <el-button type="danger" plain @click="recycle">入回收站</el-button>
         <el-button @click="exportImage">导出</el-button>
-        <el-button @click="genSidecar">生成 sidecar .txt</el-button>
+        <el-button type="primary" plain @click="manualTag">手动打标</el-button>
       </div>
     </div>
   </div>
@@ -217,9 +218,8 @@ onUnmounted(() => {
 .viewer {
   flex: 1;
   min-width: 0;
+  position: relative;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
 }
 .stage {
   flex: 1;
@@ -240,29 +240,58 @@ onUnmounted(() => {
   height: 100%;
   object-fit: contain;
 }
+.nav-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.nav-close:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
+.nav-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.nav-arrow:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
+.nav-arrow.left {
+  left: 16px;
+}
+.nav-arrow.right {
+  right: 16px;
+}
 .placeholder-name {
   color: #888;
-}
-.viewer-toolbar {
-  display: flex;
-  gap: 8px;
-  justify-content: center;
-}
-.similar-title {
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-}
-.similar-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 6px;
-  flex-wrap: wrap;
-}
-.similar-thumb {
-  width: 96px;
-  height: 72px;
-  border-radius: 6px;
-  cursor: pointer;
 }
 .panel {
   width: 400px;

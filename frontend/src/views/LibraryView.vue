@@ -89,10 +89,10 @@ async function onSortChange() {
   await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
 }
 
-/** 切换"仅 AI 生成"筛选。 */
+/** 切换"AI 生成显示"筛选：勾选=只显示 AI 图，不勾=排除 AI 图只显示正常图。 */
 async function onToggleAiFilter(val: boolean | string | number) {
   await library
-    .applyFilter({ isAi: val === true || val === 'true' ? true : undefined })
+    .applyFilter({ isAi: val === true || val === 'true' ? true : false })
     .catch((e: Error) => ElMessage.error(e.message))
 }
 </script>
@@ -118,7 +118,7 @@ async function onToggleAiFilter(val: boolean | string | number) {
         :model-value="library.filter.isAi === true"
         @change="onToggleAiFilter"
       >
-        仅 AI 生成
+        AI 生成显示
       </el-checkbox>
 
       <div class="spacer" />

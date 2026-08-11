@@ -521,6 +521,16 @@ impl Db {
         Ok(())
     }
 
+    /// 解除图片对 dedup_groups.best_image 的引用（purge 前调用，避免 FK 失败）。
+    pub fn unset_group_best_ref(&self, image_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE dedup_groups SET best_image = NULL WHERE best_image = ?1",
+            params![image_id],
+        )?;
+        Ok(())
+    }
+
     /// 标记图片为冗余候选。
     pub fn set_redundant(&self, image_id: i64, redundant: bool) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
@@ -545,7 +555,12 @@ impl Db {
     pub fn dedup_stats(&self) -> Result<DedupStats, DbError> {
         let conn = self.conn.lock().unwrap();
         Ok(DedupStats {
-            group_count: conn.query_row("SELECT COUNT(*) FROM dedup_groups", [], |r| r.get(0))?,
+            group_count: conn.query_row(
+                "SELECT COUNT(*) FROM dedup_groups g
+                 WHERE (SELECT COUNT(*) FROM images i WHERE i.dedup_group = g.id AND i.status = 'active' AND i.is_redundant = 1) > 0",
+                [],
+                |r| r.get(0),
+            )?,
             involved_images: conn.query_row(
                 "SELECT COUNT(*) FROM images WHERE dedup_group IS NOT NULL AND status = 'active'",
                 [],
@@ -576,6 +591,7 @@ impl Db {
                     (SELECT i3.clarity_score FROM images i3 WHERE i3.id = g.best_image)
              FROM dedup_groups g
              WHERE (?2 IS NULL OR g.id > ?2)
+               AND (SELECT COUNT(*) FROM images i WHERE i.dedup_group = g.id AND i.status = 'active' AND i.is_redundant = 1) > 0
              ORDER BY g.id
              LIMIT ?3",
         )?;
