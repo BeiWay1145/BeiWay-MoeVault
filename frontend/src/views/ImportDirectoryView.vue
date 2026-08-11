@@ -51,7 +51,7 @@ function dirKey(d: DayGroup, g: DirGroup) {
   return `${d.date}::${g.source_dir ?? ''}`
 }
 
-async function loadTree() {
+async function loadTree(preserveState = false) {
   loading.value = true
   try {
     const params = new URLSearchParams()
@@ -60,10 +60,12 @@ async function loadTree() {
     if (aiFilter.value !== 'all') params.set('ai', aiFilter.value)
     const d = await get<{ days: DayGroup[] }>(`/imports/tree?${params.toString()}`)
     days.value = d.days
-    // 清空组内缓存（筛选变化后失效）
-    expanded.value = new Set()
-    dirImages.value = {}
-    dirNext.value = {}
+    // 筛选变化后清空组内缓存；状态保留模式（切回板块）不清
+    if (!preserveState) {
+      expanded.value = new Set()
+      dirImages.value = {}
+      dirNext.value = {}
+    }
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
@@ -277,17 +279,26 @@ function fmtDate(date: string) {
   return `${y}年${m}月${d}日`
 }
 
-watch([sauceFilter, tagFilter, aiFilter], loadTree)
+watch([sauceFilter, tagFilter, aiFilter], () => loadTree())
 // 导入完成后刷新主目录（新图自动分组出现）；keep-alive 切回时也刷新
 onMounted(() => {
   library.fetchImages(50).catch(() => {})
   loadTree()
-  window.addEventListener('moevault:import-done', loadTree)
+  window.addEventListener('moevault:import-done', onImportDone)
 })
-onActivated(loadTree)
+onActivated(() => {
+  // 切回主目录：保留筛选/展开/加载状态（不重置为默认）
+  if (days.value.length === 0) loadTree()
+  else loadTree(true)
+})
 onUnmounted(() => {
-  window.removeEventListener('moevault:import-done', loadTree)
+  window.removeEventListener('moevault:import-done', onImportDone)
 })
+
+/** 导入完成事件：刷新主目录（保留状态）。 */
+function onImportDone() {
+  loadTree(true)
+}
 
 /** 手动刷新主目录。 */
 function refresh() {
