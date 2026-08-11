@@ -1,6 +1,14 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted } from 'vue'
 import SideNav from '@/components/SideNav.vue'
 import TopBar from '@/components/TopBar.vue'
+import { useTaskStore } from '@/stores/tasks'
+
+const taskStore = useTaskStore()
+
+// 全局启动任务轮询：任何页面提交任务后都能收到完成通知
+onMounted(() => taskStore.start())
+onUnmounted(() => taskStore.stop())
 </script>
 
 <template>

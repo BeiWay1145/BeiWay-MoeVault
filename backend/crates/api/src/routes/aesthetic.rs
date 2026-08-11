@@ -35,11 +35,25 @@ async fn run_aesthetic(
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let st = state.clone();
     let force_ids = req.force_ids;
+
+    // 创建任务记录
+    let payload = force_ids
+        .as_ref()
+        .map(|ids| serde_json::json!({ "image_ids": ids }).to_string());
+    let job_id = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.create_job("aesthetic", payload.as_deref())
+    })
+    .await
+    .map_err(super::join_error_response)?
+    .map_err(super::db_error_response)?;
+
     let infer = Arc::new(InferClient::new(state.infer_base_url.clone()));
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {
         let db = st.db.clone();
+        let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
         let result = moevault_tagger::run_aesthetic_pipeline(
             &db,
             &infer,
@@ -47,24 +61,25 @@ async fn run_aesthetic(
             force_ids,
         )
         .await;
+        let (status, done, failed, error) = match &result {
+            Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
+            Err(e) => ("failed", 0, 0, Some(e.to_string())),
+        };
+        let _ = db.update_job(job_id, status, done, failed, error.as_deref());
         let event = match result {
             Ok(progress) => json!({
-                "type": "aesthetic.done",
-                "payload": {
-                    "done": progress.done,
-                    "failed": progress.failed,
-                    "total": progress.total,
-                },
+                "type": "task.done",
+                "payload": { "job_id": job_id, "kind": "aesthetic", "done": progress.done, "failed": progress.failed, "total": progress.total },
             }),
             Err(e) => json!({
-                "type": "aesthetic.failed",
-                "payload": { "error": e.to_string() },
+                "type": "task.failed",
+                "payload": { "job_id": job_id, "kind": "aesthetic", "error": e.to_string() },
             }),
         };
         st.broadcast(event.to_string());
     });
 
-    Ok(Json(json!({ "started": true })))
+    Ok(Json(json!({ "started": true, "job_id": job_id, "kind": "aesthetic" })))
 }
 
 async fn aesthetic_stats(
@@ -92,18 +107,46 @@ async fn rescore_image(
     Json(_req): Json<RunAestheticRequest>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let st = state.clone();
+
+    // 创建任务记录
+    let payload = serde_json::json!({ "image_ids": [id] }).to_string();
+    let job_id = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.create_job("aesthetic", Some(&payload))
+    })
+    .await
+    .map_err(super::join_error_response)?
+    .map_err(super::db_error_response)?;
+
     let infer = Arc::new(InferClient::new(state.infer_base_url.clone()));
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {
-        let _ = moevault_tagger::run_aesthetic_pipeline(
+        let _ = st.db.start_job(job_id, 1);
+        let result = moevault_tagger::run_aesthetic_pipeline(
             &st.db,
             &infer,
             &library_dir,
             Some(vec![id]),
         )
         .await;
+        let (status, done, failed, error) = match &result {
+            Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
+            Err(e) => ("failed", 0, 0, Some(e.to_string())),
+        };
+        let _ = st.db.update_job(job_id, status, done, failed, error.as_deref());
+        let event = match result {
+            Ok(progress) => json!({
+                "type": "task.done",
+                "payload": { "job_id": job_id, "kind": "aesthetic", "done": progress.done, "failed": progress.failed, "total": progress.total },
+            }),
+            Err(e) => json!({
+                "type": "task.failed",
+                "payload": { "job_id": job_id, "kind": "aesthetic", "error": e.to_string() },
+            }),
+        };
+        st.broadcast(event.to_string());
     });
 
-    Ok(Json(json!({ "started": true, "image_id": id })))
+    Ok(Json(json!({ "started": true, "job_id": job_id, "image_id": id, "kind": "aesthetic" })))
 }

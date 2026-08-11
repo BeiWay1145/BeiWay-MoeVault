@@ -151,20 +151,30 @@ async fn read_ai_info(
     Ok(Json(result))
 }
 
-/// POST /api/v1/images/{id}/mark-ai：手动标记图片为 AI 生成（写入 ai_metadata 标记）。
+/// POST /api/v1/images/{id}/mark-ai：手动标记/取消标记图片为 AI 生成。
+/// body 可选 `{ "ai": bool }`（默认 true=标记，false=取消）。
 async fn mark_ai(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let set = body
+        .as_ref()
+        .and_then(|j| j.get("ai"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        db.set_ai_metadata(id, "[manual] marked as AI")
-            .map_err(db_error_response)?;
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+        if set {
+            db.set_ai_metadata(id, "[manual] marked as AI")
+        } else {
+            db.clear_ai_mark(id)
+        }
+        .map_err(db_error_response)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
-    Ok(Json(json!({ "ok": true, "is_ai": true })))
+    Ok(Json(json!({ "ok": true, "is_ai": set })))
 }
 
 /// POST /api/v1/images/{id}/sidecar：生成 sidecar .txt（逗号分隔标签，与 cl_tagger 格式一致）。
@@ -373,6 +383,7 @@ async fn list_images(
     let db = state.db.clone();
     let status_for_query = status.clone();
     let filter = params.build_filter()?;
+    let filter_for_total = filter.clone();
     let sort = params.parse_sort()?;
     let sort_asc = params.order.as_deref() == Some("asc");
     let (items, next_id) = tokio::task::spawn_blocking(move || {
@@ -385,7 +396,7 @@ async fn list_images(
     let total = {
         let db = state.db.clone();
         let status2 = status.clone();
-        tokio::task::spawn_blocking(move || db.count_images(&status2))
+        tokio::task::spawn_blocking(move || db.count_images_filtered(&status2, &filter_for_total))
             .await
             .map_err(join_error_response)?
             .map_err(db_error_response)?

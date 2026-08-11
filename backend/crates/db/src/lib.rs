@@ -37,6 +37,22 @@ impl From<DbError> for AppError {
 /// 溯源缓存记录：`(similarity, source, source_url)`。
 pub type SauceCacheEntry = (f64, Option<String>, Option<String>);
 
+/// 后台任务记录（打标/美学/溯源等耗时操作，持久化于 jobs 表）。
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: i64,
+    pub ty: String,
+    pub status: String,
+    pub total: i64,
+    pub done: i64,
+    pub failed: i64,
+    pub payload: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+}
+
 /// SQLite 数据库封装。单连接 + Mutex：SQLite 写串行化，WAL 下读并发足够。
 #[derive(Clone)]
 pub struct Db {
@@ -93,97 +109,7 @@ impl Db {
                     (i.ai_metadata IS NOT NULL AND i.ai_metadata != '')
              FROM images i",
         );
-        let mut conds: Vec<String> = vec!["i.status = ?1".to_string()];
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(status.to_string())];
-
-        // 标签筛选（AND 语义：每标签一个 EXISTS）
-        for tag in &filter.tags {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!(
-                "EXISTS (SELECT 1 FROM image_tags it JOIN tags tg ON tg.id = it.tag_id
-                 WHERE it.image_id = i.id AND tg.name = {t})"
-            ));
-            params.push(Box::new(tag.clone()));
-        }
-        // 排除标签
-        for tag in &filter.exclude_tags {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!(
-                "NOT EXISTS (SELECT 1 FROM image_tags it2 JOIN tags tg2 ON tg2.id = it2.tag_id
-                 WHERE it2.image_id = i.id AND tg2.name = {t})"
-            ));
-            params.push(Box::new(tag.clone()));
-        }
-        // 关键字（文件名 LIKE）
-        if let Some(q) = &filter.q {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.rel_path LIKE {t}"));
-            params.push(Box::new(format!("%{q}%")));
-        }
-        // 日期范围（exif_datetime 回退 file_mtime 语义：用 COALESCE）
-        if let Some(v) = filter.date_from {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("COALESCE(i.exif_datetime, i.file_mtime) >= {t}"));
-            params.push(Box::new(v));
-        }
-        if let Some(v) = filter.date_to {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("COALESCE(i.exif_datetime, i.file_mtime) <= {t}"));
-            params.push(Box::new(v));
-        }
-        // 美学/清晰度范围
-        if let Some(v) = filter.aesthetic_min {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.aesthetic_score >= {t}"));
-            params.push(Box::new(v));
-        }
-        if let Some(v) = filter.aesthetic_max {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.aesthetic_score <= {t}"));
-            params.push(Box::new(v));
-        }
-        if let Some(v) = filter.clarity_min {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.clarity_score >= {t}"));
-            params.push(Box::new(v));
-        }
-        if let Some(v) = filter.clarity_max {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.clarity_score <= {t}"));
-            params.push(Box::new(v));
-        }
-        // 来源/格式/尺寸/冗余
-        if let Some(v) = &filter.source {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.source = {t}"));
-            params.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &filter.format {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.format = {t}"));
-            params.push(Box::new(v.clone()));
-        }
-        if let Some(v) = filter.min_width {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.width >= {t}"));
-            params.push(Box::new(v));
-        }
-        if let Some(v) = filter.min_height {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.height >= {t}"));
-            params.push(Box::new(v));
-        }
-        if let Some(v) = filter.is_redundant {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.is_redundant = {t}"));
-            params.push(Box::new(v as i64));
-        }
-        if let Some(v) = filter.is_ai {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') = {t}"));
-            params.push(Box::new(v as i64));
-        }
-
+        let (mut conds, mut params) = build_filter_conds(status, filter);
         // 游标（id 偏移，配合排序保证稳定分页）
         if let Some(c) = cursor_id {
             let t = format!("?{}", params.len() + 1);
@@ -225,6 +151,27 @@ impl Db {
         Ok((items, next))
     }
 
+    /// 按筛选条件统计图片数量（与列表口径一致，供 total 使用）。
+    pub fn count_images_filtered(
+        &self,
+        status: &str,
+        filter: &ImageFilter,
+    ) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let (conds, params) = build_filter_conds(status, filter);
+        let sql = format!("SELECT COUNT(*) FROM images i WHERE {}", conds.join(" AND "));
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        let n: i64 = match rows.next()? {
+            Some(row) => row.get(0)?,
+            None => 0,
+        };
+        Ok(n)
+    }
+
     /// 指定状态的图片总数。
     pub fn count_images(&self, status: &str) -> Result<i64, DbError> {
         let conn = self.conn.lock().unwrap();
@@ -239,8 +186,9 @@ impl Db {
     /// 总览统计。
     pub fn stats(&self) -> Result<Stats, DbError> {
         let conn = self.conn.lock().unwrap();
+        // 图片总数 = active 图数量（与图库列表口径一致；回收站图单列）
         let total_images =
-            conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM images WHERE status = 'active'", [], |r| r.get(0))?;
         let active_images =
             conn.query_row("SELECT COUNT(*) FROM images WHERE status = 'active'", [], |r| {
                 r.get(0)
@@ -974,6 +922,20 @@ impl Db {
         Ok(())
     }
 
+    /// 清除 AI 生成标记（ai_metadata 置空 + 删除 source=ai 标签）。
+    pub fn clear_ai_mark(&self, image_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET ai_metadata = NULL WHERE id = ?1",
+            params![image_id],
+        )?;
+        conn.execute(
+            "DELETE FROM image_tags WHERE image_id = ?1 AND source = 'ai'",
+            params![image_id],
+        )?;
+        Ok(())
+    }
+
     /// 未评分（aesthetic_score IS NULL）的 active 图片 id 列表。
     pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {        let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 10000);
@@ -1060,6 +1022,198 @@ impl Db {
         )?;
         Ok(())
     }
+
+    // ---------- 任务（jobs） ----------
+
+    /// 创建任务记录，返回 job id。
+    pub fn create_job(&self, ty: &str, payload: Option<&str>) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_secs();
+        conn.execute(
+            "INSERT INTO jobs (type, status, total, done, failed, payload, error, created_at, updated_at)
+             VALUES (?1, 'pending', 0, 0, 0, ?2, NULL, ?3, ?3)",
+            params![ty, payload, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 启动任务：置为 running 并设置总数。
+    pub fn start_job(&self, job_id: i64, total: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'running', total = ?2, updated_at = ?3 WHERE id = ?1",
+            params![job_id, total, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// 更新任务进度。
+    pub fn update_job(
+        &self,
+        job_id: i64,
+        status: &str,
+        done: i64,
+        failed: i64,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_secs();
+        let finished = if status == "done" || status == "failed" || status == "cancelled" {
+            Some(now)
+        } else {
+            None
+        };
+        conn.execute(
+            "UPDATE jobs SET status = ?2, done = ?3, failed = ?4, error = ?5, updated_at = ?6, finished_at = COALESCE(?7, finished_at)
+             WHERE id = ?1",
+            params![job_id, status, done, failed, error, now, finished],
+        )?;
+        Ok(())
+    }
+
+    /// 任务列表（按创建时间倒序）。
+    pub fn list_jobs(&self, limit: i64) -> Result<Vec<Job>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+        let mut stmt = conn.prepare(
+            "SELECT id, type, status, total, done, failed, payload, error, created_at, updated_at, finished_at
+             FROM jobs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_job)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 单条任务详情。
+    pub fn get_job(&self, job_id: i64) -> Result<Option<Job>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, type, status, total, done, failed, payload, error, created_at, updated_at, finished_at
+             FROM jobs WHERE id = ?1",
+            params![job_id],
+            row_to_job,
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+}
+
+fn row_to_job(r: &Row) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: r.get(0)?,
+        ty: r.get(1)?,
+        status: r.get(2)?,
+        total: r.get(3)?,
+        done: r.get(4)?,
+        failed: r.get(5)?,
+        payload: r.get(6)?,
+        error: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
+        finished_at: r.get(10)?,
+    })
+}
+
+/// 构建图片筛选条件（status + filter），供列表查询与计数共用。
+/// 返回 (conds, params)，conds 中占位符从 ?1 递增；游标条件由调用方按需追加。
+fn build_filter_conds(
+    status: &str,
+    filter: &ImageFilter,
+) -> (Vec<String>, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut conds: Vec<String> = vec!["i.status = ?1".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(status.to_string())];
+
+    // 标签筛选（AND 语义：每标签一个 EXISTS）
+    for tag in &filter.tags {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM image_tags it JOIN tags tg ON tg.id = it.tag_id
+             WHERE it.image_id = i.id AND tg.name = {t})"
+        ));
+        params.push(Box::new(tag.clone()));
+    }
+    // 排除标签
+    for tag in &filter.exclude_tags {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!(
+            "NOT EXISTS (SELECT 1 FROM image_tags it2 JOIN tags tg2 ON tg2.id = it2.tag_id
+             WHERE it2.image_id = i.id AND tg2.name = {t})"
+        ));
+        params.push(Box::new(tag.clone()));
+    }
+    // 关键字（文件名 LIKE）
+    if let Some(q) = &filter.q {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.rel_path LIKE {t}"));
+        params.push(Box::new(format!("%{q}%")));
+    }
+    // 日期范围（exif_datetime 回退 file_mtime 语义：用 COALESCE）
+    if let Some(v) = filter.date_from {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("COALESCE(i.exif_datetime, i.file_mtime) >= {t}"));
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filter.date_to {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("COALESCE(i.exif_datetime, i.file_mtime) <= {t}"));
+        params.push(Box::new(v));
+    }
+    // 美学/清晰度范围
+    if let Some(v) = filter.aesthetic_min {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.aesthetic_score >= {t}"));
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filter.aesthetic_max {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.aesthetic_score <= {t}"));
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filter.clarity_min {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.clarity_score >= {t}"));
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filter.clarity_max {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.clarity_score <= {t}"));
+        params.push(Box::new(v));
+    }
+    // 来源/格式/尺寸/冗余/AI
+    if let Some(v) = &filter.source {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.source = {t}"));
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.format {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.format = {t}"));
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = filter.min_width {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.width >= {t}"));
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filter.min_height {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.height >= {t}"));
+        params.push(Box::new(v));
+    }
+    if let Some(v) = filter.is_redundant {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("i.is_redundant = {t}"));
+        params.push(Box::new(v as i64));
+    }
+    if let Some(v) = filter.is_ai {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') = {t}"));
+        params.push(Box::new(v as i64));
+    }
+    (conds, params)
 }
 
 fn now_secs() -> i64 {

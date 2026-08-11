@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { ImageItem } from '@/stores/library'
 import { thumbUrl } from '@/stores/library'
 
@@ -25,6 +25,28 @@ const thumbStyle = computed(() => {
   const ratio = props.image.height / props.image.width
   return { aspectRatio: `${props.image.width} / ${props.image.height}`, height: 'auto' }
 })
+
+// 右下角叉号两击删除：第一次点击变色（armed），再点一次送去回收站；Shift+点击直接删除
+const armed = ref(false)
+let armedTimer: number | undefined
+function onDeleteClick(e: MouseEvent) {
+  if (e.shiftKey) {
+    armed.value = false
+    emit('recycle', props.image)
+    return
+  }
+  if (armed.value) {
+    armed.value = false
+    if (armedTimer !== undefined) window.clearTimeout(armedTimer)
+    emit('recycle', props.image)
+  } else {
+    armed.value = true
+    if (armedTimer !== undefined) window.clearTimeout(armedTimer)
+    armedTimer = window.setTimeout(() => {
+      armed.value = false
+    }, 3000)
+  }
+}
 
 function fmtSize(bytes: number) {
   if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`
@@ -53,13 +75,15 @@ function fmtSize(bytes: number) {
       <div v-else class="thumb-fallback">无图</div>
       <span v-if="image.isRedundant" class="badge redundant" title="冗余候选（同组存在更清晰图）">⚠ 模糊</span>
       <span v-if="image.aesthetic" class="badge aesthetic" title="美学评分">⭐ {{ image.aesthetic.toFixed(1) }}</span>
-      <div class="hover-actions">
-        <el-button size="small" circle @click.stop="emit('toggleSelect', image)">
-          {{ selected ? '✓' : '选' }}
-        </el-button>
-        <el-button size="small" circle @click.stop="emit('preview', image)">🔍</el-button>
-        <el-button size="small" circle @click.stop="emit('recycle', image)">🗑</el-button>
-      </div>
+      <span v-if="image.isAi" class="badge ai" title="AI 生成">AI</span>
+      <button
+        class="delete-btn"
+        :class="{ armed }"
+        :title="armed ? '再点一次移入回收站（Shift+点击直接删除）' : '移入回收站'"
+        @click.stop="onDeleteClick"
+      >
+        <span class="del-x">✕</span>
+      </button>
     </div>
     <div class="meta">
       <div class="name" :title="image.name">{{ image.name }}</div>
@@ -137,17 +161,52 @@ function fmtSize(bytes: number) {
   right: 6px;
   background: rgba(0, 0, 0, 0.45);
 }
-.hover-actions {
+.badge.ai {
+  left: 6px;
+  bottom: 6px;
+  top: auto;
+  background: rgba(103, 194, 58, 0.9);
+}
+/* 右下角 32px 半透明圆底叉号（增强2）：单击变色待确认，再点删除；Shift+点击直接删除 */
+.delete-btn {
   position: absolute;
-  inset: 0;
-  display: none;
+  right: 8px;
+  bottom: 8px;
+  z-index: 5;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  background: rgba(0, 0, 0, 0.25);
+  transition: background 0.15s, transform 0.15s;
+  opacity: 0.85;
 }
-.image-card:hover .hover-actions {
-  display: flex;
+.delete-btn:hover {
+  background: rgba(0, 0, 0, 0.7);
+  opacity: 1;
+}
+.delete-btn.armed {
+  background: rgba(230, 80, 80, 0.92);
+  transform: scale(1.15);
+  opacity: 1;
+}
+.del-x {
+  font-size: 14px;
+  line-height: 1;
+}
+.list-mode .delete-btn {
+  width: 24px;
+  height: 24px;
+  right: 4px;
+  bottom: 4px;
+}
+.list-mode .del-x {
+  font-size: 11px;
 }
 .meta {
   padding: 6px 8px;

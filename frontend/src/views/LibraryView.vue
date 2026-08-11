@@ -1,19 +1,38 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Grid, List, Close, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, type ImageItem, type ViewMode } from '@/stores/library'
+import { useTaskStore } from '@/stores/tasks'
 import { post } from '@/api/client'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 
 const router = useRouter()
 const library = useLibraryStore()
+const taskStore = useTaskStore()
 
-onMounted(() => {
-  library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
+onMounted(async () => {
+  await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
+  // 增强1：从详情返回/重启后还原上次浏览位置
+  await nextTick()
+  restorePos()
 })
+
+/** 恢复滚动位置：定位到上次查看详情的图片附近。 */
+function restorePos() {
+  const pos = library.restoreDetailPos('library')
+  if (!pos) return
+  const el = document.querySelector<HTMLElement>(`.app-main [data-image-id="${pos.imageId}"]`)
+  if (el) {
+    el.scrollIntoView({ block: 'center' })
+    return
+  }
+  // 图片不在当前列表（可能已删除/筛选变化）：按比例恢复滚动
+  const scroller = document.querySelector('.app-main')
+  if (scroller && pos.scrollTop > 0) scroller.scrollTop = pos.scrollTop
+}
 
 const viewOptions: { key: ViewMode; icon: typeof Grid; label: string }[] = [
   { key: 'grid', icon: Grid, label: '网格' },
@@ -39,7 +58,17 @@ function openPreview(img: ImageItem) {
   previewVisible.value = true
 }
 
-/** 移入回收站（真实 API）。 */
+/** 点击卡片：多选模式→切换选择；否则进入详情（记录位置）。 */
+function onCardClick(img: ImageItem) {
+  if (library.multiSelect) {
+    library.toggleSelect(img.id)
+    return
+  }
+  library.saveDetailPos('library', img.id)
+  router.push(`/library/${img.id}`)
+}
+
+/** 移入回收站（卡片叉号两击触发，增强2）。 */
 async function onRecycle(img: ImageItem) {
   try {
     await ElMessageBox.confirm(`将「${img.name}」移入回收站？可随时恢复。`, '删除确认', {
@@ -84,6 +113,70 @@ async function onRecycleSelected() {
   await library.fetchImages()
 }
 
+/** 批量打标（后端管线自动跳过带 AI 生成标签的图）。 */
+async function onBatchTag() {
+  const ids = [...library.selected]
+  if (ids.length === 0) return
+  try {
+    await taskStore.enqueueTag(ids)
+    library.clearSelect()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 批量美学评分。 */
+async function onBatchAesthetic() {
+  const ids = [...library.selected]
+  if (ids.length === 0) return
+  try {
+    await taskStore.enqueueAesthetic(ids)
+    library.clearSelect()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 批量 SauceNAO 溯源（自动跳过 AI 生成图）。 */
+async function onBatchSauce() {
+  const ids = [...library.selected]
+  if (ids.length === 0) return
+  try {
+    await taskStore.enqueueSauce(ids)
+    library.clearSelect()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 批量检测 AI（逐张读 PNG tEXt；自动跳过已标记 AI 的图）。 */
+async function onBatchDetectAi() {
+  const ids = [...library.selected]
+  if (ids.length === 0) return
+  const todo = ids.filter((id) => {
+    const it = library.images.find((i) => i.id === id)
+    return it ? !it.isAi : true
+  })
+  if (todo.length === 0) {
+    ElMessage.info('所选图片均已标记为 AI 生成')
+    library.clearSelect()
+    return
+  }
+  ElMessage.info(`正在检测 ${todo.length} 张图片的 AI 元信息…`)
+  let ok = 0
+  for (const id of todo) {
+    try {
+      await post(`/images/${id}/ai-info`)
+      ok++
+    } catch {
+      /* 单张失败继续 */
+    }
+  }
+  ElMessage.success(`AI 检测完成：${ok} 张已处理`)
+  library.clearSelect()
+  await library.fetchImages()
+}
+
 /** 排序变化时重新拉取（后端排序）。 */
 async function onSortChange() {
   await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
@@ -121,10 +214,18 @@ async function onToggleAiFilter(val: boolean | string | number) {
         AI 生成显示
       </el-checkbox>
 
+      <el-checkbox v-model="library.multiSelect">
+        多选模式
+      </el-checkbox>
+
       <div class="spacer" />
 
       <template v-if="selectedCount > 0">
         <el-button type="danger" plain @click="onRecycleSelected">删除所选 ({{ selectedCount }})</el-button>
+        <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>
+        <el-button type="success" plain @click="onBatchAesthetic">批量美学</el-button>
+        <el-button plain @click="onBatchSauce">批量溯源</el-button>
+        <el-button plain @click="onBatchDetectAi">批量检测 AI</el-button>
         <el-button @click="library.clearSelect()">取消选择</el-button>
       </template>
       <el-button :icon="Refresh" circle title="刷新" @click="onSortChange" />
@@ -135,7 +236,7 @@ async function onToggleAiFilter(val: boolean | string | number) {
         :images="library.images"
         :view-mode="library.viewMode"
         :selected="library.selected"
-        @click="(img: ImageItem) => router.push(`/library/${img.id}`)"
+        @click="onCardClick"
         @toggle-select="library.toggleSelect($event.id)"
         @preview="openPreview"
         @recycle="onRecycle"

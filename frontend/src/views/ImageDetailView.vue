@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useLibraryStore, originalUrl } from '@/stores/library'
+import { useTaskStore } from '@/stores/tasks'
 import { get, post } from '@/api/client'
 
 const route = useRoute()
 const router = useRouter()
 const library = useLibraryStore()
+const taskStore = useTaskStore()
 
 const image = computed(() => library.images.find((i) => i.id === Number(route.params.id)))
 const tags = ref<Array<{ name: string; name_cn: string | null; category: string; source: string }>>([])
@@ -35,6 +37,18 @@ function onKeydown(e: KeyboardEvent) {
   else if (e.key === 'Delete' || e.key === 'Del') recycle()
 }
 
+// 路由参数变化（左右切换/URL 直达）时刷新标签等详情数据（BUG1 修复）
+watch(
+  () => route.params.id,
+  () => {
+    tags.value = []
+    aiInfo.value = null
+    aiTags.value = []
+    aiChecked.value = false
+    loadDetail()
+  },
+)
+
 async function loadDetail() {
   const id = Number(route.params.id)
   if (!image.value) {
@@ -59,15 +73,20 @@ async function readAiInfo() {
   const id = Number(route.params.id)
   try {
     const r = await post<{ ok: boolean; is_ai: boolean; metadata: string | null; prompt?: string | null; negative_prompt?: string | null; tags?: string[] }>(`/images/${id}/ai-info`)
-    aiChecked.value = r.is_ai
+    // 增强4.2：图片已带 AI 标签时，即使本次未读到元信息也不清除 AI 状态
+    if (image.value?.isAi) {
+      aiChecked.value = true
+    } else {
+      aiChecked.value = r.is_ai
+    }
     aiInfo.value = r.metadata
     if (r.tags && r.tags.length > 0) {
       aiTags.value = r.tags
       ElMessage.success(`已提取 ${r.tags.length} 个 AI 生图标签`)
-    } else if (!r.is_ai) {
-      ElMessage.info('未检测到 AI 生成元信息')
-    } else {
+    } else if (aiChecked.value) {
       ElMessage.success('已标记为 AI 图片（无有效 prompt 标签）')
+    } else {
+      ElMessage.info('未检测到 AI 生成元信息')
     }
     // 刷新标签列表
     await loadDetail()
@@ -76,12 +95,18 @@ async function readAiInfo() {
   }
 }
 
-async function markAsAi() {
+// 增强4.1：手动标记/取消标记 AI（toggle）
+async function toggleAiMark() {
   if (!image.value) return
+  const next = !aiChecked.value
   try {
-    await post(`/images/${image.value.id}/mark-ai`)
-    aiChecked.value = true
-    ElMessage.success('已手动标记为 AI 图片')
+    await post(`/images/${image.value.id}/mark-ai`, { ai: next })
+    aiChecked.value = next
+    // 同步本地列表中的 isAi（图库筛选/角标即时生效）
+    const it = library.images.find((i) => i.id === image.value!.id)
+    if (it) it.isAi = next
+    ElMessage.success(next ? '已标记为 AI 生成图片' : '已取消 AI 生成标记')
+    await loadDetail()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -104,25 +129,38 @@ async function recycle() {
     if (target) {
       router.push(`/library/${target.id}`)
     } else {
-      router.push('/library')
+      router.back()
     }
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-// 手动打标：本地 cl_tagger 模型打标（替代原 sidecar 功能）
+// 手动打标（BUG3 任务化）：加入打标队列，进度见任务中心
 async function manualTag() {
   if (!image.value) return
   try {
-    const r = await post<{ ok: boolean; count?: number; message?: string }>(`/images/${image.value.id}/retag`, { force: true })
-    ElMessage.success(r.count != null ? `打标完成，写入 ${r.count} 个标签` : (r.message ?? '打标完成'))
-    tags.value = []
-    // 刷新标签
-    const t = await get<{ tags: Array<{ name: string; name_cn: string | null; category: string; source: string }> }>(
-      `/images/${image.value.id}/tags`,
-    )
-    tags.value = t.tags
+    await taskStore.enqueueTag([image.value.id])
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+// 增强5：美学处理（Q-Align 评分任务）
+async function rescoreAesthetic() {
+  if (!image.value) return
+  try {
+    await taskStore.enqueueAesthetic([image.value.id])
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+// 增强5：尝试溯源（SauceNAO 任务）
+async function trySauce() {
+  if (!image.value) return
+  try {
+    await taskStore.enqueueSauce([image.value.id])
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -148,7 +186,7 @@ onUnmounted(() => {
 <template>
   <div v-if="image" class="detail">
     <div class="viewer">
-      <button class="nav-close" title="返回图库" @click="router.push('/library')">✕</button>
+      <button class="nav-close" title="返回" @click="router.back()">✕</button>
       <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
       <div ref="stageRef" class="stage">
         <el-image :src="originalSrc" fit="contain" class="stage-img">
@@ -184,8 +222,8 @@ onUnmounted(() => {
           <el-button size="small" type="primary" plain style="margin-left: 8px" @click="readAiInfo">
             读取 AI 生成信息
           </el-button>
-          <el-button size="small" type="warning" plain :disabled="aiChecked" @click="markAsAi">
-            手动标记为 AI
+          <el-button size="small" :type="aiChecked ? 'info' : 'warning'" plain @click="toggleAiMark">
+            {{ aiChecked ? '取消 AI 标记' : '手动标记为 AI' }}
           </el-button>
         </div>
         <div v-if="tags.length > 0" class="tag-list">
@@ -203,6 +241,8 @@ onUnmounted(() => {
         <el-button type="danger" plain @click="recycle">入回收站</el-button>
         <el-button @click="exportImage">导出</el-button>
         <el-button type="primary" plain @click="manualTag">手动打标</el-button>
+        <el-button type="success" plain @click="rescoreAesthetic">美学处理</el-button>
+        <el-button plain @click="trySauce">尝试溯源</el-button>
       </div>
     </div>
   </div>

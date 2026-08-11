@@ -25,6 +25,23 @@ pub struct TagProgress {
     pub failed: usize,
 }
 
+/// 溯源进度统计。
+#[derive(Debug, Clone, Default, Copy)]
+pub struct SauceProgress {
+    pub total: usize,
+    pub done: usize,
+    pub failed: usize,
+}
+
+/// 溯源命中结果。
+#[derive(Debug, Clone)]
+pub struct SauceHit {
+    pub source: String,
+    pub source_url: String,
+    pub tags: Vec<String>,
+    pub similarity: f64,
+}
+
 /// 本地推理服务客户端（HTTP 调用 Python 服务）。
 #[derive(Clone)]
 pub struct InferClient {
@@ -216,50 +233,149 @@ async fn tag_one(
         }
     }
 
-    // 2. 从调度器获取可用 key
+    // 2. 溯源（SauceNAO + booru 爬标签）；None = 未命中/失败（回退本地打标）
+    let hit = match sauce_one(db, sauce, pool, infer, library_dir, min_sim, image_id).await? {
+        Some(h) => h,
+        None => {
+            return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+        }
+    };
+
+    // 存标签
+    save_tags(db, image_id, &hit.source, Some(&hit.source_url), &hit.tags, hit.similarity)?;
+    db.put_sauce_cache(&img.md5, hit.similarity, Some(&hit.source), Some(&hit.source_url), None)?;
+    db.set_image_source(image_id, &hit.source, Some(&hit.source_url))?;
+    info!(image_id, source = %hit.source, tag_count = hit.tags.len(), "溯源打标成功");
+    Ok(())
+}
+
+/// 单图 SauceNAO 溯源 + booru 爬标签。
+/// 返回 Some(命中) 或 None（未命中/失败，已写缓存与不可溯源标记；调用方决定回退策略）。
+/// AI 生成图直接返回 Ok(None)（不消耗配额）。
+#[allow(clippy::too_many_arguments)]
+async fn sauce_one(
+    db: &Db,
+    sauce: &SauceNaoClient,
+    pool: &ApiKeyPool,
+    infer: &InferClient,
+    library_dir: &Path,
+    min_sim: f64,
+    image_id: i64,
+) -> Result<Option<SauceHit>, TaggerError> {
+    let img = db
+        .get_image_by_id(image_id)?
+        .ok_or_else(|| TaggerError::Invalid(format!("图片 {image_id} 不存在")))?;
+    let file_path = library_dir.join(&img.rel_path);
+
+    // AI 生成图：溯源无意义，直接跳过
+    let has_ai_tag = db.image_tags(image_id)?.iter().any(|t| t.source == "ai");
+    if img.ai_metadata.is_some() || has_ai_tag {
+        info!(image_id, "AI 生成图，跳过溯源");
+        return Ok(None);
+    }
+
+    // 不可溯源标记：跳过（调用方 force 时由 run_tag_pipeline 预先清除）
+    if img.no_auto_sauce {
+        info!(image_id, "图片已标记不可溯源，跳过自动溯源");
+        return Ok(None);
+    }
+
+    // 从调度器获取可用 key
     let (api_key, key_idx) = pool.acquire().await;
 
-    // 3. SauceNAO 溯源（带 key）
+    // SauceNAO 溯源（带 key）
     let (result, quota) = match sauce.search_file(&file_path, &api_key).await {
         Ok(r) => r,
         Err(e) => {
-            // 请求失败：标记 key 失败（冷却），溯源失败走本地打标
+            // 请求失败：标记 key 失败（冷却），溯源失败
             pool.on_failure(key_idx).await;
             let is_no_result = matches!(e, TaggerError::NoSource(_));
-            warn!(image_id, error = %e, is_no_result, "溯源失败，回退本地打标");
+            warn!(image_id, error = %e, is_no_result, "溯源失败");
             db.put_sauce_cache(&img.md5, 0.0, None, None, None)?;
-            // 无结果（SauceNAO 0 命中）→ 标记不可自动溯源，防止浪费配额；
-            // 限流/网络错误等不标记（下次可重试）
             if is_no_result {
                 db.set_no_auto_sauce(image_id, true)?;
             }
-            return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+            return Ok(None);
         }
     };
     // 成功：更新配额头 + 进入短冷却（保守 5s，防连发撞限流）
     pool.update(key_idx, quota.short_remaining, quota.long_remaining).await;
     pool.start_cooldown(key_idx, 5).await;
 
-    // 4. 有效判定：相似度 ≥ 阈值 且 ext_urls 含 booru 链接
+    // 有效判定：相似度 ≥ 阈值 且 ext_urls 含 booru 链接
     if result.similarity < min_sim {
         db.put_sauce_cache(&img.md5, result.similarity, None, None, None)?;
-        // 相似度不足（非限流问题）：标记不可自动溯源，防止浪费配额
         db.set_no_auto_sauce(image_id, true)?;
-        return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+        return Ok(None);
     }
     let fetched = booru::fetch_tags(infer.http(), &result.ext_urls).await;
     let Some((source, source_url, tags)) = fetched.ok() else {
-        // 命中 booru 但爬取失败：记缓存 + 本地回退；不标记不可溯源（下次可重试）
+        // 命中 booru 但爬取失败：记缓存，不标记不可溯源（下次可重试）
         db.put_sauce_cache(&img.md5, result.similarity, None, None, None)?;
-        return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+        return Ok(None);
     };
 
-    // 5. 存标签
-    save_tags(db, image_id, source, Some(&source_url), &tags, result.similarity)?;
-    db.put_sauce_cache(&img.md5, result.similarity, Some(source), Some(&source_url), None)?;
-    db.set_image_source(image_id, source, Some(&source_url))?;
-    info!(image_id, source, tag_count = tags.len(), "溯源打标成功");
-    Ok(())
+    Ok(Some(SauceHit {
+        source: source.to_string(),
+        source_url,
+        tags,
+        similarity: result.similarity,
+    }))
+}
+
+/// 溯源专用管线：只做 SauceNAO 溯源 + booru 爬标签（失败不本地打标）。
+/// - `image_ids`：None = 全部未溯源 active 图；Some = 指定图（强制重新溯源）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sauce_pipeline(
+    db: &Db,
+    sauce: &SauceNaoClient,
+    pool: &ApiKeyPool,
+    infer: &InferClient,
+    library_dir: &Path,
+    min_sim: f64,
+    image_ids: Option<Vec<i64>>,
+) -> Result<SauceProgress, TaggerError> {
+    let ids = match image_ids {
+        Some(ids) => ids,
+        None => db.untagged_active_images(10000)?,
+    };
+    if ids.is_empty() {
+        return Ok(SauceProgress::default());
+    }
+    info!(count = ids.len(), "溯源管线：开始");
+
+    // 指定 ids：清除不可溯源标记，允许强制重新溯源
+    for id in &ids {
+        db.set_no_auto_sauce(*id, false)?;
+    }
+    let mut progress = SauceProgress {
+        total: ids.len(),
+        ..Default::default()
+    };
+
+    for image_id in &ids {
+        match sauce_one(db, sauce, pool, infer, library_dir, min_sim, *image_id).await {
+            Ok(Some(hit)) => {
+                // 写标签 + source
+                save_tags(db, *image_id, &hit.source, Some(&hit.source_url), &hit.tags, hit.similarity)?;
+                if let Ok(Some(img)) = db.get_image_by_id(*image_id) {
+                    db.put_sauce_cache(&img.md5, hit.similarity, Some(&hit.source), Some(&hit.source_url), None)?;
+                }
+                db.set_image_source(*image_id, &hit.source, Some(&hit.source_url))?;
+                progress.done += 1;
+            }
+            Ok(None) => {
+                info!(image_id, "溯源无命中");
+                progress.failed += 1;
+            }
+            Err(e) => {
+                warn!(image_id, error = %e, "溯源失败");
+                progress.failed += 1;
+            }
+        }
+    }
+    info!(done = progress.done, failed = progress.failed, "溯源管线完成");
+    Ok(progress)
 }
 
 /// 保存标签（tags upsert + image_tags 写入）。

@@ -18,8 +18,8 @@ const emit = defineEmits<{
 
 <template>
   <!-- 瀑布流：CSS columns 多列，卡片按自身比例高度（break-inside 避免截断） -->
-  <div v-if="viewMode === 'waterfall'" class="waterfall">
-    <div v-for="img in images" :key="img.id" class="waterfall-item">
+  <TransitionGroup v-if="viewMode === 'waterfall'" name="flip" tag="div" class="waterfall">
+    <div v-for="img in images" :key="img.id" class="waterfall-item" :data-image-id="img.id">
       <ImageCard
         :image="img"
         :selected="selected?.has(img.id)"
@@ -30,11 +30,11 @@ const emit = defineEmits<{
         @recycle="emit('recycle', $event)"
       />
     </div>
-  </div>
+  </TransitionGroup>
 
   <div v-else class="image-wall" :class="`view-${viewMode}`">
-    <template v-if="viewMode === 'list'">
-      <div v-for="img in images" :key="img.id" class="list-row">
+    <TransitionGroup v-if="viewMode === 'list'" name="flip" tag="div" class="list-wrap">
+      <div v-for="img in images" :key="img.id" class="list-row" :data-image-id="img.id">
         <ImageCard
           :image="img"
           :selected="selected?.has(img.id)"
@@ -45,19 +45,19 @@ const emit = defineEmits<{
           @recycle="emit('recycle', $event)"
         />
       </div>
-    </template>
-    <template v-else>
-      <ImageCard
-        v-for="img in images"
-        :key="img.id"
-        :image="img"
-        :selected="selected?.has(img.id)"
-        @click="emit('click', $event)"
-        @toggle-select="emit('toggleSelect', $event)"
-        @preview="emit('preview', $event)"
-        @recycle="emit('recycle', $event)"
-      />
-    </template>
+    </TransitionGroup>
+    <TransitionGroup v-else name="flip" tag="div" class="grid-wrap">
+      <div v-for="img in images" :key="img.id" class="grid-cell" :data-image-id="img.id">
+        <ImageCard
+          :image="img"
+          :selected="selected?.has(img.id)"
+          @click="emit('click', $event)"
+          @toggle-select="emit('toggleSelect', $event)"
+          @preview="emit('preview', $event)"
+          @recycle="emit('recycle', $event)"
+        />
+      </div>
+    </TransitionGroup>
   </div>
 </template>
 
@@ -73,6 +73,16 @@ const emit = defineEmits<{
   grid-template-columns: 1fr;
   gap: 8px;
 }
+.grid-wrap {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+.list-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 .list-row {
   width: 100%;
 }
@@ -85,5 +95,24 @@ const emit = defineEmits<{
 .waterfall-item {
   break-inside: avoid;
   margin-bottom: 12px;
+}
+
+/* 删除/新增补位动效（瀑布流、网格、列表通用） */
+.flip-enter-active,
+.flip-leave-active,
+.flip-move {
+  transition: all 0.25s ease;
+}
+.flip-enter-from {
+  opacity: 0;
+  transform: scale(0.92);
+}
+.flip-leave-to {
+  opacity: 0;
+  transform: scale(0.92);
+}
+.flip-leave-active {
+  position: absolute;
+  z-index: 2;
 }
 </style>

@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, join_error_response};
 
 /// GET /api/v1/logs：读取后端日志尾部（便于查看问题）。
 async fn get_logs(
@@ -43,6 +43,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/tagging/run", post(run_tagging))
         .route("/api/v1/tagging/stats", get(tagging_stats))
         .route("/api/v1/tagging/keys", get(key_status))
+        .route("/api/v1/sauce/run", post(run_sauce))
         .route("/api/v1/tags", get(list_tags))
         .route("/api/v1/logs", get(get_logs))
         .route("/api/v1/images/{id}/tags", get(image_tags))
@@ -194,6 +195,18 @@ async fn run_tagging(
         ));
     }
 
+    // 创建任务记录（持久化）
+    let payload = force_ids
+        .as_ref()
+        .map(|ids| serde_json::json!({ "image_ids": ids }).to_string());
+    let job_id = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.create_job("tag", payload.as_deref())
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(db_error_response)?;
+
     // 同步打标模型目录到推理服务
     sync_tagger_model(&state, &model_dir).await;
 
@@ -204,6 +217,7 @@ async fn run_tagging(
 
     tokio::spawn(async move {
         let db = st.db.clone();
+        let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
         let result = run_tag_pipeline_async(
             &db,
             &sauce,
@@ -215,24 +229,98 @@ async fn run_tagging(
             force_ids,
         )
         .await;
+        let (status, done, failed, error) = match &result {
+            Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
+            Err(e) => ("failed", 0, 0, Some(e.to_string())),
+        };
+        let _ = db.update_job(job_id, status, done, failed, error.as_deref());
         let event = match result {
             Ok(progress) => json!({
-                "type": "tagging.done",
-                "payload": {
-                    "done": progress.done,
-                    "failed": progress.failed,
-                    "total": progress.total,
-                },
+                "type": "task.done",
+                "payload": { "job_id": job_id, "kind": "tag", "done": progress.done, "failed": progress.failed, "total": progress.total },
             }),
             Err(e) => json!({
-                "type": "tagging.failed",
-                "payload": { "error": e.to_string() },
+                "type": "task.failed",
+                "payload": { "job_id": job_id, "kind": "tag", "error": e.to_string() },
             }),
         };
         st.broadcast(event.to_string());
     });
 
-    Ok(Json(json!({ "started": true })))
+    Ok(Json(json!({ "started": true, "job_id": job_id, "kind": "tag" })))
+}
+
+/// POST /api/v1/sauce/run：SauceNAO 溯源任务（只溯源+爬标签，失败不本地打标）。
+async fn run_sauce(
+    State(state): State<AppState>,
+    Json(req): Json<RunTaggingRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let st = state.clone();
+    let force_ids = req.force_ids;
+
+    // 配置
+    let db_for_config = state.db.clone();
+    let (api_keys, min_sim, _, _) = tokio::task::spawn_blocking(move || {
+        read_tag_config(&db_for_config)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    if api_keys.is_empty() {
+        return Err(error_response(
+            ErrorKind::InvalidInput,
+            "未配置 SauceNAO API key（设置页添加密钥）",
+        ));
+    }
+
+    // 创建任务记录
+    let payload = force_ids
+        .as_ref()
+        .map(|ids| serde_json::json!({ "image_ids": ids }).to_string());
+    let job_id = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.create_job("sauce", payload.as_deref())
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(db_error_response)?;
+
+    let pool = get_or_init_pool(&state, &api_keys).await?;
+    let sauce = Arc::new(SauceNaoClient::new(min_sim));
+    let infer = InferClient::new(st.infer_base_url.clone());
+    let library_dir = st.library_dir();
+
+    tokio::spawn(async move {
+        let db = st.db.clone();
+        let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
+        let result = moevault_tagger::run_sauce_pipeline(
+            &db,
+            &sauce,
+            &pool,
+            &infer,
+            &library_dir,
+            min_sim,
+            force_ids,
+        )
+        .await;
+        let (status, done, failed, error) = match &result {
+            Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
+            Err(e) => ("failed", 0, 0, Some(e.to_string())),
+        };
+        let _ = db.update_job(job_id, status, done, failed, error.as_deref());
+        let event = match result {
+            Ok(progress) => json!({
+                "type": "task.done",
+                "payload": { "job_id": job_id, "kind": "sauce", "done": progress.done, "failed": progress.failed, "total": progress.total },
+            }),
+            Err(e) => json!({
+                "type": "task.failed",
+                "payload": { "job_id": job_id, "kind": "sauce", "error": e.to_string() },
+            }),
+        };
+        st.broadcast(event.to_string());
+    });
+
+    Ok(Json(json!({ "started": true, "job_id": job_id, "kind": "sauce" })))
 }
 
 /// 包装：把同步 DB 操作包进 spawn_blocking，异步网络部分在外。
@@ -338,6 +426,16 @@ async fn retag_image(
         return Err(error_response(ErrorKind::InvalidInput, "未配置 SauceNAO API key"));
     }
 
+    // 创建任务记录
+    let payload = serde_json::json!({ "image_ids": [id] }).to_string();
+    let job_id = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        move || db.create_job("tag", Some(&payload))
+    })
+    .await
+    .map_err(join_error_response)?
+    .map_err(db_error_response)?;
+
     // 同步打标模型目录到推理服务
     sync_tagger_model(&state, &model_dir).await;
 
@@ -347,7 +445,8 @@ async fn retag_image(
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {
-        let _ = run_tag_pipeline_async(
+        let _ = st.db.start_job(job_id, 1);
+        let result = run_tag_pipeline_async(
             &st.db,
             &sauce,
             &pool,
@@ -358,7 +457,23 @@ async fn retag_image(
             Some(vec![id]),
         )
         .await;
+        let (status, done, failed, error) = match &result {
+            Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
+            Err(e) => ("failed", 0, 0, Some(e.to_string())),
+        };
+        let _ = st.db.update_job(job_id, status, done, failed, error.as_deref());
+        let event = match result {
+            Ok(progress) => json!({
+                "type": "task.done",
+                "payload": { "job_id": job_id, "kind": "tag", "done": progress.done, "failed": progress.failed, "total": progress.total },
+            }),
+            Err(e) => json!({
+                "type": "task.failed",
+                "payload": { "job_id": job_id, "kind": "tag", "error": e.to_string() },
+            }),
+        };
+        st.broadcast(event.to_string());
     });
 
-    Ok(Json(json!({ "started": true, "image_id": id })))
+    Ok(Json(json!({ "started": true, "job_id": job_id, "image_id": id, "kind": "tag" })))
 }

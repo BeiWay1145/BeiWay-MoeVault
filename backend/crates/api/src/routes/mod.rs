@@ -7,6 +7,7 @@ pub mod images;
 pub mod import;
 pub mod settings;
 pub mod tagging;
+pub mod tasks;
 pub mod trash;
 pub mod ws;
 

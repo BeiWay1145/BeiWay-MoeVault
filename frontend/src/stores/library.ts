@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { get } from '@/api/client'
 
 /** 图库浏览状态：筛选条件、排序、视图模式、选中集合。数据来自 /api/v1/images。 */
@@ -50,11 +50,26 @@ export interface LibraryFilter {
 }
 
 export const useLibraryStore = defineStore('library', () => {
-  const viewMode = ref<ViewMode>('grid')
+  // 视图模式持久化（关闭软件后记忆）
+  const savedMode = localStorage.getItem('moevault-view-mode')
+  const viewMode = ref<ViewMode>(savedMode === 'grid' || savedMode === 'waterfall' || savedMode === 'list' ? savedMode : 'grid')
   const sortKey = ref<SortKey>('imported')
   const sortAsc = ref(false)
   const selected = ref<Set<number>>(new Set())
   const filter = ref<LibraryFilter>({})
+  /** 详情位置记忆：{from, imageId, scrollTop}（localStorage 持久化，退出还原） */
+  const detailPos = ref<{ from: string; imageId: number; scrollTop: number } | null>(null)
+  try {
+    const raw = localStorage.getItem('moevault-detail-pos')
+    if (raw) detailPos.value = JSON.parse(raw) as { from: string; imageId: number; scrollTop: number }
+  } catch {
+    /* 忽略 */
+  }
+  /** 多选模式（画廊/搜索共用）：开启后点击图片直接切换选择，用于批量操作 */
+  const multiSelect = ref(false)
+
+  // 视图模式变化 → 持久化
+  watch(viewMode, (m) => localStorage.setItem('moevault-view-mode', m))
 
   const images = ref<ImageItem[]>([])
   const total = ref(0)
@@ -132,12 +147,34 @@ export const useLibraryStore = defineStore('library', () => {
     selected.value = new Set()
   }
 
+  /** 记录进入详情页时的位置（来源页 + 图片 id + 滚动位置），供返回/重启还原。 */
+  function saveDetailPos(from: string, imageId: number) {
+    const scroller = document.querySelector('.app-main')
+    const scrollTop = scroller ? scroller.scrollTop : window.scrollY
+    detailPos.value = { from, imageId, scrollTop }
+    try {
+      localStorage.setItem('moevault-detail-pos', JSON.stringify(detailPos.value))
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  /** 取出保存的位置（from 匹配才返回）。 */
+  function restoreDetailPos(from: string) {
+    if (detailPos.value && detailPos.value.from === from) {
+      return detailPos.value
+    }
+    return null
+  }
+
   return {
     viewMode,
     sortKey,
     sortAsc,
     selected,
     filter,
+    detailPos,
+    multiSelect,
     images,
     total,
     loading,
@@ -147,5 +184,7 @@ export const useLibraryStore = defineStore('library', () => {
     removeImageById,
     toggleSelect,
     clearSelect,
+    saveDetailPos,
+    restoreDetailPos,
   }
 })

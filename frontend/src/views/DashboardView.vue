@@ -102,11 +102,11 @@ const quickLinks = [
       <el-empty v-if="taskStore.tasks.length === 0" description="暂无任务" :image-size="60" />
       <div v-for="t in taskStore.tasks" v-else :key="t.id" class="task-line">
         <el-progress
-          :percentage="Math.round(t.progress * 100)"
+          :percentage="t.total > 0 ? Math.round((t.done / t.total) * 100) : 0"
           :status="t.status === 'failed' ? 'exception' : t.status === 'done' ? 'success' : undefined"
           :stroke-width="8"
         >
-          <span class="task-label">{{ t.type }} #{{ t.id }}</span>
+          <span class="task-label">{{ t.typeLabel || t.type }} #{{ t.id }}</span>
           <span class="num-mono">{{ t.done }}/{{ t.total }}</span>
         </el-progress>
       </div>
