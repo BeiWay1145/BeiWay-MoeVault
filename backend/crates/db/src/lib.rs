@@ -1351,15 +1351,14 @@ impl Db {
                 params.push(Box::new(format!("%{}%", q.trim())));
             }
         }
-        sql.push_str(
-            " ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC
-             LIMIT ? OFFSET ?",
-        );
+        // LIMIT/OFFSET 占位符编号跟随已有参数（q 可能占 ?1）
         let limit_ph = params.len() + 1;
-        sql.push_str(&limit_ph.to_string());
+        let offset_ph = params.len() + 2;
+        sql.push_str(&format!(
+            " ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC
+             LIMIT ?{limit_ph} OFFSET ?{offset_ph}"
+        ));
         params.push(Box::new(limit));
-        let offset_ph = params.len() + 1;
-        sql.push_str(&offset_ph.to_string());
         params.push(Box::new(offset));
         let mut stmt = conn.prepare(&sql)?;
         for (i, v) in params.iter().enumerate() {
