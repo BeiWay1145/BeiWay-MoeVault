@@ -118,7 +118,7 @@ impl Db {
         let mut sql = String::from(
             "SELECT i.id, i.md5, i.rel_path, i.width, i.height, i.format, i.size_bytes,
                     i.exif_datetime, i.clarity_score, i.aesthetic_score,
-                    i.is_redundant, i.source, i.source_url, i.imported_at, i.thumb_rel,
+                    i.is_redundant, i.source, i.source_url, i.no_auto_sauce, i.imported_at, i.thumb_rel,
                     (i.ai_metadata IS NOT NULL AND i.ai_metadata != '')
              FROM images i",
         );
@@ -332,15 +332,12 @@ impl Db {
         let mut conds = vec!["i.status = 'active'".to_string()];
         let params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(s) = sauce {
+            let is_sauced = "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
+            let is_ai = "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
             match s {
-                "sauced" => conds.push(
-                    "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')"
-                        .to_string(),
-                ),
-                "unsauced" => conds.push(
-                    "(i.source_url IS NULL OR i.source_url = '') AND (i.source = 'local' OR i.source = '')"
-                        .to_string(),
-                ),
+                "sauced" => conds.push(is_sauced.to_string()),
+                "unsauced" => conds.push(format!("NOT ({is_sauced}) AND NOT ({is_ai}) AND i.no_auto_sauce = 0")),
+                "un-sauced" => conds.push(format!("({is_ai}) OR i.no_auto_sauce = 1")),
                 _ => {}
             }
         }
@@ -424,15 +421,12 @@ impl Db {
         ];
         // 复用与 tree 相同的筛选
         if let Some(s) = sauce {
+            let is_sauced = "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
+            let is_ai = "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
             match s {
-                "sauced" => conds.push(
-                    "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')"
-                        .to_string(),
-                ),
-                "unsauced" => conds.push(
-                    "(i.source_url IS NULL OR i.source_url = '') AND (i.source = 'local' OR i.source = '')"
-                        .to_string(),
-                ),
+                "sauced" => conds.push(is_sauced.to_string()),
+                "unsauced" => conds.push(format!("NOT ({is_sauced}) AND NOT ({is_ai}) AND i.no_auto_sauce = 0")),
+                "un-sauced" => conds.push(format!("({is_ai}) OR i.no_auto_sauce = 1")),
                 _ => {}
             }
         }
@@ -471,7 +465,7 @@ impl Db {
         let sql = format!(
             "SELECT i.id, i.md5, i.rel_path, i.width, i.height, i.format, i.size_bytes,
                     i.exif_datetime, i.clarity_score, i.aesthetic_score,
-                    i.is_redundant, i.source, i.source_url, i.imported_at, i.thumb_rel,
+                    i.is_redundant, i.source, i.source_url, i.no_auto_sauce, i.imported_at, i.thumb_rel,
                     (i.ai_metadata IS NOT NULL AND i.ai_metadata != '')
              FROM images i
              WHERE {where_sql}
@@ -1516,6 +1510,17 @@ fn build_filter_conds(
         conds.push(format!("i.source = {t}"));
         params.push(Box::new(v.clone()));
     }
+    // 溯源状态（已溯源/不可溯源/未溯源）
+    if let Some(v) = &filter.sauce_status {
+        let is_sauced = "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
+        let is_ai = "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
+        match v.as_str() {
+            "sauced" => conds.push(is_sauced.to_string()),
+            "unsauced" => conds.push(format!("NOT ({is_sauced}) AND NOT ({is_ai}) AND i.no_auto_sauce = 0")),
+            "un-sauced" => conds.push(format!("({is_ai}) OR i.no_auto_sauce = 1")),
+            _ => {}
+        }
+    }
     if let Some(v) = &filter.format {
         let t = format!("?{}", params.len() + 1);
         conds.push(format!("i.format = {t}"));
@@ -1590,9 +1595,10 @@ fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {
         is_redundant: r.get::<_, i64>(10)? != 0,
         source: r.get(11)?,
         source_url: r.get(12)?,
-        imported_at: r.get(13)?,
-        thumb_rel: r.get(14)?,
-        is_ai: r.get::<_, i64>(15)? != 0,
+        no_auto_sauce: r.get::<_, i64>(13)? != 0,
+        imported_at: r.get(14)?,
+        thumb_rel: r.get(15)?,
+        is_ai: r.get::<_, i64>(16)? != 0,
     })
 }
 

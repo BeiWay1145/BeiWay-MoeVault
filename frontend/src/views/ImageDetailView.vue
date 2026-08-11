@@ -297,6 +297,7 @@ onUnmounted(() => {
           <el-tag v-if="aiChecked" type="primary" style="margin-left: 6px">AI 生成</el-tag>
           <el-tag v-else type="info" plain style="margin-left: 6px">非 AI 生成</el-tag>
           <el-tag v-if="image.sourceUrl || (image.source !== undefined && image.source !== 'local' && image.source !== '')" type="success" plain style="margin-left: 6px">已溯源</el-tag>
+          <el-tag v-else-if="image.noAutoSauce || aiChecked" type="warning" plain style="margin-left: 6px">不可溯源</el-tag>
           <el-tag v-else type="info" plain style="margin-left: 6px">未溯源</el-tag>
           <el-tag v-if="tags.length > 0" type="success" plain style="margin-left: 6px">已打标</el-tag>
           <el-tag v-else-if="aiChecked" type="info" plain style="margin-left: 6px">无需打标</el-tag>

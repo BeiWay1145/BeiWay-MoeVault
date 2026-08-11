@@ -256,6 +256,17 @@ async function onToggleAiFilter(val: boolean | string | number) {
         AI 生成显示
       </el-checkbox>
 
+      <el-select
+        :model-value="library.filter.sauceStatus ?? ''"
+        style="width: 130px"
+        @change="(v: string) => library.applyFilter({ sauceStatus: v || undefined })"
+      >
+        <el-option label="溯源：全部" value="" />
+        <el-option label="已溯源" value="sauced" />
+        <el-option label="不可溯源" value="un-sauced" />
+        <el-option label="未溯源" value="unsauced" />
+      </el-select>
+
       <el-checkbox v-model="library.multiSelect">
         多选模式
       </el-checkbox>

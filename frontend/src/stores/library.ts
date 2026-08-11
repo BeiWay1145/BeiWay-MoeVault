@@ -25,6 +25,8 @@ export interface ImageItem {
   sourceUrl?: string
   /** 来源（danbooru/gelbooru/local） */
   source?: string
+  /** 不可自动溯源标记（尝试过无结果/AI 图） */
+  noAutoSauce?: boolean
 }
 
 export type ViewMode = 'grid' | 'waterfall' | 'list'
@@ -51,6 +53,8 @@ export interface LibraryFilter {
   format?: string
   isRedundant?: boolean
   isAi?: boolean
+  /** 溯源状态：sauced / unsauced / un-sauced */
+  sauceStatus?: string
 }
 
 export const useLibraryStore = defineStore('library', () => {
@@ -105,6 +109,7 @@ export const useLibraryStore = defineStore('library', () => {
       if (f.format) params.set('format', f.format)
       if (f.isRedundant != null) params.set('is_redundant', f.isRedundant ? '1' : '0')
       if (f.isAi != null) params.set('is_ai', f.isAi ? '1' : '0')
+      if (f.sauceStatus) params.set('sauce_status', f.sauceStatus)
 
       const d = await get<{ items: Array<Record<string, unknown>>; total: number; next_cursor?: string | null }>(
         `/images?${params.toString()}`,
@@ -124,6 +129,7 @@ export const useLibraryStore = defineStore('library', () => {
         format: (it.format as string) ?? undefined,
         sourceUrl: (it.source_url as string) ?? undefined,
         source: (it.source as string) ?? undefined,
+        noAutoSauce: (it.no_auto_sauce as boolean) ?? false,
       }))
       total.value = d.total
       nextCursor.value = (d.next_cursor as string | null) ?? null

@@ -79,6 +79,8 @@ pub struct ImageListItem {
     pub source: String,
     /// 溯源来源链接（danbooru/gelbooru 页面或自定义）。
     pub source_url: Option<String>,
+    /// 不可自动溯源标记（尝试过无结果/AI 图）。
+    pub no_auto_sauce: bool,
     pub imported_at: i64,
     /// 缩略图相对路径（data/thumbs 下）。
     pub thumb_rel: String,
@@ -115,6 +117,8 @@ pub struct ImageFilter {
     pub is_redundant: Option<bool>,
     /// 只看 AI 生成图片。
     pub is_ai: Option<bool>,
+    /// 溯源状态：sauced（已溯源）/unsauced（未溯源）/un-sauced（不可溯源：no_auto_sauce 或 AI 图）。
+    pub sauce_status: Option<String>,
 }
 
 /// 排序键。

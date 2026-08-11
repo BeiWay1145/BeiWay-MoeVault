@@ -16,6 +16,7 @@ const keyword = ref('')
 const aestheticMin = ref<number | null>(null)
 const source = ref('')
 const onlyRedundant = ref(false)
+const sauceStatus = ref('')
 const forceSauce = ref(false)
 const tagsInput = ref('')
 
@@ -76,6 +77,7 @@ async function doSearch() {
       aestheticMin: aestheticMin.value ?? undefined,
       source: source.value || undefined,
       isRedundant: onlyRedundant.value ? true : undefined,
+      sauceStatus: sauceStatus.value || undefined,
       tags: tagsInput.value
         ? tagsInput.value.split(',').map((s) => s.trim()).filter(Boolean)
         : undefined,
@@ -88,6 +90,7 @@ async function clearSearch() {
   aestheticMin.value = null
   source.value = ''
   onlyRedundant.value = false
+  sauceStatus.value = ''
   tagsInput.value = ''
   library.clearFilter()
   await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
@@ -210,6 +213,13 @@ async function onBatchDetectAi() {
         </el-form-item>
         <el-form-item label="冗余候选">
           <el-switch v-model="onlyRedundant" />
+        </el-form-item>
+        <el-form-item label="溯源状态">
+          <el-select v-model="sauceStatus" clearable placeholder="不限" style="width: 130px">
+            <el-option value="sauced" label="已溯源" />
+            <el-option value="un-sauced" label="不可溯源" />
+            <el-option value="unsauced" label="未溯源" />
+          </el-select>
         </el-form-item>
         <el-form-item>
           <el-checkbox v-model="library.multiSelect">多选模式</el-checkbox>

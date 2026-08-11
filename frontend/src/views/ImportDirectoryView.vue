@@ -28,7 +28,7 @@ const days = ref<DayGroup[]>([])
 const loading = ref(false)
 
 // 筛选状态（sauce/tag/ai）
-const sauceFilter = ref<'all' | 'sauced' | 'unsauced'>('all')
+const sauceFilter = ref<'all' | 'sauced' | 'unsauced' | 'un-sauced'>('all')
 const tagFilter = ref<'all' | 'tagged' | 'untagged' | 'no_need'>('all')
 const aiFilter = ref<'all' | 'ai' | 'not_ai'>('all')
 
@@ -265,9 +265,10 @@ onMounted(() => {
   <div class="imports-page">
     <div class="toolbar">
       <div class="filters">
-        <el-select v-model="sauceFilter" size="default" style="width: 130px">
+        <el-select v-model="sauceFilter" size="default" style="width: 150px">
           <el-option label="溯源：全部" value="all" />
           <el-option label="已溯源" value="sauced" />
+          <el-option label="不可溯源" value="un-sauced" />
           <el-option label="未溯源" value="unsauced" />
         </el-select>
         <el-select v-model="tagFilter" size="default" style="width: 150px">

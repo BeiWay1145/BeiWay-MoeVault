@@ -291,6 +291,8 @@ pub struct ListParams {
     pub is_redundant: Option<String>,
     /// 只看 AI 生成图片（1/0/true/false）。
     pub is_ai: Option<String>,
+    /// 溯源状态：sauced / unsauced / un-sauced。
+    pub sauce_status: Option<String>,
     /// 排序键：imported/date/aesthetic/clarity/size/random。
     pub sort: Option<String>,
     /// asc/desc。
@@ -360,6 +362,7 @@ impl ListParams {
             min_height: self.min_height,
             is_redundant: self.parse_redundant()?,
             is_ai: self.parse_ai()?,
+            sauce_status: self.sauce_status.clone(),
         })
     }
 
