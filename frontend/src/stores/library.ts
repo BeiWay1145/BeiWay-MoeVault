@@ -21,6 +21,10 @@ export interface ImageItem {
   isAi: boolean
   /** 文件扩展名（如 jpg/png） */
   format?: string
+  /** 溯源来源链接（danbooru/gelbooru 页面或自定义） */
+  sourceUrl?: string
+  /** 来源（danbooru/gelbooru/local） */
+  source?: string
 }
 
 export type ViewMode = 'grid' | 'waterfall' | 'list'
@@ -70,17 +74,25 @@ export const useLibraryStore = defineStore('library', () => {
 
   // 视图模式变化 → 持久化
   watch(viewMode, (m) => localStorage.setItem('moevault-view-mode', m))
+  // E9: 关闭多选模式时自动取消选择
+  watch(multiSelect, (on) => {
+    if (!on) clearSelect()
+  })
 
   const images = ref<ImageItem[]>([])
   const total = ref(0)
   const loading = ref(false)
+  /** 游标分页的下一页游标（cursor 模式时由后端返回）。 */
+  const nextCursor = ref<string | null>(null)
 
-  /** 拉取图片列表（按当前筛选/排序）。 */
-  async function fetchImages(limit = 200) {
+  /** 拉取图片列表（按当前筛选/排序）。
+   *  opts.cursor 存在时用游标分页（E6），否则按 limit 一次拉取。 */
+  async function fetchImages(limit = 200, opts: { cursor?: string | null } = {}) {
     loading.value = true
     try {
       const params = new URLSearchParams()
       params.set('limit', String(limit))
+      if (opts.cursor != null) params.set('cursor', String(opts.cursor))
       if (sortKey.value) params.set('sort', sortKey.value)
       if (sortAsc.value) params.set('order', 'asc')
       const f = filter.value
@@ -94,12 +106,12 @@ export const useLibraryStore = defineStore('library', () => {
       if (f.isRedundant != null) params.set('is_redundant', f.isRedundant ? '1' : '0')
       if (f.isAi != null) params.set('is_ai', f.isAi ? '1' : '0')
 
-      const d = await get<{ items: Array<Record<string, unknown>>; total: number }>(
+      const d = await get<{ items: Array<Record<string, unknown>>; total: number; next_cursor?: string | null }>(
         `/images?${params.toString()}`,
       )
       images.value = d.items.map((it) => ({
         id: it.id as number,
-        name: decodeURIComponent((it.rel_path as string).split('/').pop() ?? ''),
+        name: decodeURIComponent((it.rel_path as string).split(/[\\/]/).pop() ?? ''),
         width: it.width as number,
         height: it.height as number,
         sizeBytes: it.size_bytes as number,
@@ -110,8 +122,11 @@ export const useLibraryStore = defineStore('library', () => {
         thumbRel: (it.thumb_rel as string) ?? '',
         isAi: it.is_ai as boolean,
         format: (it.format as string) ?? undefined,
+        sourceUrl: (it.source_url as string) ?? undefined,
+        source: (it.source as string) ?? undefined,
       }))
       total.value = d.total
+      nextCursor.value = (d.next_cursor as string | null) ?? null
     } finally {
       loading.value = false
     }
@@ -178,6 +193,7 @@ export const useLibraryStore = defineStore('library', () => {
     images,
     total,
     loading,
+    nextCursor,
     fetchImages,
     applyFilter,
     clearFilter,

@@ -60,14 +60,6 @@ function onCardClick(img: ImageItem) {
 
 async function onRecycle(img: ImageItem) {
   try {
-    await ElMessageBox.confirm(`将「${img.name}」移入回收站？可随时恢复。`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '移入回收站',
-    })
-  } catch {
-    return
-  }
-  try {
     await post(`/images/${img.id}/recycle`, { reason: 'manual' })
     ElMessage.success('已移入回收站')
     await library.fetchImages()

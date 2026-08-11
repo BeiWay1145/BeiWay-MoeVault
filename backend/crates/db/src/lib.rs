@@ -105,7 +105,7 @@ impl Db {
         let mut sql = String::from(
             "SELECT i.id, i.md5, i.rel_path, i.width, i.height, i.format, i.size_bytes,
                     i.exif_datetime, i.clarity_score, i.aesthetic_score,
-                    i.is_redundant, i.source, i.imported_at, i.thumb_rel,
+                    i.is_redundant, i.source, i.source_url, i.imported_at, i.thumb_rel,
                     (i.ai_metadata IS NOT NULL AND i.ai_metadata != '')
              FROM images i",
         );
@@ -952,6 +952,16 @@ impl Db {
         Ok(out)
     }
 
+    /// 写入/更新溯源来源链接（可手动编辑）。
+    pub fn update_source_url(&self, image_id: i64, url: Option<&str>) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET source_url = ?2 WHERE id = ?1",
+            params![image_id, url],
+        )?;
+        Ok(())
+    }
+
     /// 写入美学评分。
     pub fn set_aesthetic_score(&self, image_id: i64, score: f64) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
@@ -1098,6 +1108,16 @@ impl Db {
         )
         .optional()
         .map_err(DbError::from)
+    }
+
+    /// 清空历史任务（done/failed/cancelled），保留 running/pending。返回删除数。
+    pub fn clear_jobs(&self) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM jobs WHERE status IN ('done','failed','cancelled')",
+            [],
+        )?;
+        Ok(n as i64)
     }
 }
 
@@ -1261,9 +1281,10 @@ fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {
         aesthetic_score: r.get(9)?,
         is_redundant: r.get::<_, i64>(10)? != 0,
         source: r.get(11)?,
-        imported_at: r.get(12)?,
-        thumb_rel: r.get(13)?,
-        is_ai: r.get::<_, i64>(14)? != 0,
+        source_url: r.get(12)?,
+        imported_at: r.get(13)?,
+        thumb_rel: r.get(14)?,
+        is_ai: r.get::<_, i64>(15)? != 0,
     })
 }
 

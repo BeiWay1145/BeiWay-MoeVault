@@ -70,7 +70,14 @@ async fn score_one(
     let file_path = library_dir.join(&img.rel_path);
 
     // 调用推理服务 /infer/aesthetic
-    let score = infer.infer_aesthetic(file_path.as_path()).await?;
+    let score = infer
+        .infer_aesthetic(file_path.as_path())
+        .await
+        .map_err(|e| {
+            TaggerError::Invalid(format!(
+                "美学评分失败（请确认推理服务已启动: python/run_server.bat，端口 8001）：{e}"
+            ))
+        })?;
     db.set_aesthetic_score(image_id, score)?;
     info!(image_id, score, "美学评分完成");
     Ok(())

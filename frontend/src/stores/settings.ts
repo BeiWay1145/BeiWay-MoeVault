@@ -20,6 +20,9 @@ export interface SettingsState {
   cn_dict_enabled: boolean
   recycle_days: number
   library_dir: string
+  /** E6: 画廊/搜索分页模式（默认关闭） */
+  pagination_enabled: boolean
+  page_size: number
 }
 
 const defaults: SettingsState = {
@@ -33,6 +36,8 @@ const defaults: SettingsState = {
   cn_dict_enabled: false,
   recycle_days: 0,
   library_dir: 'data/library',
+  pagination_enabled: false,
+  page_size: 50,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -55,6 +60,8 @@ export const useSettingsStore = defineStore('settings', () => {
         cn_dict_enabled: s.cn_dict_enabled === true || s.cn_dict_enabled === 'true',
         recycle_days: s.recycle_days != null ? Number(s.recycle_days) : defaults.recycle_days,
         library_dir: String(s.library_dir ?? defaults.library_dir),
+        pagination_enabled: s.pagination_enabled === true || s.pagination_enabled === 'true',
+        page_size: s.page_size != null ? Number(s.page_size) : defaults.page_size,
       }
       loaded.value = true
     } catch {
@@ -74,6 +81,8 @@ export const useSettingsStore = defineStore('settings', () => {
       cn_dict_enabled: String(settings.value.cn_dict_enabled),
       recycle_days: String(settings.value.recycle_days),
       library_dir: settings.value.library_dir,
+      pagination_enabled: String(settings.value.pagination_enabled),
+      page_size: String(settings.value.page_size),
     })
   }
 

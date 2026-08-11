@@ -18,7 +18,7 @@ use super::{db_error_response, error_response, join_error_response};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/tasks", get(list_tasks))
+        .route("/api/v1/tasks", get(list_tasks).delete(clear_tasks))
         .route("/api/v1/tasks/{id}", get(get_task))
 }
 
@@ -80,6 +80,29 @@ async fn get_task(
         .await
         .map_err(join_error_response)?
         .map_err(db_error_response)?;
+    // 各 key 额度消耗（SauceNAO 任务相关）
+    let keys_usage: Vec<Value> = {
+        let slot = state.sauce_pool.read().await;
+        match slot.as_ref() {
+            Some(pool) => pool
+                .snapshot()
+                .await
+                .iter()
+                .map(|k| {
+                    json!({
+                        "name": k.name,
+                        "tier": k.tier,
+                        "long_remaining": k.long_remaining,
+                        "short_remaining": k.short_remaining,
+                        "total_requests": k.total_requests,
+                        "cooldown_secs": k.cooldown_secs(),
+                        "daily_paused": k.daily_paused,
+                    })
+                })
+                .collect(),
+            None => vec![],
+        }
+    };
     match job {
         Some(j) => Ok(Json(json!({
             "id": j.id,
@@ -94,7 +117,20 @@ async fn get_task(
             "created_at": j.created_at,
             "updated_at": j.updated_at,
             "finished_at": j.finished_at,
+            "keys_usage": keys_usage,
         }))),
         None => Err(error_response(ErrorKind::NotFound, format!("任务 {id} 不存在"))),
     }
+}
+
+/// DELETE /api/v1/tasks：清空历史任务（保留进行中）。
+async fn clear_tasks(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let n = tokio::task::spawn_blocking(move || db.clear_jobs())
+        .await
+        .map_err(join_error_response)?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true, "cleared": n })))
 }

@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, originalUrl } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
-import { get, post } from '@/api/client'
+import { get, post, put } from '@/api/client'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,8 +17,36 @@ const aiInfo = ref<string | null>(null)
 const aiTags = ref<string[]>([])
 const aiChecked = ref(false)
 const stageRef = ref<HTMLElement | null>(null)
+/** 全屏查看模式（点击图片进入；叉号/ESC 退出；左右键切换）。 */
+const fullscreen = ref(false)
 
 const originalSrc = computed(() => (image.value ? originalUrl(image.value.id) : undefined))
+
+// E3: 标签按 danbooru 分类（画师/系列/角色/常规），名称前缀分类
+type TagView = { name: string; name_cn: string | null; source: string }
+const tagGroups = computed(() => {
+  const groups: Record<'artist' | 'copyright' | 'character' | 'general', TagView[]> = {
+    artist: [],
+    copyright: [],
+    character: [],
+    general: [],
+  }
+  for (const t of tags.value) {
+    const name = t.name
+    if (name.startsWith('artist:')) groups.artist.push({ ...t, name: name.slice(7) })
+    else if (name.startsWith('copyright:')) groups.copyright.push({ ...t, name: name.slice(10) })
+    else if (name.startsWith('character:')) groups.character.push({ ...t, name: name.slice(10) })
+    else groups.general.push(t)
+  }
+  return groups
+})
+const tagGroupDefs = [
+  { key: 'artist', label: '画师', type: 'danger' as const },
+  { key: 'copyright', label: '系列', type: 'warning' as const },
+  { key: 'character', label: '角色', type: 'success' as const },
+  { key: 'general', label: '常规', type: 'primary' as const },
+]
+const hasAnyTags = computed(() => tags.value.length > 0)
 
 // 上一张/下一张（基于当前列表顺序）
 const indexInList = computed(() => library.images.findIndex((i) => i.id === image.value?.id))
@@ -30,11 +58,20 @@ function gotoImage(delta: number) {
   router.push(`/library/${next.id}`)
 }
 
-// 键盘左右键切换 + Del 删除（放入回收站）
+// 键盘左右键切换 + Del 删除 + ESC 退出全屏
 function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    fullscreen.value = false
+    return
+  }
   if (e.key === 'ArrowLeft') gotoImage(-1)
   else if (e.key === 'ArrowRight') gotoImage(1)
   else if (e.key === 'Delete' || e.key === 'Del') recycle()
+}
+
+/** 点击图片区域进入全屏。 */
+function enterFullscreen() {
+  fullscreen.value = true
 }
 
 // 路由参数变化（左右切换/URL 直达）时刷新标签等详情数据（BUG1 修复）
@@ -174,6 +211,26 @@ function exportImage() {
   a.click()
 }
 
+/** E2: 手动编辑溯源来源链接。 */
+async function editSourceUrl() {
+  if (!image.value) return
+  const id = image.value.id
+  const cur = image.value.sourceUrl ?? ''
+  const { value } = await ElMessageBox.prompt('输入溯源来源链接（留空清除）', '编辑原图链接', {
+    inputValue: cur,
+    inputPlaceholder: 'https://danbooru.donmai.us/posts/...',
+  }).catch(() => ({ value: null as string | null }))
+  if (value === null) return
+  try {
+    await put(`/images/${id}/source-url`, { url: value || null })
+    const it = library.images.find((i) => i.id === id)
+    if (it) it.sourceUrl = value || undefined
+    ElMessage.success('原图链接已更新')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 onMounted(() => {
   loadDetail()
   window.addEventListener('keydown', onKeydown)
@@ -188,8 +245,8 @@ onUnmounted(() => {
     <div class="viewer">
       <button class="nav-close" title="返回" @click="router.back()">✕</button>
       <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
-      <div ref="stageRef" class="stage">
-        <el-image :src="originalSrc" fit="contain" class="stage-img">
+      <div ref="stageRef" class="stage" @click="enterFullscreen">
+        <el-image :src="originalSrc" fit="contain" class="stage-img" :preview-src-list="[]">
           <template #error>
             <span class="placeholder-name">原图加载失败</span>
           </template>
@@ -197,6 +254,20 @@ onUnmounted(() => {
       </div>
       <button class="nav-arrow right" title="下一张" @click="gotoImage(1)">›</button>
     </div>
+
+    <!-- 全屏查看模式（E1）：点击图片进入，叉号/ESC 退出，左右键切换 -->
+    <Transition name="fs">
+      <div v-if="fullscreen" class="fullscreen" @click="fullscreen = false">
+        <button class="fs-close" title="退出全屏" @click.stop="fullscreen = false">✕</button>
+        <button class="fs-arrow left" title="上一张" @click.stop="gotoImage(-1)">‹</button>
+        <el-image :src="originalSrc" fit="contain" class="fs-img" @click.stop>
+          <template #error>
+            <span class="placeholder-name">原图加载失败</span>
+          </template>
+        </el-image>
+        <button class="fs-arrow right" title="下一张" @click.stop="gotoImage(1)">›</button>
+      </div>
+    </Transition>
 
     <div class="panel">
       <el-descriptions :column="1" title="基本信息" border>
@@ -209,10 +280,20 @@ onUnmounted(() => {
           <span class="num-mono">{{ image.aesthetic?.toFixed(1) ?? '—' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="导入时间">{{ new Date(image.importedAt * 1000).toLocaleDateString() }}</el-descriptions-item>
+        <el-descriptions-item label="原图链接">
+          <a v-if="image.sourceUrl" :href="image.sourceUrl" target="_blank" rel="noopener" class="src-link">{{ image.sourceUrl }}</a>
+          <span v-else class="muted">未溯源</span>
+          <el-button size="small" text type="primary" style="margin-left: 8px" @click="editSourceUrl">编辑</el-button>
+        </el-descriptions-item>
         <el-descriptions-item label="状态">
           <el-tag v-if="image.isRedundant" type="warning">冗余候选</el-tag>
           <el-tag v-else type="success">正常</el-tag>
           <el-tag v-if="aiChecked" type="primary" style="margin-left: 6px">AI 生成</el-tag>
+          <el-tag v-if="image.sourceUrl || (image.source !== undefined && image.source !== 'local' && image.source !== '')" type="success" plain style="margin-left: 6px">已溯源</el-tag>
+          <el-tag v-else type="info" plain style="margin-left: 6px">未溯源</el-tag>
+          <el-tag v-if="tags.length > 0" type="success" plain style="margin-left: 6px">已打标</el-tag>
+          <el-tag v-else-if="aiChecked" type="info" plain style="margin-left: 6px">无需打标</el-tag>
+          <el-tag v-else type="warning" plain style="margin-left: 6px">未打标</el-tag>
         </el-descriptions-item>
       </el-descriptions>
 
@@ -226,11 +307,13 @@ onUnmounted(() => {
             {{ aiChecked ? '取消 AI 标记' : '手动标记为 AI' }}
           </el-button>
         </div>
-        <div v-if="tags.length > 0" class="tag-list">
-          <el-tag v-for="t in tags" :key="t.name" class="tag" size="small"
-            :type="t.source === 'ai' ? 'primary' : 'info'">
-            {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
-          </el-tag>
+        <div v-if="hasAnyTags" class="tag-groups">
+          <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
+            <span v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0" class="tag-group-label">{{ g.label }}</span>
+            <el-tag v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name" class="tag" size="small" :type="g.type">
+              {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
+            </el-tag>
+          </div>
         </div>
         <el-empty v-else description="暂无标签（可点击上方按钮读取 AI 生成信息）" :image-size="50" />
         <pre v-if="aiInfo" class="ai-info">{{ aiInfo }}</pre>
@@ -333,6 +416,89 @@ onUnmounted(() => {
 .placeholder-name {
   color: #888;
 }
+.src-link {
+  color: var(--el-color-primary);
+  word-break: break-all;
+  font-size: 12px;
+}
+.muted {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+/* 全屏查看模式（E1） */
+.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.97);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.fs-img {
+  width: 100%;
+  height: 100%;
+  cursor: zoom-out;
+}
+.fs-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 10;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.fs-close:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+.fs-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  width: 52px;
+  height: 52px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 36px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.fs-arrow:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+.fs-arrow.left {
+  left: 24px;
+}
+.fs-arrow.right {
+  right: 24px;
+}
+.fs-enter-active,
+.fs-leave-active {
+  transition: opacity 0.2s ease;
+}
+.fs-enter-from,
+.fs-leave-to {
+  opacity: 0;
+}
 .panel {
   width: 400px;
   flex: none;
@@ -348,10 +514,22 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
 }
-.tag-list {
+.tag-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tag-group {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  align-items: center;
+}
+.tag-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  margin-right: 2px;
 }
 .ai-info {
   margin-top: 8px;

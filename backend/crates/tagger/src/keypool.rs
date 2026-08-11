@@ -113,8 +113,9 @@ fn now_secs() -> u64 {
 
 /// 多 key 调度器（线程安全）。
 /// 支持持久化：设置 persist_path 后每次状态变更自动保存 JSON 快照，重启恢复。
+#[derive(Clone)]
 pub struct ApiKeyPool {
-    inner: Mutex<PoolInner>,
+    inner: std::sync::Arc<Mutex<PoolInner>>,
 }
 
 struct PoolInner {
@@ -145,7 +146,7 @@ impl ApiKeyPool {
             })
             .collect();
         Self {
-            inner: Mutex::new(PoolInner { keys, cursor: 0, persist: None }),
+            inner: std::sync::Arc::new(Mutex::new(PoolInner { keys, cursor: 0, persist: None })),
         }
     }
 
@@ -162,7 +163,7 @@ impl ApiKeyPool {
             })
             .collect();
         Self {
-            inner: Mutex::new(PoolInner { keys, cursor: 0, persist: None }),
+            inner: std::sync::Arc::new(Mutex::new(PoolInner { keys, cursor: 0, persist: None })),
         }
     }
 
@@ -194,11 +195,11 @@ impl ApiKeyPool {
             }
         }
         Some(Self {
-            inner: Mutex::new(PoolInner {
+            inner: std::sync::Arc::new(Mutex::new(PoolInner {
                 keys: snap.keys,
                 cursor: snap.cursor,
                 persist: Some(path.to_path_buf()),
-            }),
+            })),
         })
     }
 
@@ -349,6 +350,16 @@ impl ApiKeyPool {
         self.inner.lock().await.keys.clone()
     }
 
+    /// 手动解除当日停用（用户显式调整额度后允许继续使用）。
+    pub async fn force_resume(&self, idx: usize) {
+        let mut inner = self.inner.lock().await;
+        if let Some(k) = inner.keys.get_mut(idx) {
+            k.daily_paused = false;
+        }
+        drop(inner);
+        self.save().await;
+    }
+
     /// 是否有任何可用 key。
     pub async fn any_available(&self) -> bool {
         self.inner.lock().await.keys.iter().any(|k| k.available())
@@ -473,5 +484,53 @@ mod tests {
         let snap = pool.snapshot().await;
         assert_eq!(snap[0].short_remaining, 0);
         assert!(!snap[0].available());
+    }
+
+    /// 额外需求：验证多线程/多并发下按配额与冷却灵活调度（不重复分配、冷却生效）。
+    #[tokio::test]
+    async fn concurrent_acquire_respects_cooldown_and_quota() {
+        // 3 个 key：k1 可用、k2 冷却 3600s、k3 当日停用
+        let pool = ApiKeyPool::new(vec!["k1".into(), "k2".into(), "k3".into()]);
+        pool.start_cooldown(1, 3600).await;
+        pool.update(2, Some(3), Some(5)).await; // k3 long=5 <10 → daily_paused
+        let snap = pool.snapshot().await;
+        assert!(!snap[1].available(), "k2 冷却中");
+        assert!(!snap[2].available(), "k3 当日停用");
+
+        // 并发 10 个 acquire：只应拿到 k1（其余不可用），且 k1 每次轮转消耗后进入可用循环
+        // 由于 k1 无冷却，10 次都应分配到 k1（无可用时等待逻辑不触发）
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move { pool.acquire().await.0 }));
+        }
+        let mut got = Vec::new();
+        for h in handles {
+            got.push(h.await.expect("任务执行失败"));
+        }
+        assert!(got.iter().all(|k| k == "k1"), "只应分配到可用 key k1，实际 {got:?}");
+        let snap = pool.snapshot().await;
+        assert_eq!(snap[0].total_requests, 10, "k1 累计 10 次请求");
+        assert_eq!(snap[1].total_requests, 0, "k2 冷却中不应被请求");
+        assert_eq!(snap[2].total_requests, 0, "k3 停用不应被请求");
+    }
+
+    /// 额外需求：模拟多 key 轮流分配（round-robin），全部可用时依次轮转。
+    #[tokio::test]
+    async fn concurrent_acquire_rotates_all_available() {
+        let pool = ApiKeyPool::new(vec!["k1".into(), "k2".into(), "k3".into()]);
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move { pool.acquire().await.0 }));
+        }
+        let mut got = Vec::new();
+        for h in handles {
+            got.push(h.await.expect("任务执行失败"));
+        }
+        // 3 key 全部可用 → 6 次请求应轮流覆盖 k1/k2/k3（各 2 次）
+        for name in ["k1", "k2", "k3"] {
+            assert_eq!(got.iter().filter(|k| *k == name).count(), 2, "{name} 应分到 2 次");
+        }
     }
 }

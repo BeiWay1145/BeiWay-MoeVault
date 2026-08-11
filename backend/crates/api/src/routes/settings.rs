@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    routing::{delete, get},
+    routing::{delete, get, put},
     Json, Router,
 };
 use moevault_core::models::SauceNaoKey;
@@ -32,6 +32,8 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "cn_dict_enabled",
     "recycle_days",
     "library_dir",
+    "pagination_enabled",
+    "page_size",
 ];
 
 pub fn router() -> Router<AppState> {
@@ -39,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/settings", get(get_settings).put(update_settings))
         .route("/api/v1/settings/saucenao-keys", get(list_keys).post(add_key))
         .route("/api/v1/settings/saucenao-keys/{name}", delete(delete_key))
+        .route("/api/v1/settings/saucenao-keys/{name}/quota", put(set_key_quota))
 }
 
 /// 从 settings 表读取 saucenao_keys JSON（回退旧格式）。
@@ -149,19 +152,76 @@ async fn list_keys(
         .await
         .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
         .map_err(db_error_response)?;
-    // 脱敏返回（仅管理 UI 显示用）
+    // 实时配额：从 sauce_pool 快照合并（pool 未初始化时为 None）
+    let live = {
+        let slot = state.sauce_pool.read().await;
+        match slot.as_ref() {
+            Some(pool) => Some(pool.snapshot().await),
+            None => None,
+        }
+    };
     let masked: Vec<Value> = keys
         .iter()
         .map(|k| {
+            let lr = live.as_ref().and_then(|l| l.iter().find(|s| s.name == k.name));
             json!({
                 "name": k.name,
                 "key_masked": format!("{}...{}", &k.key[..2.min(k.key.len())], &k.key[k.key.len().saturating_sub(2)..]),
                 "tier": k.tier,
                 "has_key": true,
+                "short_remaining": lr.map(|s| s.short_remaining).unwrap_or(0),
+                "long_remaining": lr.map(|s| s.long_remaining).unwrap_or(95),
+                "cooldown_secs": lr.map(|s| s.cooldown_secs()).unwrap_or(0),
+                "daily_paused": lr.map(|s| s.daily_paused).unwrap_or(false),
+                "total_requests": lr.map(|s| s.total_requests).unwrap_or(0),
             })
         })
         .collect();
     Ok(Json(json!({ "keys": masked, "count": keys.len() })))
+}
+
+/// PUT /api/v1/settings/saucenao-keys/{name}/quota：手动修改当日剩余额度。
+/// body `{ "long_remaining": number }`；同步更新运行时 pool（若已初始化）。
+async fn set_key_quota(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let Some(v) = req.get("long_remaining").and_then(|v| v.as_i64()) else {
+        return Err(error_response(ErrorKind::InvalidInput, "缺少 long_remaining"));
+    };
+    let long = v.clamp(0, 10000);
+    let db = state.db.clone();
+    let name2 = name.clone();
+    tokio::task::spawn_blocking(move || {
+        // 同步写回配置（持久化）
+        let mut keys = read_keys(&db).map_err(db_error_response)?;
+        if let Some(k) = keys.iter_mut().find(|k| k.name == name2) {
+            // SauceNaoKey 无配额字段，配额存于 pool 快照；这里只确保 key 存在
+            let _ = k;
+        } else {
+            return Err(error_response(ErrorKind::NotFound, format!("密钥 {name2} 不存在")));
+        }
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    // 更新运行时 pool（若已初始化）
+    {
+        let pool_arc = {
+            let slot = state.sauce_pool.read().await;
+            slot.clone()
+        };
+        if let Some(pool) = pool_arc {
+            let snap = pool.snapshot().await;
+            if let Some(idx) = snap.iter().position(|s| s.name == name) {
+                pool.update(idx, None, Some(long)).await;
+                // 手动设置后解除当日停用（用户显式改额度 = 允许继续用）
+                pool.force_resume(idx).await;
+            }
+        }
+    }
+    Ok(Json(json!({ "ok": true, "name": name, "long_remaining": long })))
 }
 
 async fn add_key(

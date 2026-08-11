@@ -75,6 +75,8 @@ pub struct ImageListItem {
     pub aesthetic_score: Option<f64>,
     pub is_redundant: bool,
     pub source: String,
+    /// 溯源来源链接（danbooru/gelbooru 页面或自定义）。
+    pub source_url: Option<String>,
     pub imported_at: i64,
     /// 缩略图相对路径（data/thumbs 下）。
     pub thumb_rel: String,

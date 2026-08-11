@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use moevault_core::models::{ImageFilter, Page, SortKey, Stats, STATUS_ACTIVE};
@@ -27,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/images/{id}/similar", get(similar_images))
         .route("/api/v1/images/{id}/ai-info", post(read_ai_info))
         .route("/api/v1/images/{id}/mark-ai", post(mark_ai))
+        .route("/api/v1/images/{id}/source-url", put(update_source_url))
 }
 
 /// GET /api/v1/images/{id}/file：返回原图（stream）。
@@ -175,6 +176,29 @@ async fn mark_ai(
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
     Ok(Json(json!({ "ok": true, "is_ai": set })))
+}
+
+/// PUT /api/v1/images/{id}/source-url：手动编辑溯源来源链接。
+/// body `{ "url": string | null }`（null 清除）。
+async fn update_source_url(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let url = req
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let db = state.db.clone();
+    let url_for_db = url.clone();
+    tokio::task::spawn_blocking(move || {
+        db.update_source_url(id, url_for_db.as_deref())
+            .map_err(db_error_response)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(json!({ "ok": true, "source_url": url })))
 }
 
 /// POST /api/v1/images/{id}/sidecar：生成 sidecar .txt（逗号分隔标签，与 cl_tagger 格式一致）。

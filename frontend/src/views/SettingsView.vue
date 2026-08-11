@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { Delete } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post, del, put } from '@/api/client'
 import { useSettingsStore, type SauceKeyConfig } from '@/stores/settings'
 
@@ -11,8 +12,7 @@ const activeTab = ref('saucenao')
 const newKey = ref('')
 const newKeyName = ref('')
 const newKeyTier = ref('free')
-const keys = ref<SauceKeyConfig[]>([])
-const keyStatuses = ref<Array<Record<string, unknown>>>([])
+const keys = ref<SauceKeyConfig[] & Array<Record<string, unknown>>>([])
 const manageVisible = ref(false)
 const saving = ref(false)
 
@@ -24,20 +24,57 @@ const taggerModelOptions = [
 
 async function loadKeys() {
   try {
-    const d = await get<{ keys: SauceKeyConfig[]; count: number }>('/settings/saucenao-keys')
+    // 现在 list_keys 返回实时配额（short/long/cooldown/status）
+    const d = await get<{ keys: SauceKeyConfig[] & Array<Record<string, unknown>>; count: number }>(
+      '/settings/saucenao-keys',
+    )
     keys.value = d.keys
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-async function loadKeyStatuses() {
+/** E7: 手动修改某 key 的当日额度。 */
+async function editQuota(name: string) {
+  const k = keys.value.find((x) => x.name === name) as (SauceKeyConfig & Record<string, unknown>) | undefined
+  const cur = Number(k?.long_remaining ?? 95)
+  const { value } = await ElMessageBox.prompt('设置当日剩余额度', `修改额度 · ${name}`, {
+    inputValue: String(cur),
+    inputPattern: /^\d+$/,
+    inputErrorMessage: '请输入数字',
+  }).catch(() => ({ value: null as string | null }))
+  if (value === null) return
   try {
-    const d = await get<{ keys: Array<Record<string, unknown>> }>('/tagging/keys')
-    keyStatuses.value = d.keys
-  } catch {
-    keyStatuses.value = []
+    await put(`/settings/saucenao-keys/${encodeURIComponent(name)}/quota`, { long_remaining: Number(value) })
+    ElMessage.success('额度已更新')
+    await loadKeys()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
   }
+}
+
+/** E7: 安全删除密钥（红垃圾桶，需确认）。 */
+async function removeKey(name: string) {
+  try {
+    await ElMessageBox.confirm(`确定删除密钥「${name}」？删除后无法恢复。`, '删除密钥', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    await del(`/settings/saucenao-keys/${encodeURIComponent(name)}`)
+    ElMessage.success(`已删除 ${name}`)
+    await loadKeys()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+async function loadKeyStatuses() {
+  // 额度已合并进 /settings/saucenao-keys（list_keys 实时返回），此函数保留兼容空实现
 }
 
 async function addKey() {
@@ -61,20 +98,9 @@ async function addKey() {
   }
 }
 
-async function removeKey(name: string) {
-  try {
-    await del(`/settings/saucenao-keys/${name}`)
-    ElMessage.success(`已删除 ${name}`)
-    await loadKeys()
-    await loadKeyStatuses()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
-
 async function openManage() {
   manageVisible.value = true
-  await loadKeyStatuses()
+  await loadKeys()
 }
 
 async function saveSettings() {
@@ -105,7 +131,7 @@ onMounted(async () => {
 <template>
   <div class="settings-page">
     <el-tabs v-model="activeTab">
-      <el-tab-pane label="图库" name="library">
+      <el-tab-pane label="通用" name="library">
         <el-form label-width="160px" style="max-width: 720px">
           <el-form-item label="库目录">
             <el-input v-model="settings.settings.library_dir" placeholder="data/library" />
@@ -199,30 +225,38 @@ onMounted(async () => {
       <el-button @click="settings.reset()">恢复默认</el-button>
     </div>
 
-    <!-- 管理密钥弹窗：显示各 key 的等级与当前额度 -->
-    <el-dialog v-model="manageVisible" title="管理密钥" width="560px">
-      <el-table :data="keyStatuses" size="small">
+    <!-- 管理密钥弹窗（E7）：实时额度 + 编辑 + 状态 + 红垃圾桶删除 -->
+    <el-dialog v-model="manageVisible" title="管理密钥" width="640px">
+      <el-table :data="keys" size="small">
         <el-table-column prop="name" label="名称" width="100" />
-        <el-table-column label="等级" width="80">
+        <el-table-column label="等级" width="70">
           <template #default="{ row }">
             <el-tag :type="row.tier === 'member' ? 'primary' : 'info'" size="small">
               {{ row.tier === 'member' ? '付费' : '免费' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="key_masked" label="密钥" width="140" />
-        <el-table-column label="当日额度" width="100">
+        <el-table-column prop="key_masked" label="密钥" width="120" />
+        <el-table-column label="当日额度" width="120">
           <template #default="{ row }">
             <span :class="{ warn: (row.long_remaining as number) < 10 }">
-              {{ row.long_remaining }}
+              {{ row.long_remaining ?? '—' }}
             </span>
+            <el-button size="small" text type="primary" @click="editQuota(row.name)">改</el-button>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="90">
           <template #default="{ row }">
             <el-tag v-if="row.daily_paused" type="danger" size="small">已停用</el-tag>
-            <el-tag v-else-if="row.cooldown_secs > 0" type="warning" size="small">冷却中</el-tag>
+            <el-tag v-else-if="(row.cooldown_secs as number) > 0" type="warning" size="small">冷却中</el-tag>
             <el-tag v-else type="success" size="small">可用</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="" width="56" align="center">
+          <template #default="{ row }">
+            <el-button size="small" type="danger" text title="删除密钥" @click="removeKey(row.name)">
+              <el-icon><Delete /></el-icon>
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
