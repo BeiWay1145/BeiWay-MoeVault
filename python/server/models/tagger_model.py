@@ -25,6 +25,7 @@ class TaggerModel:
         self._is_naflex = False
         self._load_error = None
         self._model_dir = None
+        self._device = "auto"  # auto / cuda / cpu
 
     # ---------- 加载 ----------
     def load(self) -> None:
@@ -34,7 +35,7 @@ class TaggerModel:
                 return
             self._do_load(config.TAGGER_MODEL_DIR)
 
-    def load_from_dir(self, model_dir) -> None:
+    def load_from_dir(self, model_dir, device="auto") -> None:
         """切换并重新加载指定模型目录（线程安全，先清空旧模型释放显存）。"""
         with self._lock:
             self._session = None
@@ -42,6 +43,7 @@ class TaggerModel:
             self._idx_to_tag = {}
             self._is_naflex = False
             self._load_error = None
+            self._device = device
             self._do_load(model_dir)
 
     @property
@@ -105,7 +107,16 @@ class TaggerModel:
             else:
                 self._idx_to_tag = {int(k): v for k, v in raw.items()}
 
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            # auto：若 CUDA 可用则用 CUDA，否则 CPU
+            device = self._device
+            if device == "auto":
+                import onnxruntime as ort
+                device = "cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
+            providers = (
+                ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                if device == "cuda"
+                else ["CPUExecutionProvider"]
+            )
             self._session = ort.InferenceSession(str(paths["onnx"]), providers=providers)
             self._model_dir = model_dir
             self._load_error = None

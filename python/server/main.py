@@ -67,6 +67,34 @@ def health():
     }
 
 
+@app.get("/devices")
+def devices():
+    """列出可用的推理设备（供设置页下拉选择）。"""
+    result = []
+    # 打标：onnxruntime 可用 providers
+    try:
+        import onnxruntime as ort
+        for p in ort.get_available_providers():
+            if "CUDA" in p:
+                result.append({"id": "cuda", "name": f"GPU ({p})", "kind": "tagger"})
+            elif "CPU" in p:
+                result.append({"id": "cpu", "name": "CPU", "kind": "tagger"})
+    except Exception:
+        pass
+    # 美学：torch cuda
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                name = torch.cuda.get_device_name(i)
+                result.append({"id": f"cuda:{i}", "name": f"GPU ({name})", "kind": "aesthetic"})
+        else:
+            result.append({"id": "cpu", "name": "CPU", "kind": "aesthetic"})
+    except Exception:
+        pass
+    return {"devices": result}
+
+
 # ---------- 打标 ----------
 class TaggerConfigRequest(BaseModel):
     model_dir: str

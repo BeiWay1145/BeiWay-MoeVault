@@ -128,9 +128,28 @@ async function loadMore(d: DayGroup, g: DirGroup) {
   await loadDirImages(k, d.date, g.source_dir, dirNext.value[k])
 }
 
-/** 组内全选/取消全选。 */
-function toggleDirSelect(d: DayGroup, g: DirGroup, all: boolean) {
+/** 加载某来源组的全部图片（循环到无下一页），供全选用。 */
+async function loadAllDirImages(d: DayGroup, g: DirGroup) {
   const k = dirKey(d, g)
+  // 循环加载直到无下一页或已加载数 >= 组 count
+  let guard = 0
+  while (guard < 100) {
+    const cursor = dirNext.value[k] ?? null
+    // 已加载数达到组总数则停
+    const loaded = dirImages.value[k]?.length ?? 0
+    if (loaded >= g.count || !cursor) break
+    await loadDirImages(k, d.date, g.source_dir, cursor)
+    guard++
+  }
+}
+
+/** 组内全选/取消全选（全选时自动加载完整个组，未展开也能选全部）。 */
+async function toggleDirSelect(d: DayGroup, g: DirGroup, all: boolean) {
+  const k = dirKey(d, g)
+  if (all && (dirImages.value[k]?.length ?? 0) < g.count) {
+    // 未加载完：先加载全部（含未展开的组）
+    await loadAllDirImages(d, g)
+  }
   const imgs = dirImages.value[k] ?? []
   const s = new Set(selected.value)
   if (all) imgs.forEach((i) => s.add(i.id))

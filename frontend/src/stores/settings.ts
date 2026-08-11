@@ -15,6 +15,9 @@ export interface SettingsState {
   tagger_model_dir: string
   tagger_model_name: string
   aesthetic_model: string
+  /** 推理设备：auto/cuda/cpu（打标与美学各一） */
+  tagger_device: string
+  aesthetic_device: string
   dedup_hamming: number
   sidecar_enabled: boolean
   cn_dict_enabled: boolean
@@ -33,6 +36,8 @@ const defaults: SettingsState = {
   tagger_model_dir: 'D:/Game/AI/cl_tagger/models',
   tagger_model_name: 'cl_tagger (SIGLIP2 ONNX)',
   aesthetic_model: 'trojblue/distill-q-align-aesthetic-siglip2-base',
+  tagger_device: 'auto',
+  aesthetic_device: 'auto',
   dedup_hamming: 8,
   sidecar_enabled: false,
   cn_dict_enabled: false,
@@ -58,6 +63,8 @@ export const useSettingsStore = defineStore('settings', () => {
         tagger_model_dir: String(s.tagger_model_dir ?? defaults.tagger_model_dir),
         tagger_model_name: String(s.tagger_model_name ?? defaults.tagger_model_name),
         aesthetic_model: String(s.aesthetic_model ?? defaults.aesthetic_model),
+        tagger_device: String(s.tagger_device ?? defaults.tagger_device),
+        aesthetic_device: String(s.aesthetic_device ?? defaults.aesthetic_device),
         dedup_hamming: s.dedup_hamming != null ? Number(s.dedup_hamming) : defaults.dedup_hamming,
         sidecar_enabled: s.sidecar_enabled === true || s.sidecar_enabled === 'true',
         cn_dict_enabled: s.cn_dict_enabled === true || s.cn_dict_enabled === 'true',
@@ -80,6 +87,8 @@ export const useSettingsStore = defineStore('settings', () => {
       tagger_model_dir: settings.value.tagger_model_dir,
       tagger_model_name: settings.value.tagger_model_name,
       aesthetic_model: settings.value.aesthetic_model,
+      tagger_device: settings.value.tagger_device,
+      aesthetic_device: settings.value.aesthetic_device,
       dedup_hamming: String(settings.value.dedup_hamming),
       sidecar_enabled: String(settings.value.sidecar_enabled),
       cn_dict_enabled: String(settings.value.cn_dict_enabled),

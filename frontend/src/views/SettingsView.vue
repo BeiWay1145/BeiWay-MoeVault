@@ -190,9 +190,51 @@ function onModelSelect(name: string) {
   }
 }
 
+// ---- 推理设备（打标/美学）----
+interface DeviceOption {
+  id: string
+  name: string
+  kind: string
+}
+const taggerDevices = ref<DeviceOption[]>([])
+const aestheticDevices = ref<DeviceOption[]>([])
+async function loadDevices() {
+  try {
+    const d = await get<{ devices: DeviceOption[] }>('/devices')
+    // 打标设备：onnxruntime 的 cuda/cpu；美学设备：torch 的 cuda:/cpu
+    const all = d.devices
+    taggerDevices.value = [
+      { id: 'auto', name: '自动', kind: 'tagger' },
+      ...all.filter((x) => x.kind === 'tagger'),
+    ]
+    aestheticDevices.value = [
+      { id: 'auto', name: '自动', kind: 'aesthetic' },
+      ...all.filter((x) => x.kind === 'aesthetic'),
+    ]
+    // 若后端返回的只有一种 kind（如只 tagger），美学兜底 auto/cpu
+    if (aestheticDevices.value.length === 1) {
+      aestheticDevices.value.push({ id: 'cpu', name: 'CPU', kind: 'aesthetic' })
+    }
+    if (taggerDevices.value.length === 1) {
+      taggerDevices.value.push({ id: 'cpu', name: 'CPU', kind: 'tagger' })
+    }
+  } catch {
+    // 推理服务未启动：给默认选项
+    taggerDevices.value = [
+      { id: 'auto', name: '自动', kind: 'tagger' },
+      { id: 'cpu', name: 'CPU', kind: 'tagger' },
+    ]
+    aestheticDevices.value = [
+      { id: 'auto', name: '自动', kind: 'aesthetic' },
+      { id: 'cpu', name: 'CPU', kind: 'aesthetic' },
+    ]
+  }
+}
+
 onMounted(async () => {
   await settings.load()
   await loadKeys()
+  await loadDevices()
 })
 </script>
 
@@ -257,6 +299,12 @@ onMounted(async () => {
           <el-form-item label="置信度阈值">
             <el-slider v-model="settings.settings.tag_threshold" :min="0" :max="1" :step="0.05" show-input style="width: 260px" />
           </el-form-item>
+          <el-form-item label="推理设备">
+            <el-select v-model="settings.settings.tagger_device" style="width: 260px">
+              <el-option v-for="d in taggerDevices" :key="d.id" :label="d.name" :value="d.id" />
+            </el-select>
+            <span class="hint">GPU 加速打标（下次任务生效）</span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 
@@ -272,6 +320,12 @@ onMounted(async () => {
         <el-form label-width="160px" style="max-width: 720px">
           <el-form-item label="模型">
             <el-input v-model="settings.settings.aesthetic_model" />
+          </el-form-item>
+          <el-form-item label="推理设备">
+            <el-select v-model="settings.settings.aesthetic_device" style="width: 260px">
+              <el-option v-for="d in aestheticDevices" :key="d.id" :label="d.name" :value="d.id" />
+            </el-select>
+            <span class="hint">GPU 加速美学评分（下次任务生效）</span>
           </el-form-item>
         </el-form>
       </el-tab-pane>
