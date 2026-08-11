@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { Plus, Search } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { get, put } from '@/api/client'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { get, put, post, del } from '@/api/client'
 
 interface TagItem {
   id: number
@@ -19,6 +19,12 @@ const loading = ref(false)
 const cnDict = ref(false)
 const newName = ref('')
 const keyword = ref('')
+// 分页
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+// 批量选择
+const selected = ref<Set<number>>(new Set())
 
 const categoryOptions = [
   { value: 'artist', label: '画师' },
@@ -27,20 +33,15 @@ const categoryOptions = [
   { value: 'general', label: '常规' },
 ]
 
-const categoryTagType: Record<string, 'danger' | 'warning' | 'success' | 'primary' | 'info'> = {
-  artist: 'danger',
-  copyright: 'warning',
-  character: 'success',
-  general: 'primary',
-}
-
 async function loadTags() {
   loading.value = true
   try {
+    const offset = (page.value - 1) * pageSize.value
     const d = await get<{ items: TagItem[]; total: number }>(
-      `/tags${keyword.value.trim() ? `?q=${encodeURIComponent(keyword.value.trim())}` : ''}`,
+      `/tags?offset=${offset}&limit=${pageSize.value}${keyword.value.trim() ? `&q=${encodeURIComponent(keyword.value.trim())}` : ''}`,
     )
     tags.value = d.items
+    total.value = d.total
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
@@ -48,37 +49,96 @@ async function loadTags() {
   }
 }
 
-/** E2: 搜索标签（输入防抖）。 */
+/** 搜索（防抖 + 回第一页）。 */
 let searchTimer: number | undefined
 function onSearchInput() {
   if (searchTimer !== undefined) window.clearTimeout(searchTimer)
-  searchTimer = window.setTimeout(loadTags, 300)
+  searchTimer = window.setTimeout(() => {
+    page.value = 1
+    loadTags()
+  }, 300)
 }
 
-/** E1: 修改标签分类。 */
 async function changeCategory(t: TagItem, category: string) {
   if (category === t.category) return
   try {
     await put(`/tags/${t.id}/category`, { category })
     t.category = category
-    ElMessage.success(`「${t.name}」分类已改为 ${categoryOptions.find((c) => c.value === category)?.label}`)
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
+}
+
+/** 删除单个标签。 */
+async function removeTag(t: TagItem) {
+  try {
+    await ElMessageBox.confirm(`删除标签「${t.name}」？其图片关联也会删除。`, '删除标签', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await del(`/tags/${t.id}`)
+    ElMessage.success('已删除')
+    await loadTags()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 拉黑/取消拉黑单个标签。 */
+async function toggleBlacklist(t: TagItem) {
+  try {
+    await post(`/tags/${t.id}/blacklist`, { blacklisted: !t.is_blacklisted })
+    t.is_blacklisted = !t.is_blacklisted
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 批量删除。 */
+async function batchDelete() {
+  const ids = [...selected.value]
+  if (ids.length === 0) return
+  try {
+    await ElMessageBox.confirm(`批量删除 ${ids.length} 个标签？图片关联也会删除。`, '批量删除', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await post('/tags/batch-delete', { ids })
+    ElMessage.success(`已删除 ${ids.length} 个标签`)
+    selected.value = new Set()
+    await loadTags()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 批量拉黑。 */
+async function batchBlacklist() {
+  const ids = [...selected.value]
+  if (ids.length === 0) return
+  try {
+    await post('/tags/batch-blacklist', { ids, blacklisted: true })
+    ElMessage.success(`已拉黑 ${ids.length} 个标签（不再显示）`)
+    selected.value = new Set()
+    await loadTags()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+function toggleSelect(id: number) {
+  const s = new Set(selected.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  selected.value = s
 }
 
 function createTag() {
   if (!newName.value.trim()) return
   ElMessage.info('自定义标签创建将在标签管理 API 完善后生效')
   newName.value = ''
-}
-
-function toggleBlacklist(t: TagItem) {
-  ElMessage.info(`黑名单管理（${t.name}）将在后续实现`)
-}
-
-function merge(t: TagItem) {
-  ElMessage.info(`合并「${t.name}」将在标签管理 API 完善后实现`)
 }
 
 onMounted(loadTags)
@@ -98,49 +158,63 @@ onMounted(loadTags)
         @input="onSearchInput"
         @clear="loadTags"
       />
+      <template v-if="selected.size > 0">
+        <el-button type="danger" plain @click="batchDelete">批量删除 ({{ selected.size }})</el-button>
+        <el-button plain @click="batchBlacklist">批量拉黑 ({{ selected.size }})</el-button>
+      </template>
       <div class="spacer" />
       <el-switch v-model="cnDict" active-text="中文字典" inactive-text="英文" />
     </div>
 
     <div v-loading="loading">
-      <el-table v-if="tags.length > 0" :data="tags">
+      <el-table v-if="tags.length > 0" :data="tags" @selection-change="(rows: TagItem[]) => { selected = new Set(rows.map(r => r.id)) }">
+        <el-table-column type="selection" width="45" />
         <el-table-column prop="name" label="名称(EN)" />
-        <el-table-column prop="name_cn" label="中文" width="140" />
-        <el-table-column label="分类" width="150">
+        <el-table-column prop="name_cn" label="中文" width="120" />
+        <el-table-column label="分类" width="140">
           <template #default="{ row }">
             <el-select
               :model-value="row.category"
               size="small"
-              style="width: 120px"
+              style="width: 110px"
               @change="(c: string) => changeCategory(row, c)"
             >
               <el-option v-for="o in categoryOptions" :key="o.value" :label="o.label" :value="o.value" />
             </el-select>
           </template>
         </el-table-column>
-        <el-table-column prop="image_count" label="关联图数" width="120">
+        <el-table-column prop="image_count" label="关联图数" width="90">
           <template #default="{ row }">
             <span class="num-mono">{{ row.image_count }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="黑名单" width="120">
+        <el-table-column label="黑名单" width="90">
           <template #default="{ row }">
             <el-tag :type="row.is_blacklisted ? 'danger' : 'info'" size="small">
-              {{ row.is_blacklisted ? '已屏蔽' : '正常' }}
+              {{ row.is_blacklisted ? '已拉黑' : '正常' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260">
+        <el-table-column label="操作" width="150">
           <template #default="{ row }">
-            <el-button size="small" @click="merge(row)">合并</el-button>
-            <el-button size="small">重命名</el-button>
-            <el-button size="small" :type="row.is_blacklisted ? 'primary' : 'danger'" plain @click="toggleBlacklist(row)">
-              {{ row.is_blacklisted ? '解除屏蔽' : '屏蔽' }}
+            <el-button size="small" :type="row.is_blacklisted ? 'primary' : 'warning'" plain @click="toggleBlacklist(row)">
+              {{ row.is_blacklisted ? '取消拉黑' : '拉黑' }}
             </el-button>
+            <el-button size="small" type="danger" plain @click="removeTag(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
       <el-empty v-else-if="!loading" description="暂无标签，导入图片并打标后自动出现" />
+    </div>
+
+    <div class="pager">
+      <el-pagination
+        layout="total, prev, pager, next"
+        :total="total"
+        :page-size="pageSize"
+        :current-page="page"
+        @current-change="(p: number) => { page = p; loadTags() }"
+      />
     </div>
   </div>
 </template>
@@ -158,5 +232,9 @@ onMounted(loadTags)
 }
 .spacer {
   flex: 1;
+}
+.pager {
+  display: flex;
+  justify-content: center;
 }
 </style>
