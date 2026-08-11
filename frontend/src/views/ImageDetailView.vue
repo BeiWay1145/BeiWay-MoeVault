@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { useLibraryStore, thumbUrl, originalUrl } from '@/stores/library'
+import { useLibraryStore, originalUrl } from '@/stores/library'
 import { get, post } from '@/api/client'
 
 const route = useRoute()
@@ -11,10 +11,11 @@ const library = useLibraryStore()
 
 const image = computed(() => library.images.find((i) => i.id === Number(route.params.id)))
 const tags = ref<Array<{ name: string; name_cn: string | null; category: string; source: string }>>([])
-const similar = ref<Array<{ id: number; thumb_rel: string; width: number; height: number }>>([])
 const aiInfo = ref<string | null>(null)
+const aiTags = ref<string[]>([])
 const aiChecked = ref(false)
-const loadingSimilar = ref(false)
+const fullscreen = ref(false)
+const stageRef = ref<HTMLElement | null>(null)
 
 const originalSrc = computed(() => (image.value ? originalUrl(image.value.id) : undefined))
 
@@ -28,6 +29,26 @@ function gotoImage(delta: number) {
   router.push(`/library/${next.id}`)
 }
 
+// 键盘左右键切换（详情页 + 全屏）
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'ArrowLeft') gotoImage(-1)
+  else if (e.key === 'ArrowRight') gotoImage(1)
+}
+
+// 全屏切换
+async function toggleFullscreen() {
+  if (fullscreen.value) {
+    await document.exitFullscreen().catch(() => {})
+    fullscreen.value = false
+  } else {
+    const el = stageRef.value
+    if (el) {
+      await el.requestFullscreen().catch((err) => ElMessage.warning(`全屏失败: ${err}`))
+      fullscreen.value = true
+    }
+  }
+}
+
 async function loadDetail() {
   const id = Number(route.params.id)
   if (!image.value) {
@@ -39,33 +60,42 @@ async function loadDetail() {
       `/images/${id}/tags`,
     )
     tags.value = t.tags
+    aiTags.value = t.tags.filter((x) => x.source === 'ai').map((x) => x.name)
+    aiChecked.value = !!image.value?.isAi
   } catch {
     tags.value = []
   }
-  // 相似图
-  loadingSimilar.value = true
-  try {
-    const s = await get<{ items: Array<{ id: number; thumb_rel: string; width: number; height: number }> }>(
-      `/images/${id}/similar?limit=8`,
-    )
-    similar.value = s.items
-  } catch {
-    similar.value = []
-  } finally {
-    loadingSimilar.value = false
-  }
-  // 已存的 AI 信息（通过 image list 判断）
+  // 已存的 AI 信息
   aiChecked.value = !!image.value?.isAi
 }
 
 async function readAiInfo() {
   const id = Number(route.params.id)
   try {
-    const r = await post<{ ok: boolean; is_ai: boolean; metadata: string | null }>(`/images/${id}/ai-info`)
+    const r = await post<{ ok: boolean; is_ai: boolean; metadata: string | null; prompt?: string | null; negative_prompt?: string | null; tags?: string[] }>(`/images/${id}/ai-info`)
     aiChecked.value = r.is_ai
     aiInfo.value = r.metadata
-    if (!r.is_ai) ElMessage.info('未检测到 AI 生成元信息（可能不是 AI 图或已去除元数据）')
-    else ElMessage.success('检测到 AI 生成信息')
+    if (r.tags && r.tags.length > 0) {
+      aiTags.value = r.tags
+      ElMessage.success(`已提取 ${r.tags.length} 个 AI 生图标签`)
+    } else if (!r.is_ai) {
+      ElMessage.info('未检测到 AI 生成元信息')
+    } else {
+      ElMessage.success('已标记为 AI 图片（无有效 prompt 标签）')
+    }
+    // 刷新标签列表
+    await loadDetail()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+async function markAsAi() {
+  if (!image.value) return
+  try {
+    await post(`/images/${image.value.id}/mark-ai`)
+    aiChecked.value = true
+    ElMessage.success('已手动标记为 AI 图片')
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -100,13 +130,22 @@ function exportImage() {
   a.click()
 }
 
-onMounted(loadDetail)
+onMounted(() => {
+  loadDetail()
+  window.addEventListener('keydown', onKeydown)
+  document.addEventListener('fullscreenchange', () => {
+    fullscreen.value = !!document.fullscreenElement
+  })
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+})
 </script>
 
 <template>
   <div v-if="image" class="detail">
     <div class="viewer">
-      <div class="stage">
+      <div ref="stageRef" class="stage">
         <el-image :src="originalSrc" fit="contain" class="stage-img">
           <template #error>
             <span class="placeholder-name">原图加载失败</span>
@@ -116,24 +155,9 @@ onMounted(loadDetail)
       <div class="viewer-toolbar">
         <el-button @click="gotoImage(-1)">◀ 上一张</el-button>
         <el-button @click="gotoImage(1)">下一张 ▶</el-button>
+        <el-button @click="toggleFullscreen">{{ fullscreen ? '退出全屏' : '全屏' }}</el-button>
         <el-button @click="router.push('/library')">返回图库</el-button>
       </div>
-      <!-- 相似图片：无相似时隐藏 -->
-      <div v-if="similar.length > 0" class="similar">
-        <span class="similar-title">相似图片</span>
-        <div class="similar-row">
-          <el-image
-            v-for="s in similar"
-            :key="s.id"
-            class="similar-thumb"
-            :src="thumbUrl(s.thumb_rel)"
-            fit="cover"
-            :preview-src-list="[thumbUrl(s.thumb_rel)]"
-            @click="router.push(`/library/${s.id}`)"
-          />
-        </div>
-      </div>
-      <el-empty v-else-if="!loadingSimilar && similar.length === 0" description="无相似图片" :image-size="50" />
     </div>
 
     <div class="panel">
@@ -159,9 +183,13 @@ onMounted(loadDetail)
           <el-button size="small" type="primary" plain style="margin-left: 8px" @click="readAiInfo">
             读取 AI 生成信息
           </el-button>
+          <el-button size="small" type="warning" plain :disabled="aiChecked" @click="markAsAi">
+            手动标记为 AI
+          </el-button>
         </div>
         <div v-if="tags.length > 0" class="tag-list">
-          <el-tag v-for="t in tags" :key="t.name" class="tag" size="small">
+          <el-tag v-for="t in tags" :key="t.name" class="tag" size="small"
+            :type="t.source === 'ai' ? 'primary' : 'info'">
             {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
           </el-tag>
         </div>
@@ -201,10 +229,16 @@ onMounted(loadDetail)
   justify-content: center;
   background: #000;
   min-height: 320px;
+  overflow: hidden;
 }
 .stage-img {
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+}
+.stage-img :deep(.el-image__inner) {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 .placeholder-name {
   color: #888;

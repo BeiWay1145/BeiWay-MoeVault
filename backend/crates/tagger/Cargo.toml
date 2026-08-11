@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 moevault-core = { path = "../core" }
 moevault-db = { path = "../db" }
+moevault-ingest = { path = "../ingest" }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

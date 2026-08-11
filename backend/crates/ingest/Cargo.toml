@@ -11,5 +11,6 @@ walkdir = { workspace = true }
 md-5 = { workspace = true }
 image = { workspace = true }
 kamadak-exif = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

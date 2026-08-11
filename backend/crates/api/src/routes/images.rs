@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/images/{id}/file", get(get_original_file))
         .route("/api/v1/images/{id}/similar", get(similar_images))
         .route("/api/v1/images/{id}/ai-info", post(read_ai_info))
+        .route("/api/v1/images/{id}/mark-ai", post(mark_ai))
 }
 
 /// GET /api/v1/images/{id}/file：返回原图（stream）。
@@ -125,17 +126,45 @@ async fn read_ai_info(
         let meta = moevault_ingest::features::read_ai_metadata(&path);
         match &meta {
             Some(m) => {
-                db.set_ai_metadata(id, m).map_err(db_error_response)?;
+                // 存原始元信息 + 提取的 prompt tag（source=ai）
+                db.set_ai_metadata(id, &m.raw).map_err(db_error_response)?;
+                if !m.tags.is_empty() {
+                    let tag_ids: Vec<(i64, Option<f64>)> = m
+                        .tags
+                        .iter()
+                        .map(|t| db.upsert_tag(t, "general").map(|tid| (tid, None)))
+                        .collect::<Result<_, _>>()
+                        .map_err(db_error_response)?;
+                    db.insert_image_tags(id, &tag_ids, "ai").map_err(db_error_response)?;
+                }
                 Ok::<_, (axum::http::StatusCode, Json<Value>)>(json!({
-                    "ok": true, "is_ai": true, "metadata": m,
+                    "ok": true, "is_ai": m.is_ai, "metadata": m.raw,
+                    "prompt": m.prompt, "negative_prompt": m.negative_prompt,
+                    "tags": m.tags,
                 }))
             }
-            None => Ok(json!({ "ok": true, "is_ai": false, "metadata": null })),
+            None => Ok(json!({ "ok": true, "is_ai": false, "metadata": null, "tags": [] })),
         }
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
     Ok(Json(result))
+}
+
+/// POST /api/v1/images/{id}/mark-ai：手动标记图片为 AI 生成（写入 ai_metadata 标记）。
+async fn mark_ai(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.set_ai_metadata(id, "[manual] marked as AI")
+            .map_err(db_error_response)?;
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(json!({ "ok": true, "is_ai": true })))
 }
 
 /// POST /api/v1/images/{id}/sidecar：生成 sidecar .txt（逗号分隔标签，与 cl_tagger 格式一致）。

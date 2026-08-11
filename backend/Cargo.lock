@@ -878,6 +878,7 @@ dependencies = [
  "md-5",
  "moevault-core",
  "moevault-db",
+ "serde_json",
  "thiserror",
  "tracing",
  "walkdir",
@@ -889,6 +890,7 @@ version = "0.1.0"
 dependencies = [
  "moevault-core",
  "moevault-db",
+ "moevault-ingest",
  "regex",
  "reqwest",
  "serde",

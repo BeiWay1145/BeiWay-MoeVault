@@ -177,6 +177,30 @@ async fn tag_one(
         .ok_or_else(|| TaggerError::Invalid(format!("图片 {image_id} 不存在")))?;
     let file_path = library_dir.join(&img.rel_path);
 
+    // AI 生成图：prompt 比打标准确、溯源无意义 → 跳过打标与溯源
+    // （已通过 ai-info 写入 source=ai 标签的图）
+    let has_ai_tag = db
+        .image_tags(image_id)?
+        .iter()
+        .any(|t| t.source == "ai");
+    if img.ai_metadata.is_some() || has_ai_tag {
+        if !has_ai_tag {
+            // 已标记 AI 但未提取标签：尝试提取（尽力而为）
+            if let Some(meta) = moevault_ingest::features::read_ai_metadata(&file_path) {
+                if !meta.tags.is_empty() {
+                    let tag_ids: Vec<(i64, Option<f64>)> = meta
+                        .tags
+                        .iter()
+                        .map(|t| db.upsert_tag(t, "general").map(|tid| (tid, None)))
+                        .collect::<Result<_, _>>()?;
+                    db.insert_image_tags(image_id, &tag_ids, "ai")?;
+                }
+            }
+        }
+        info!(image_id, "AI 生成图，跳过打标与溯源（prompt 标签已用）");
+        return Ok(());
+    }
+
     // 不可溯源标记检查：已标记的图不自动溯源（用户手动 force 时跳过此检查）
     if img.no_auto_sauce {
         info!(image_id, "图片已标记不可溯源，跳过自动溯源（可用手动 retag 强制）");
