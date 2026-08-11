@@ -71,15 +71,7 @@ async function resolveBest(g: DedupGroup) {
       <el-statistic title="冗余候选" :value="dedup.redundantCount">
         <template #suffix><span style="font-size: 12px">张</span></template>
       </el-statistic>
-      <el-button
-        type="primary"
-        plain
-        style="margin-left: auto"
-        :loading="scanning"
-        @click="runScan"
-      >
-        全库重扫
-      </el-button>
+      <span class="hint">从主目录发起范围查重后，结果在这里处理</span>
     </div>
 
     <div v-loading="dedup.loading" class="group-list">

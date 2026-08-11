@@ -132,13 +132,14 @@ async function loadMore(d: DayGroup, g: DirGroup) {
 async function loadAllDirImages(d: DayGroup, g: DirGroup) {
   const k = dirKey(d, g)
   // 循环加载直到无下一页或已加载数 >= 组 count
+  // 首次加载用 null cursor（从头开始），后续用 dirNext
+  let cursor: string | null = null
   let guard = 0
   while (guard < 100) {
-    const cursor = dirNext.value[k] ?? null
-    // 已加载数达到组总数则停
     const loaded = dirImages.value[k]?.length ?? 0
-    if (loaded >= g.count || !cursor) break
+    if (loaded >= g.count || (cursor === null && loaded > 0 && !dirNext.value[k])) break
     await loadDirImages(k, d.date, g.source_dir, cursor)
+    cursor = dirNext.value[k] ?? null
     guard++
   }
 }
@@ -206,50 +207,50 @@ async function onBatchDelete() {
   await loadTree()
 }
 
-async function onBatchTag() {
-  const ids = [...selected.value]
-  if (ids.length === 0) return
+async function onBatchTag(ids?: number[]) {
+  const list = ids ?? [...selected.value]
+  if (list.length === 0) return
   try {
-    await taskStore.enqueueTag(ids)
-    selected.value = new Set()
+    await taskStore.enqueueTag(list)
+    if (!ids) selected.value = new Set()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-async function onBatchAesthetic() {
-  const ids = [...selected.value]
-  if (ids.length === 0) return
+async function onBatchAesthetic(ids?: number[]) {
+  const list = ids ?? [...selected.value]
+  if (list.length === 0) return
   try {
-    await taskStore.enqueueAesthetic(ids)
-    selected.value = new Set()
+    await taskStore.enqueueAesthetic(list)
+    if (!ids) selected.value = new Set()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-async function onBatchSauce() {
-  const ids = [...selected.value]
-  if (ids.length === 0) return
+async function onBatchSauce(ids?: number[]) {
+  const list = ids ?? [...selected.value]
+  if (list.length === 0) return
   try {
-    await taskStore.enqueueSauce(ids, forceSauce.value)
-    selected.value = new Set()
+    await taskStore.enqueueSauce(list, forceSauce.value)
+    if (!ids) selected.value = new Set()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-async function onBatchDetectAi() {
-  const ids = [...selected.value]
-  if (ids.length === 0) return
-  const todo = ids.filter((id) => {
+async function onBatchDetectAi(ids?: number[]) {
+  const list = ids ?? [...selected.value]
+  if (list.length === 0) return
+  const todo = list.filter((id) => {
     const all = Object.values(dirImages.value).flat()
     const it = all.find((i) => i.id === id)
     return it ? !it.isAi : true
   })
   if (todo.length === 0) {
     ElMessage.info('所选图片均已标记为 AI 生成')
-    selected.value = new Set()
+    if (!ids) selected.value = new Set()
     return
   }
   ElMessage.info(`正在检测 ${todo.length} 张图片的 AI 元信息…`)
@@ -263,7 +264,7 @@ async function onBatchDetectAi() {
     }
   }
   ElMessage.success(`AI 检测完成：${ok} 张已处理`)
-  selected.value = new Set()
+  if (!ids) selected.value = new Set()
   await loadTree()
 }
 
@@ -344,6 +345,118 @@ async function onDedup() {
     dedupLoading.value = false
   }
 }
+
+// ---- 改进1：批量行为（多选下拉 + 执行两击确认）----
+const batchActions = ref<string[]>([]) // 选中行为：aesthetic/tag/sauce/ai-detect
+const execArmed = ref(false)
+let execTimer: number | undefined
+// 改进2：日期折叠（默认展开）
+const collapsedDays = ref<Set<string>>(new Set())
+// 改进3：全选全部
+const selectingAll = ref(false)
+
+/** 选中图或当前筛选集的 ids（批量执行用）。 */
+function getBatchIds(): number[] {
+  if (selected.value.size > 0) return [...selected.value]
+  const all = Object.values(dirImages.value).flat()
+  return [...new Set(all.map((i) => i.id))]
+}
+
+/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学。 */
+async function onExecuteBatch() {
+  const ids = getBatchIds()
+  if (ids.length === 0) {
+    ElMessage.warning('没有可执行的图片（请先多选或展开加载）')
+    return
+  }
+  const order = ['ai-detect', 'sauce', 'tag', 'aesthetic']
+  for (const act of order) {
+    if (!batchActions.value.includes(act)) continue
+    switch (act) {
+      case 'ai-detect':
+        await onBatchDetectAi(ids)
+        break
+      case 'sauce':
+        await onBatchSauce(ids)
+        break
+      case 'tag':
+        await onBatchTag(ids)
+        break
+      case 'aesthetic':
+        await onBatchAesthetic(ids)
+        break
+    }
+  }
+  if (batchActions.value.length > 0) ElMessage.success('批量任务已全部提交')
+  batchActions.value = []
+}
+
+/** 执行按钮两击确认：第一下变红显示「确认执行」，再点执行；Shift 直接执行。 */
+function onExecClick(e: MouseEvent) {
+  if (batchActions.value.length === 0) {
+    ElMessage.warning('请先选择批量行为')
+    return
+  }
+  if (e.shiftKey) {
+    execArmed.value = false
+    onExecuteBatch()
+    return
+  }
+  if (execArmed.value) {
+    execArmed.value = false
+    if (execTimer !== undefined) window.clearTimeout(execTimer)
+    onExecuteBatch()
+  } else {
+    execArmed.value = true
+    if (execTimer !== undefined) window.clearTimeout(execTimer)
+    execTimer = window.setTimeout(() => (execArmed.value = false), 3000)
+  }
+}
+
+/** 改进2：切换日期组折叠。 */
+function toggleDay(d: DayGroup) {
+  const s = new Set(collapsedDays.value)
+  if (s.has(d.date)) s.delete(d.date)
+  else s.add(d.date)
+  collapsedDays.value = s
+}
+
+/** 改进2：日期组内全部图全选（自动加载所有来源组）。 */
+async function toggleDaySelect(d: DayGroup, all: boolean) {
+  const s = new Set(selected.value)
+  if (all) {
+    for (const g of d.dirs) {
+      await loadAllDirImages(d, g)
+      const imgs = dirImages.value[dirKey(d, g)] ?? []
+      imgs.forEach((i) => s.add(i.id))
+    }
+  } else {
+    for (const g of d.dirs) {
+      const imgs = dirImages.value[dirKey(d, g)] ?? []
+      imgs.forEach((i) => s.delete(i.id))
+    }
+  }
+  selected.value = s
+}
+
+/** 改进3：全选全部（加载当前筛选下所有组）。 */
+async function onSelectAll() {
+  selectingAll.value = true
+  try {
+    const s = new Set<number>()
+    for (const d of days.value) {
+      for (const g of d.dirs) {
+        await loadAllDirImages(d, g)
+        const imgs = dirImages.value[dirKey(d, g)] ?? []
+        imgs.forEach((i) => s.add(i.id))
+      }
+    }
+    selected.value = s
+    if (s.size === 0) ElMessage.info('没有可选的图片')
+  } finally {
+    selectingAll.value = false
+  }
+}
 </script>
 
 <template>
@@ -369,17 +482,36 @@ async function onDedup() {
       </div>
       <div class="spacer" />
       <el-button :loading="dedupLoading" @click="onDedup" title="对当前筛选集或选中图查重">查重</el-button>
+      <el-button :loading="selectingAll" @click="onSelectAll" title="全选当前库全部图片">全选全部</el-button>
       <el-button :icon="Refresh" circle title="刷新" @click="refresh" />
       <el-button plain @click="reprocessBroken" title="重新解析解码失败的图片（修复基本信息/缩略图）">重新解析</el-button>
       <template v-if="selectedCount > 0">
         <el-button type="danger" plain @click="onBatchDelete">删除所选 ({{ selectedCount }})</el-button>
-        <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>
-        <el-button type="success" plain @click="onBatchAesthetic">批量美学</el-button>
-        <el-button plain @click="onBatchSauce">批量溯源</el-button>
-        <el-checkbox v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
-        <el-button plain @click="onBatchDetectAi">批量检测 AI</el-button>
         <el-button @click="selected = new Set()">取消选择</el-button>
       </template>
+      <!-- 改进1：批量行为多选下拉 + 执行（两击确认） -->
+      <el-select
+        v-model="batchActions"
+        multiple
+        collapse-tags
+        placeholder="选择批量行为"
+        style="width: 220px"
+        size="default"
+      >
+        <el-option label="美学评分" value="aesthetic" />
+        <el-option label="打标" value="tag" />
+        <el-option label="溯源" value="sauce" />
+        <el-option label="AI 检测" value="ai-detect" />
+      </el-select>
+      <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制溯源</el-checkbox>
+      <el-button
+        :type="execArmed ? 'danger' : 'primary'"
+        plain
+        @click="onExecClick"
+        :title="'Shift+点击直接执行'"
+      >
+        {{ execArmed ? '确认执行' : '执行' }}
+      </el-button>
     </div>
 
     <div v-loading="loading">
@@ -387,9 +519,19 @@ async function onDedup() {
 
       <!-- 日期组 -->
       <div v-for="d in days" :key="d.date" class="day-group">
-        <div class="day-header">{{ fmtDate(d.date) }}</div>
+        <div class="day-header" @click="toggleDay(d)">
+          <el-icon>
+            <ArrowRight v-if="collapsedDays.has(d.date)" />
+            <ArrowDown v-else />
+          </el-icon>
+          <span>{{ fmtDate(d.date) }}</span>
+          <div class="day-actions" @click.stop>
+            <el-checkbox @change="(v: boolean) => toggleDaySelect(d, v)">全选本日</el-checkbox>
+          </div>
+        </div>
 
-        <!-- 来源组 -->
+        <!-- 来源组（日期折叠时隐藏） -->
+        <template v-if="!collapsedDays.has(d.date)">
         <div v-for="g in d.dirs" :key="dirKey(d, g)" class="dir-group">
           <div class="dir-header" @click="toggleDir(d, g)">
             <el-icon>
@@ -426,6 +568,7 @@ async function onDedup() {
             </div>
           </div>
         </div>
+        </template>
       </div>
     </div>
   </div>
@@ -461,6 +604,13 @@ async function onDedup() {
   font-weight: 600;
   margin-bottom: 10px;
   color: var(--el-text-color-primary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.day-actions {
+  margin-left: auto;
 }
 .dir-group {
   margin-bottom: 8px;
