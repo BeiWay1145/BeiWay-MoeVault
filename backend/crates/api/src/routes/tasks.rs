@@ -149,6 +149,8 @@ async fn cancel_task(
             return Err(error_response(ErrorKind::NotFound, format!("任务 {id} 不存在")));
         }
         db.cancel_job(id).map_err(db_error_response)?;
+        db.add_log("warn", "task", &format!("任务 #{id} 已中断（用户操作）"))
+            .map_err(db_error_response)?;
         Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
     })
     .await
@@ -188,9 +190,14 @@ async fn resume_task(
         return Err(error_response(ErrorKind::InvalidInput, "任务负载中没有图片 id，无法继续"));
     }
     // 重新置为 pending（清空计数），重新启动溯源管线
+    let ids_count = ids.len();
     tokio::task::spawn_blocking({
         let db = state.db.clone();
-        move || db.resume_job(id)
+        move || {
+            db.resume_job(id)?;
+            db.add_log("info", "task", &format!("任务 #{id} 已继续（{ids_count} 张重新入队，已处理自动跳过）"))?;
+            Ok::<_, moevault_db::DbError>(())
+        }
     })
     .await
     .map_err(join_error_response)?

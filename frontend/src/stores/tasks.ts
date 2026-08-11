@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { get, post } from '@/api/client'
 import { ElMessage } from 'element-plus'
+import { reportLog } from '@/api/log'
 
 export interface TaskItem {
   id: number
@@ -114,6 +115,7 @@ export const useTaskStore = defineStore('tasks', () => {
   async function enqueueTag(ids: number[]) {
     const r = await post<{ started: boolean; job_id: number; kind: string }>('/tagging/run', { force_ids: ids })
     notifyEnqueued(r.kind, r.job_id, ids.length)
+    reportLog(`提交批量打标任务 #${r.job_id}（${ids.length} 张）`)
     load()
     return r
   }
@@ -122,6 +124,7 @@ export const useTaskStore = defineStore('tasks', () => {
   async function enqueueAesthetic(ids: number[]) {
     const r = await post<{ started: boolean; job_id: number; kind: string }>('/aesthetic/run', { force_ids: ids })
     notifyEnqueued(r.kind, r.job_id, ids.length)
+    reportLog(`提交批量美学任务 #${r.job_id}（${ids.length} 张）`)
     load()
     return r
   }
@@ -130,6 +133,7 @@ export const useTaskStore = defineStore('tasks', () => {
   async function enqueueSauce(ids: number[]) {
     const r = await post<{ started: boolean; job_id: number; kind: string }>('/sauce/run', { force_ids: ids })
     notifyEnqueued(r.kind, r.job_id, ids.length)
+    reportLog(`提交批量溯源任务 #${r.job_id}（${ids.length} 张）`)
     load()
     return r
   }

@@ -56,6 +56,16 @@ pub struct Job {
 /// 主目录某天的来源分组：`(来源文件夹名, 图片数)`。
 pub type ImportDirCount = (Option<String>, i64);
 
+/// 应用日志记录。
+#[derive(Debug, Clone)]
+pub struct AppLog {
+    pub id: i64,
+    pub level: String,
+    pub category: String,
+    pub message: String,
+    pub created_at: i64,
+}
+
 /// SQLite 数据库封装。单连接 + Mutex：SQLite 写串行化，WAL 下读并发足够。
 #[derive(Clone)]
 pub struct Db {
@@ -1358,6 +1368,64 @@ impl Db {
             params![job_id, now_secs()],
         )?;
         Ok(())
+    }
+
+    // ---------- 应用日志（设置页日志追踪器） ----------
+
+    /// 写入一条日志（限量保留：超过 MAX_LOGS 删除最旧）。
+    pub fn add_log(&self, level: &str, category: &str, message: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO app_logs (level, category, message, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![level, category, message, now_secs()],
+        )?;
+        // 限量保留 2000 条
+        conn.execute(
+            "DELETE FROM app_logs WHERE id NOT IN (SELECT id FROM app_logs ORDER BY id DESC LIMIT 2000)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// 查询日志（按时间倒序，分页）。
+    pub fn list_logs(&self, limit: i64, before_id: Option<i64>) -> Result<Vec<AppLog>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+        let mut sql = String::from(
+            "SELECT id, level, category, message, created_at FROM app_logs",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(bid) = before_id {
+            sql.push_str(" WHERE id < ?1");
+            params.push(Box::new(bid));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        let ph = params.len() + 1;
+        sql.push_str(&ph.to_string());
+        params.push(Box::new(limit));
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(AppLog {
+                id: row.get(0)?,
+                level: row.get(1)?,
+                category: row.get(2)?,
+                message: row.get(3)?,
+                created_at: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 清空日志。
+    pub fn clear_logs(&self) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM app_logs", [])?;
+        Ok(n as i64)
     }
 }
 

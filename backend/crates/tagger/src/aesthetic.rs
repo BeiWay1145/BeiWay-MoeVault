@@ -31,6 +31,7 @@ pub async fn run_aesthetic_pipeline(
     infer: &crate::InferClient,
     library_dir: &Path,
     image_ids: Option<Vec<i64>>,
+    job_id: Option<i64>,
 ) -> Result<AestheticProgress, TaggerError> {
     let ids = match image_ids {
         Some(ids) => {
@@ -55,11 +56,19 @@ pub async fn run_aesthetic_pipeline(
 
     for image_id in &ids {
         match score_one(db, infer, library_dir, *image_id).await {
-            Ok(()) => progress.done += 1,
+            Ok(()) => {
+                progress.done += 1;
+                let _ = db.add_log("info", "aesthetic", &format!("图片 #{image_id} 美学评分成功"));
+            }
             Err(e) => {
                 warn!(image_id, error = %e, "美学评分失败");
                 progress.failed += 1;
+                let _ = db.add_log("error", "aesthetic", &format!("图片 #{image_id} 美学评分失败：{e}"));
             }
+        }
+        // 实时写回 job 进度（任务中心进度条可见推进）
+        if let Some(jid) = job_id {
+            let _ = db.update_job(jid, "running", progress.done as i64, progress.failed as i64, None);
         }
     }
     info!(done = progress.done, failed = progress.failed, "美学评分流水线完成");

@@ -4,6 +4,7 @@ import { Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post, del, put } from '@/api/client'
 import { useSettingsStore, type SauceKeyConfig } from '@/stores/settings'
+import { reportLog } from '@/api/log'
 
 const settings = useSettingsStore()
 const activeTab = ref('saucenao')
@@ -107,6 +108,7 @@ async function saveSettings() {
   saving.value = true
   try {
     await settings.save()
+    reportLog('用户修改并保存了设置')
     ElMessage.success('设置已保存')
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -114,6 +116,62 @@ async function saveSettings() {
     saving.value = false
   }
 }
+
+// ---- 日志面板（设置页「日志」tab） ----
+interface LogEntry {
+  id: number
+  level: string
+  category: string
+  message: string
+  created_at: number
+}
+const logs = ref<LogEntry[]>([])
+const logLoading = ref(false)
+
+async function loadLogs() {
+  logLoading.value = true
+  try {
+    const d = await get<{ items: LogEntry[] }>('/logs?limit=200')
+    logs.value = d.items
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    logLoading.value = false
+  }
+}
+
+async function clearLogs() {
+  try {
+    await ElMessageBox.confirm('清空全部日志？', '清空日志', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    const r = await del<{ cleared: number }>('/logs')
+    ElMessage.success(`已清空 ${r.cleared} 条日志`)
+    await loadLogs()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+function exportLogs() {
+  const lines = logs.value.map(
+    (l) =>
+      `[${new Date(l.created_at * 1000).toLocaleString()}] [${l.level}] [${l.category}] ${l.message}`,
+  )
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `moevault-logs-${Date.now()}.txt`
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+const logLevelType = (l: string) =>
+  ({ info: 'info', warn: 'warning', error: 'danger' })[l] as 'info' | 'warning' | 'danger'
+const logCategoryLabel = (c: string) =>
+  ({ task: '任务', sauce: '溯源', tag: '打标', aesthetic: '美学', frontend: '前端', import: '导入', system: '系统' })[c] ?? c
 
 function onModelSelect(name: string) {
   const opt = taggerModelOptions.find((o) => o.name === name)
@@ -222,6 +280,27 @@ onMounted(async () => {
           </el-form-item>
         </el-form>
       </el-tab-pane>
+
+      <!-- 日志面板（日志追踪器）：任务/溯源/打标/前端操作记录，排查问题用 -->
+      <el-tab-pane label="日志" name="logs">
+        <div class="log-panel">
+          <div class="log-toolbar">
+            <el-button size="small" @click="loadLogs">刷新</el-button>
+            <el-button size="small" type="primary" plain @click="exportLogs">导出 txt</el-button>
+            <el-button size="small" type="danger" plain @click="clearLogs">清空日志</el-button>
+            <span class="hint">记录任务生命周期、溯源/打标结果、前端操作，排查打标/溯源失败用</span>
+          </div>
+          <div v-loading="logLoading" class="log-list">
+            <el-empty v-if="logs.length === 0 && !logLoading" description="暂无日志" :image-size="50" />
+            <div v-for="l in logs" :key="l.id" class="log-line">
+              <span class="log-time">{{ new Date(l.created_at * 1000).toLocaleString() }}</span>
+              <el-tag :type="logLevelType(l.level)" size="small">{{ l.level }}</el-tag>
+              <el-tag size="small" type="info">{{ logCategoryLabel(l.category) }}</el-tag>
+              <span class="log-msg">{{ l.message }}</span>
+            </div>
+          </div>
+        </div>
+      </el-tab-pane>
     </el-tabs>
 
     <div class="save-bar">
@@ -289,5 +368,40 @@ onMounted(async () => {
 .warn {
   color: var(--el-color-danger);
   font-weight: 600;
+}
+.log-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.log-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--el-fill-color-lighter);
+}
+.log-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.log-time {
+  color: var(--el-text-color-secondary);
+  flex: none;
+  font-family: monospace;
+}
+.log-msg {
+  flex: 1;
+  word-break: break-all;
 }
 </style>

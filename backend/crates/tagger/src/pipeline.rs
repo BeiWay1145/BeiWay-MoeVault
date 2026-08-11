@@ -181,6 +181,7 @@ pub async fn run_tag_pipeline(
     min_sim: f64,
     tag_threshold: f64,
     image_ids: Option<Vec<i64>>,
+    job_id: Option<i64>,
 ) -> Result<TagProgress, TaggerError> {
     let is_force = image_ids.is_some();
     let ids = match image_ids {
@@ -213,11 +214,19 @@ pub async fn run_tag_pipeline(
     for image_id in &ids {
         let result = tag_one(db, sauce, pool, infer, library_dir, min_sim, tag_threshold, *image_id).await;
         match result {
-            Ok(()) => progress.done += 1,
+            Ok(()) => {
+                progress.done += 1;
+                let _ = db.add_log("info", "tag", &format!("图片 #{image_id} 打标成功"));
+            }
             Err(e) => {
                 warn!(image_id, error = %e, "打标失败");
                 progress.failed += 1;
+                let _ = db.add_log("error", "tag", &format!("图片 #{image_id} 打标失败：{e}"));
             }
+        }
+        // 实时写回 job 进度（任务中心进度条可见推进）
+        if let Some(jid) = job_id {
+            let _ = db.update_job(jid, "running", progress.done as i64, progress.failed as i64, None);
         }
     }
     info!(done = progress.done, failed = progress.failed, "打标流水线完成");
@@ -467,6 +476,7 @@ pub async fn run_sauce_pipeline(
                             db.put_sauce_cache(&img.md5, hit.similarity, Some(&hit.source), Some(&hit.source_url), None)?;
                         }
                         db.set_image_source(image_id, &hit.source, Some(&hit.source_url))?;
+                        let _ = db.add_log("info", "sauce", &format!("图片 #{image_id} 溯源成功（{}）", hit.source));
                         let mut p = progress.lock().unwrap();
                         p.done += 1;
                         let (d, f) = (p.done, p.failed);
@@ -478,6 +488,7 @@ pub async fn run_sauce_pipeline(
                     }
                     Ok(None) => {
                         info!(image_id, "溯源无命中");
+                        let _ = db.add_log("warn", "sauce", &format!("图片 #{image_id} 溯源无命中（AI 图/不可溯源/无匹配）"));
                         let mut p = progress.lock().unwrap();
                         p.failed += 1;
                         let (d, f) = (p.done, p.failed);
@@ -488,6 +499,7 @@ pub async fn run_sauce_pipeline(
                     }
                     Err(e) => {
                         warn!(image_id, error = %e, "溯源失败");
+                        let _ = db.add_log("error", "sauce", &format!("图片 #{image_id} 溯源失败：{e}"));
                         let mut p = progress.lock().unwrap();
                         p.failed += 1;
                         let (d, f) = (p.done, p.failed);

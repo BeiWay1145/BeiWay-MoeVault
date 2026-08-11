@@ -16,28 +16,6 @@ use crate::state::AppState;
 
 use super::{db_error_response, error_response, join_error_response};
 
-/// GET /api/v1/logs：读取后端日志尾部（便于查看问题）。
-async fn get_logs(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    let log_dir = state.data_dir.join("logs");
-    let content = tokio::task::spawn_blocking(move || {
-        let log_path = log_dir.join("app.log");
-        std::fs::read_to_string(&log_path).ok().map(|s| {
-            // 取末尾 200 行
-            let lines: Vec<&str> = s.lines().collect();
-            let start = lines.len().saturating_sub(200);
-            lines[start..].join("\n")
-        })
-    })
-    .await
-    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
-    Ok(Json(json!({
-        "path": state.data_dir.join("logs").join("app.log").display().to_string(),
-        "content": content.unwrap_or_else(|| "日志文件不存在".to_string()),
-    })))
-}
-
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/tagging/run", post(run_tagging))
@@ -46,7 +24,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/sauce/run", post(run_sauce))
         .route("/api/v1/tags", get(list_tags))
         .route("/api/v1/tags/{id}/category", put(update_tag_category))
-        .route("/api/v1/logs", get(get_logs))
         .route("/api/v1/images/{id}/tags", get(image_tags))
         .route("/api/v1/images/{id}/retag", post(retag_image))
 }
@@ -253,6 +230,7 @@ async fn run_tagging(
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
+        let _ = db.add_log("info", "task", &format!("打标任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
         let result = run_tag_pipeline_async(
             &db,
             &sauce,
@@ -262,6 +240,7 @@ async fn run_tagging(
             min_sim,
             tag_threshold,
             force_ids,
+            Some(job_id),
         )
         .await;
         let (status, done, failed, error) = match &result {
@@ -269,6 +248,11 @@ async fn run_tagging(
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
         let _ = db.update_job(job_id, status, done, failed, error.as_deref());
+        let _ = db.add_log(
+            if status == "done" { "info" } else { "error" },
+            "task",
+            &format!("打标任务 #{job_id} 完成：成功 {done} 张，失败 {failed} 张{}", error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
+        );
         let event = match result {
             Ok(progress) => json!({
                 "type": "task.done",
@@ -327,6 +311,7 @@ async fn run_sauce(
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
+        let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
         let result = moevault_tagger::run_sauce_pipeline(
             &db,
             &sauce,
@@ -350,6 +335,11 @@ async fn run_sauce(
                 status
             };
         let _ = db.update_job(job_id, final_status, done, failed, error.as_deref());
+        let _ = db.add_log(
+            if final_status == "done" { "info" } else if final_status == "cancelled" { "warn" } else { "error" },
+            "task",
+            &format!("溯源任务 #{job_id} 结束（状态 {}）：成功 {done} 张，失败 {failed} 张{}", final_status, error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
+        );
         let event = match result {
             Ok(progress) => json!({
                 "type": "task.done",
@@ -377,6 +367,7 @@ async fn run_tag_pipeline_async(
     min_sim: f64,
     tag_threshold: f64,
     force_ids: Option<Vec<i64>>,
+    job_id: Option<i64>,
 ) -> Result<moevault_tagger::TagProgress, moevault_tagger::TaggerError> {
     moevault_tagger::run_tag_pipeline(
         db,
@@ -387,6 +378,7 @@ async fn run_tag_pipeline_async(
         min_sim,
         tag_threshold,
         force_ids,
+        job_id,
     )
     .await
 }
@@ -498,6 +490,7 @@ async fn retag_image(
             min_sim,
             tag_threshold,
             Some(vec![id]),
+            Some(job_id),
         )
         .await;
         let (status, done, failed, error) = match &result {

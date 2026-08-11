@@ -54,11 +54,13 @@ async fn run_aesthetic(
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
+        let _ = db.add_log("info", "aesthetic", &format!("美学任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
         let result = moevault_tagger::run_aesthetic_pipeline(
             &db,
             &infer,
             &library_dir,
             force_ids,
+            Some(job_id),
         )
         .await;
         let (status, done, failed, error) = match &result {
@@ -66,6 +68,11 @@ async fn run_aesthetic(
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
         let _ = db.update_job(job_id, status, done, failed, error.as_deref());
+        let _ = db.add_log(
+            if status == "done" { "info" } else { "error" },
+            "aesthetic",
+            &format!("美学任务 #{job_id} 完成：成功 {done} 张，失败 {failed} 张{}", error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
+        );
         let event = match result {
             Ok(progress) => json!({
                 "type": "task.done",
@@ -123,11 +130,13 @@ async fn rescore_image(
 
     tokio::spawn(async move {
         let _ = st.db.start_job(job_id, 1);
+        let _ = st.db.add_log("info", "aesthetic", &format!("美学任务 #{job_id} 启动（图片 {id} 单张）"));
         let result = moevault_tagger::run_aesthetic_pipeline(
             &st.db,
             &infer,
             &library_dir,
             Some(vec![id]),
+            Some(job_id),
         )
         .await;
         let (status, done, failed, error) = match &result {
