@@ -59,13 +59,15 @@ async function layoutWaterfall() {
   measuring.value = true
   await nextTick()
   const items = el.querySelectorAll<HTMLElement>('.waterfall-item')
-  // 第一遍：测每张卡片高度 → row span（4px 单元；margin-bottom 提供纵向间距，不计入 span）
+  // 第一遍：测每张卡片高度 → row span。
+  // 注意：offsetHeight 不含 margin-bottom，但 item 在 grid 轨道内的实际占位 = 卡片高 + 12px 间距，
+  // 必须把间距计入 span，否则卡片高度恰为 4px 倍数时 margin 溢出轨道与下一张重叠。
   const spans: Record<number, number> = {}
   items.forEach((it) => {
     const id = Number(it.dataset.imageId)
     if (!Number.isFinite(id)) return
     const h = it.offsetHeight
-    spans[id] = Math.max(1, Math.ceil(h / ROW_UNIT))
+    spans[id] = Math.max(1, Math.ceil((h + COL_GAP) / ROW_UNIT))
   })
   // 第二遍：严格行序分配列（第 i 张 → 列 i%N），每列独立堆叠（错落）
   const colHeights = new Array<number>(newCols).fill(0)
@@ -108,15 +110,20 @@ watch(
 )
 
 let resizeObs: ResizeObserver | null = null
+let resizeTimer: number | undefined
 onMounted(async () => {
   await nextTick()
   await layoutWaterfall()
   const el = containerRef.value
   if (el) {
     resizeObs = new ResizeObserver(() => {
-      // 列数变化才重排（宽度小变化不重排）
-      const c = resolveColumns()
-      if (c !== cols.value) layoutWaterfall()
+      // 窗口宽度变化（即使列数不变）也会改变卡片宽度 → aspect-ratio 高度变化 → span 失效。
+      // 因此任何宽度变化都需重新布局；防抖避免拖拽窗口时频繁重排。
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer)
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = undefined
+        layoutWaterfall()
+      }, 150)
     })
     resizeObs.observe(el)
   }
@@ -124,12 +131,17 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   resizeObs?.disconnect()
   resizeObs = null
+  if (resizeTimer !== undefined) {
+    window.clearTimeout(resizeTimer)
+    resizeTimer = undefined
+  }
 })
 
-/** 瀑布流容器 style（grid-template-columns 由 cols 控制） */
+/** 瀑布流容器 style（grid-template-columns 由 cols 控制）。
+ *  minmax(0, 1fr)：允许列收缩到内容最小宽度以下，避免卡片 nowrap 文字撑出横向滚动条。 */
 const waterfallStyle = computed(() => {
   const c = Math.max(1, cols.value || resolveColumns())
-  return { gridTemplateColumns: `repeat(${c}, 1fr)` }
+  return { gridTemplateColumns: `repeat(${c}, minmax(0, 1fr))` }
 })
 
 /** 单张卡片的 grid 定位 style（0 基 → 1 基） */
@@ -248,6 +260,8 @@ function itemStyle(img: ImageItem) {
 .waterfall-item {
   break-inside: avoid;
   margin-bottom: 12px;
+  min-width: 0;
+  overflow: hidden; /* 防止卡片内 nowrap 文字撑宽导致横向溢出 */
 }
 
 /* 删除/新增补位动效（瀑布流、网格、列表通用） */

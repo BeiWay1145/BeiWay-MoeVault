@@ -14,6 +14,10 @@ import ImagePreview from '@/components/ImagePreview.vue'
 // keep-alive 缓存名（与路由 name 一致）
 defineOptions({ name: 'library' })
 
+// 暂时方案：筛选功能未完整实装前，隐藏图库页筛选控件（AI生成显示/美学筛选/溯源下拉）。
+// 恢复时改为 true 即可。
+const SHOW_LIBRARY_FILTERS = false
+
 const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()
@@ -286,13 +290,14 @@ function onToggleAesthetic(val: boolean | string | number) {
       </el-button>
 
       <el-checkbox
+        v-if="SHOW_LIBRARY_FILTERS"
         :model-value="library.filter.isAi === true"
         @change="onToggleAiFilter"
       >
         AI 生成显示
       </el-checkbox>
 
-      <div class="aesthetic-filter">
+      <div v-if="SHOW_LIBRARY_FILTERS" class="aesthetic-filter">
         <el-switch v-model="aestheticActive" size="small" @change="onToggleAesthetic" />
         <el-slider
           v-model="aestheticRange"
@@ -310,6 +315,7 @@ function onToggleAesthetic(val: boolean | string | number) {
       </div>
 
       <el-select
+        v-if="SHOW_LIBRARY_FILTERS"
         :model-value="library.filter.sauceStatus ?? ''"
         style="width: 130px"
         @change="(v: string) => library.applyFilter({ sauceStatus: v || undefined })"
