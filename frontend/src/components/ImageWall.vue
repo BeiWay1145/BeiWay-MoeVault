@@ -19,9 +19,9 @@ const emit = defineEmits<{
 }>()
 
 // ---- 瀑布流行序错落布局 ----
-// 原理：grid 多列 + 固定 4px 行单元，每张卡片按其测量高度设置 grid-row-end: span N。
-// 卡片按 DOM 顺序由 grid 自动放置 → 视觉顺序从左到右、从上到下（行序）；
-// 各列卡片高度参差 → 保持瀑布流错落（行尾不齐，符合使用习惯）。
+// 原理：grid 多列 + 4px 行单元。每张卡片按测量高度算出 row span，
+// 再按"严格行序"显式定位：第 i 张卡片放第 (i % N) 列，行起始为该列累计高度。
+// → 阅读顺序严格从左到右、从上到下；各列独立堆叠形成错落（行尾参差）。
 const containerRef = ref<HTMLElement | null>(null)
 const COL_GAP = 12
 const ROW_UNIT = 4
@@ -30,10 +30,10 @@ const MAX_AUTO_COLS = 5
 
 /** 当前列数（0=尚未测量，用默认 1） */
 const cols = ref(0)
-/** 每张图片的 grid-row span 映射 */
-const spans = ref<Record<number, number>>({})
 /** 测量中：grid-auto-rows 切回 auto，item 自然高度（避免 4px 行高压扁） */
 const measuring = ref(true)
+/** 每张图片的定位：{col, rowStart, span}（grid 坐标 0 基） */
+const layout = ref<Record<number, { col: number; rowStart: number; span: number }>>({})
 
 function resolveColumns(): number {
   const c = props.waterfallColumns ?? 'auto'
@@ -46,8 +46,8 @@ function resolveColumns(): number {
   )
 }
 
-/** 测量每张卡片自然高度 → 计算 row span；列数变化时先更新列数再测。 */
-async function measure() {
+/** 测量卡片自然高度 → 按严格行序计算每张卡片的行列定位。 */
+async function layoutWaterfall() {
   const el = containerRef.value
   if (!el || props.viewMode !== 'waterfall' || props.images.length === 0) return
   const newCols = resolveColumns()
@@ -59,40 +59,50 @@ async function measure() {
   measuring.value = true
   await nextTick()
   const items = el.querySelectorAll<HTMLElement>('.waterfall-item')
-  const map: Record<number, number> = {}
+  // 第一遍：测每张卡片高度 → row span（4px 单元；margin-bottom 提供纵向间距，不计入 span）
+  const spans: Record<number, number> = {}
   items.forEach((it) => {
     const id = Number(it.dataset.imageId)
     if (!Number.isFinite(id)) return
     const h = it.offsetHeight
-    map[id] = Math.max(1, Math.ceil(h / ROW_UNIT))
+    spans[id] = Math.max(1, Math.ceil(h / ROW_UNIT))
   })
-  spans.value = map
+  // 第二遍：严格行序分配列（第 i 张 → 列 i%N），每列独立堆叠（错落）
+  const colHeights = new Array<number>(newCols).fill(0)
+  const map: Record<number, { col: number; rowStart: number; span: number }> = {}
+  props.images.forEach((img, idx) => {
+    const col = idx % newCols
+    const span = spans[img.id] ?? 1
+    map[img.id] = { col, rowStart: colHeights[col], span }
+    colHeights[col] += span
+  })
+  layout.value = map
   measuring.value = false
 }
 
-// 列表变化（增删/筛选/翻页）→ 重测
+// 列表变化（增删/筛选/排序/翻页）→ 重新布局（保持当前滚动位置，不打断浏览）
 watch(
   () => props.images.map((i) => i.id).join(','),
   async () => {
     await nextTick()
-    await measure()
+    await layoutWaterfall()
   },
 )
-// 列数设置变化 → 重测
+// 列数设置变化 → 重新布局
 watch(
   () => props.waterfallColumns,
   async () => {
     await nextTick()
-    await measure()
+    await layoutWaterfall()
   },
 )
-// 切到瀑布流视图 → 激活时重测
+// 切到瀑布流视图 → 激活时重新布局
 watch(
   () => props.viewMode,
   async (v) => {
     if (v === 'waterfall') {
       await nextTick()
-      await measure()
+      await layoutWaterfall()
     }
   },
 )
@@ -100,13 +110,13 @@ watch(
 let resizeObs: ResizeObserver | null = null
 onMounted(async () => {
   await nextTick()
-  await measure()
+  await layoutWaterfall()
   const el = containerRef.value
   if (el) {
     resizeObs = new ResizeObserver(() => {
-      // 列数变化才重测（宽度小变化不重排）
+      // 列数变化才重排（宽度小变化不重排）
       const c = resolveColumns()
-      if (c !== cols.value) measure()
+      if (c !== cols.value) layoutWaterfall()
     })
     resizeObs.observe(el)
   }
@@ -116,11 +126,23 @@ onBeforeUnmount(() => {
   resizeObs = null
 })
 
-/** 瀑布流容器 class + style（grid-template-columns 由 cols 控制） */
+/** 瀑布流容器 style（grid-template-columns 由 cols 控制） */
 const waterfallStyle = computed(() => {
   const c = Math.max(1, cols.value || resolveColumns())
   return { gridTemplateColumns: `repeat(${c}, 1fr)` }
 })
+
+/** 单张卡片的 grid 定位 style（0 基 → 1 基） */
+function itemStyle(img: ImageItem) {
+  if (measuring.value) return {}
+  const p = layout.value[img.id]
+  if (!p) return {}
+  return {
+    gridColumnStart: p.col + 1,
+    gridRowStart: p.rowStart + 1,
+    gridRowEnd: p.rowStart + p.span + 1,
+  }
+}
 </script>
 
 <template>
@@ -138,7 +160,7 @@ const waterfallStyle = computed(() => {
         :key="img.id"
         class="waterfall-item"
         :data-image-id="img.id"
-        :style="{ gridRowEnd: measuring ? 'auto' : `span ${spans[img.id] ?? 1}` }"
+        :style="itemStyle(img)"
       >
         <ImageCard
           :image="img"
@@ -208,14 +230,16 @@ const waterfallStyle = computed(() => {
   width: 100%;
 }
 
-/* 瀑布流：行序错落。grid 多列 + 4px 行单元，卡片按测量高度跨行（各列参差） */
+/* 瀑布流：行序错落。grid 多列 + 4px 行单元，JS 显式定位（严格行序 + 列独立堆叠）。
+   纵向间距用 item 的 margin-bottom 提供（row-gap 0，避免 gap 计入 span 计算）。 */
 .waterfall-measure-wrap {
   width: 100%;
 }
 .waterfall {
   display: grid;
   grid-auto-rows: 4px;
-  gap: 12px;
+  column-gap: 12px;
+  row-gap: 0;
   align-items: start;
 }
 .waterfall.measuring {
@@ -223,6 +247,7 @@ const waterfallStyle = computed(() => {
 }
 .waterfall-item {
   break-inside: avoid;
+  margin-bottom: 12px;
 }
 
 /* 删除/新增补位动效（瀑布流、网格、列表通用） */

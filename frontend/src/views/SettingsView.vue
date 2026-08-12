@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post, del, put } from '@/api/client'
@@ -7,7 +7,8 @@ import { useSettingsStore, type SauceKeyConfig } from '@/stores/settings'
 import { reportLog } from '@/api/log'
 
 const settings = useSettingsStore()
-const activeTab = ref('saucenao')
+// 默认打开「通用」设置页
+const activeTab = ref('library')
 
 // ---- SauceNAO 多 key ----
 const newKey = ref('')
@@ -127,18 +128,98 @@ interface LogEntry {
 }
 const logs = ref<LogEntry[]>([])
 const logLoading = ref(false)
+const logListRef = ref<HTMLElement | null>(null)
+
+// 日志显示设置（localStorage 持久化）：自动刷新频率（秒，0=关闭）+ 自动滚动
+const LOG_SETTINGS_KEY = 'moevault-log-settings'
+const logAutoRefresh = ref(5)
+const logAutoScroll = ref(true)
+const logRefreshOptions = [
+  { value: 0, label: '关闭' },
+  { value: 5, label: '5 秒' },
+  { value: 10, label: '10 秒' },
+  { value: 30, label: '30 秒' },
+  { value: 60, label: '60 秒' },
+]
+let logTimer: number | undefined
+
+function loadLogSettings() {
+  try {
+    const raw = localStorage.getItem(LOG_SETTINGS_KEY)
+    if (!raw) return
+    const s = JSON.parse(raw) as { refresh?: number; scroll?: boolean }
+    if (typeof s.refresh === 'number' && logRefreshOptions.some((o) => o.value === s.refresh)) {
+      logAutoRefresh.value = s.refresh
+    }
+    if (typeof s.scroll === 'boolean') logAutoScroll.value = s.scroll
+  } catch {
+    /* 解析失败用默认值 */
+  }
+}
+function saveLogSettings() {
+  try {
+    localStorage.setItem(
+      LOG_SETTINGS_KEY,
+      JSON.stringify({ refresh: logAutoRefresh.value, scroll: logAutoScroll.value }),
+    )
+  } catch {
+    /* 忽略 */
+  }
+}
+function stopLogTimer() {
+  if (logTimer !== undefined) {
+    window.clearInterval(logTimer)
+    logTimer = undefined
+  }
+}
+function startLogTimer() {
+  stopLogTimer()
+  if (logAutoRefresh.value > 0) {
+    logTimer = window.setInterval(() => {
+      loadLogs()
+    }, logAutoRefresh.value * 1000)
+  }
+}
+
+/** 判断日志滚动容器是否在底部（30px 容差）。 */
+function isAtBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 30
+}
 
 async function loadLogs() {
+  const el = logListRef.value
+  const wasAtBottom = el ? isAtBottom(el) : false
   logLoading.value = true
   try {
     const d = await get<{ items: LogEntry[] }>('/logs?limit=200')
-    logs.value = d.items
+    // 最新在下（后端返回倒序，反转显示）
+    logs.value = [...d.items].reverse()
+    await nextTick()
+    // 自动滚动：仅在用户本就在底部时跟随到最新日志
+    if (logAutoScroll.value && wasAtBottom && logListRef.value) {
+      logListRef.value.scrollTop = logListRef.value.scrollHeight
+    }
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
     logLoading.value = false
   }
 }
+
+// 日志设置变化 → 持久化 + 重启定时器；切到日志 tab → 立即刷新 + 启动定时器
+watch([logAutoRefresh, logAutoScroll], () => {
+  saveLogSettings()
+  if (activeTab.value === 'logs') startLogTimer()
+})
+watch(activeTab, (tab) => {
+  if (tab === 'logs') {
+    loadLogs()
+    startLogTimer()
+  } else {
+    stopLogTimer()
+  }
+})
+onBeforeUnmount(stopLogTimer)
 
 async function clearLogs() {
   try {
@@ -235,6 +316,7 @@ onMounted(async () => {
   await settings.load()
   await loadKeys()
   await loadDevices()
+  loadLogSettings()
 })
 </script>
 
@@ -366,11 +448,20 @@ onMounted(async () => {
             <el-button size="small" type="danger" plain @click="clearLogs">清空日志</el-button>
             <span class="hint">记录任务生命周期、溯源/打标结果、前端操作，排查打标/溯源失败用</span>
           </div>
-          <div class="log-toolbar" style="margin-top: 6px">
+          <div class="log-toolbar" style="margin-top: 6px; flex-wrap: wrap">
             <el-switch v-model="settings.settings.log_clear_on_start" active-text="启动时清空旧日志" inactive-text="保留旧日志" />
             <span class="hint">开启后每次启动服务自动清空旧日志并写入一条「服务已启动」记录（默认开启）</span>
           </div>
-          <div v-loading="logLoading" class="log-list">
+          <div class="log-toolbar" style="margin-top: 6px; flex-wrap: wrap">
+            <span class="hint">自动刷新：</span>
+            <el-select v-model="logAutoRefresh" size="small" style="width: 100px">
+              <el-option v-for="o in logRefreshOptions" :key="o.value" :value="o.value" :label="o.label" />
+            </el-select>
+            <span class="hint">自动滚动：</span>
+            <el-switch v-model="logAutoScroll" size="small" active-text="开" inactive-text="关" />
+            <span class="hint">打开本页立即刷新；自动滚动仅在已滚到底部时跟随最新日志</span>
+          </div>
+          <div v-loading="logLoading" ref="logListRef" class="log-list">
             <el-empty v-if="logs.length === 0 && !logLoading" description="暂无日志" :image-size="50" />
             <div v-for="l in logs" :key="l.id" class="log-line">
               <span class="log-time">{{ new Date(l.created_at * 1000).toLocaleString() }}</span>

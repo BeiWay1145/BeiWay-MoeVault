@@ -238,19 +238,21 @@ async function onBatchDetectAi() {
         <el-form-item label="美学分">
           <div class="aesthetic-filter">
             <el-switch v-model="aestheticActive" @change="onToggleAesthetic" />
-            <el-slider
-              v-model="aestheticRange"
-              range
-              :min="1"
-              :max="5"
-              :step="0.1"
-              :disabled="!aestheticActive"
-              :format-tooltip="(v: number) => v.toFixed(1)"
-              style="width: 180px"
-              @change="onAestheticChange"
-            />
-            <span class="aesthetic-val">{{ aestheticActive ? `${aestheticRange[0].toFixed(1)} ~ ${aestheticRange[1].toFixed(1)}` : '不限' }}</span>
-            <el-checkbox v-model="aestheticIncludeUnscored" :disabled="!aestheticActive">含未评分</el-checkbox>
+            <template v-if="aestheticActive">
+              <el-slider
+                v-model="aestheticRange"
+                range
+                :min="1"
+                :max="5"
+                :step="0.1"
+                :format-tooltip="(v: number) => v.toFixed(1)"
+                style="width: 180px"
+                @change="onAestheticChange"
+              />
+              <span class="aesthetic-val">{{ aestheticRange[0].toFixed(1) }} ~ {{ aestheticRange[1].toFixed(1) }}</span>
+              <el-checkbox v-model="aestheticIncludeUnscored">含未评分</el-checkbox>
+            </template>
+            <span v-else class="aesthetic-val">不限</span>
           </div>
         </el-form-item>
         <el-form-item label="来源">
