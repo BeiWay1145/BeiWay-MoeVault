@@ -7,6 +7,7 @@ import { useLibraryStore, type ImageItem, type ViewMode } from '@/stores/library
 import { useTaskStore } from '@/stores/tasks'
 import { useSettingsStore } from '@/stores/settings'
 import { post } from '@/api/client'
+import { reportLog } from '@/api/log'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 
@@ -113,6 +114,7 @@ async function onRecycle(img: ImageItem) {
   try {
     await post(`/images/${img.id}/recycle`, { reason: 'manual' })
     ElMessage.success('已移入回收站')
+    reportLog(`回收图片 #${img.id} 到回收站`)
     await library.fetchImages()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -232,6 +234,37 @@ async function onToggleAiFilter(val: boolean | string | number) {
   await library
     .applyFilter({ isAi: val === true || val === 'true' ? true : false })
     .catch((e: Error) => ElMessage.error(e.message))
+  reportLog(val === true || val === 'true' ? '切换筛选：仅显示 AI 生成图' : '切换筛选：排除 AI 生成图')
+}
+
+// ---- 美学分范围筛选（线段端点式 1-5，双端点控制上下限） ----
+const aestheticRange = ref<[number, number]>([1, 5])
+const aestheticActive = ref(false)
+const aestheticIncludeUnscored = ref(false)
+
+/** 滑块松手后自动查询（拖动中仅实时显示数值）。 */
+function onAestheticChange() {
+  if (aestheticActive.value) {
+    library
+      .applyFilter({
+        aestheticMin: aestheticRange.value[0],
+        aestheticMax: aestheticRange.value[1],
+        aestheticIncludeUnscored: aestheticIncludeUnscored.value,
+      })
+      .catch((e: Error) => ElMessage.error(e.message))
+  }
+}
+
+/** 开关变化：开启→立即按当前范围筛选；关闭→清除美学条件。 */
+function onToggleAesthetic(val: boolean | string | number) {
+  aestheticActive.value = val === true || val === 'true'
+  if (aestheticActive.value) {
+    onAestheticChange()
+  } else {
+    library
+      .applyFilter({ aestheticMin: undefined, aestheticMax: undefined, aestheticIncludeUnscored: undefined })
+      .catch((e: Error) => ElMessage.error(e.message))
+  }
 }
 </script>
 
@@ -258,6 +291,23 @@ async function onToggleAiFilter(val: boolean | string | number) {
       >
         AI 生成显示
       </el-checkbox>
+
+      <div class="aesthetic-filter">
+        <el-switch v-model="aestheticActive" size="small" @change="onToggleAesthetic" />
+        <el-slider
+          v-model="aestheticRange"
+          range
+          :min="1"
+          :max="5"
+          :step="0.1"
+          :disabled="!aestheticActive"
+          :format-tooltip="(v: number) => v.toFixed(1)"
+          style="width: 150px"
+          @change="onAestheticChange"
+        />
+        <span class="aesthetic-val">{{ aestheticActive ? `${aestheticRange[0].toFixed(1)}~${aestheticRange[1].toFixed(1)}` : '美学不限' }}</span>
+        <el-checkbox v-model="aestheticIncludeUnscored" size="small" :disabled="!aestheticActive">含未评分</el-checkbox>
+      </div>
 
       <el-select
         :model-value="library.filter.sauceStatus ?? ''"
@@ -331,6 +381,18 @@ async function onToggleAiFilter(val: boolean | string | number) {
   gap: 12px;
   margin-bottom: 12px;
   flex-wrap: wrap;
+}
+.aesthetic-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+.aesthetic-val {
+  font-size: 12px;
+  color: var(--el-text-color-primary);
+  min-width: 62px;
+  font-variant-numeric: tabular-nums;
 }
 .spacer {
   flex: 1;

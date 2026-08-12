@@ -30,6 +30,8 @@ export interface SettingsState {
   close_to_tray: boolean
   /** 瀑布流列数：auto/2/3/4/5/6（auto=传统瀑布流，固定=网格按行） */
   waterfall_columns: string
+  /** 启动时清空旧日志（默认开启） */
+  log_clear_on_start: boolean
 }
 
 const defaults: SettingsState = {
@@ -49,6 +51,7 @@ const defaults: SettingsState = {
   page_size: 50,
   close_to_tray: false,
   waterfall_columns: 'auto',
+  log_clear_on_start: true,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -77,6 +80,7 @@ export const useSettingsStore = defineStore('settings', () => {
         page_size: s.page_size != null ? Number(s.page_size) : defaults.page_size,
         close_to_tray: s.close_to_tray === true || s.close_to_tray === 'true',
         waterfall_columns: String(s.waterfall_columns ?? defaults.waterfall_columns),
+        log_clear_on_start: s.log_clear_on_start === true || s.log_clear_on_start !== 'false',
       }
       loaded.value = true
     } catch {
@@ -102,6 +106,7 @@ export const useSettingsStore = defineStore('settings', () => {
       page_size: String(settings.value.page_size),
       close_to_tray: String(settings.value.close_to_tray),
       waterfall_columns: settings.value.waterfall_columns,
+      log_clear_on_start: String(settings.value.log_clear_on_start),
     })
   }
 

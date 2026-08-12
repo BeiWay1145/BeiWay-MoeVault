@@ -38,6 +38,7 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "page_size",
     "close_to_tray",
     "waterfall_columns",
+    "log_clear_on_start",
 ];
 
 pub fn router() -> Router<AppState> {

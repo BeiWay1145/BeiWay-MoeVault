@@ -289,6 +289,8 @@ pub struct ListParams {
     /// 美学分范围（1-5）。
     pub aesthetic_min: Option<f64>,
     pub aesthetic_max: Option<f64>,
+    /// 美学筛选时包含未评分图片（1/0/true/false）。
+    pub aesthetic_include_unscored: Option<String>,
     /// 清晰度范围。
     pub clarity_min: Option<f64>,
     pub clarity_max: Option<f64>,
@@ -366,6 +368,7 @@ impl ListParams {
             date_to: self.date_to,
             aesthetic_min: self.aesthetic_min,
             aesthetic_max: self.aesthetic_max,
+            aesthetic_include_unscored: self.parse_include_unscored()?,
             clarity_min: self.clarity_min,
             clarity_max: self.clarity_max,
             source: self.source.clone(),
@@ -388,6 +391,21 @@ impl ListParams {
                 _ => Err(error_response(
                     ErrorKind::InvalidInput,
                     format!("is_ai 仅支持 1/0/true/false，收到: {v}"),
+                )),
+            },
+        }
+    }
+
+    fn parse_include_unscored(&self) -> Result<Option<bool>, (axum::http::StatusCode, Json<Value>)> {
+        match &self.aesthetic_include_unscored {
+            None => Ok(None),
+            Some(v) if v.trim().is_empty() => Ok(None),
+            Some(v) => match v.to_lowercase().as_str() {
+                "1" | "true" | "yes" => Ok(Some(true)),
+                "0" | "false" | "no" => Ok(Some(false)),
+                _ => Err(error_response(
+                    ErrorKind::InvalidInput,
+                    format!("aesthetic_include_unscored 仅支持 1/0/true/false，收到: {v}"),
                 )),
             },
         }

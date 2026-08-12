@@ -61,6 +61,29 @@ async fn main() {
     };
     tracing::info!("数据库就绪: {}", config.db_path.display());
 
+    // 启动日志清理（设置 log_clear_on_start，默认开启）：清空旧日志 + 写入启动记录
+    let clear_on_start = db
+        .get_setting("log_clear_on_start")
+        .ok()
+        .flatten()
+        .map(|s| s != "false")
+        .unwrap_or(true);
+    if clear_on_start {
+        match db.clear_logs() {
+            Ok(n) => tracing::info!("已清空启动前日志（{n} 条）"),
+            Err(e) => tracing::warn!("启动日志清理失败: {e}"),
+        }
+    }
+    let _ = db.add_log(
+        "info",
+        "system",
+        &format!(
+            "BeiWay-MoeVault 服务已启动 (v{}，清空旧日志={})",
+            env!("CARGO_PKG_VERSION"),
+            clear_on_start
+        ),
+    );
+
     let state = AppState::new(db, config.data_dir.clone(), config.infer_base_url.clone());
     let mut app = build_router(state);
 

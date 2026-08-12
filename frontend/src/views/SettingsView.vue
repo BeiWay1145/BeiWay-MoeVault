@@ -366,6 +366,10 @@ onMounted(async () => {
             <el-button size="small" type="danger" plain @click="clearLogs">清空日志</el-button>
             <span class="hint">记录任务生命周期、溯源/打标结果、前端操作，排查打标/溯源失败用</span>
           </div>
+          <div class="log-toolbar" style="margin-top: 6px">
+            <el-switch v-model="settings.settings.log_clear_on_start" active-text="启动时清空旧日志" inactive-text="保留旧日志" />
+            <span class="hint">开启后每次启动服务自动清空旧日志并写入一条「服务已启动」记录（默认开启）</span>
+          </div>
           <div v-loading="logLoading" class="log-list">
             <el-empty v-if="logs.length === 0 && !logLoading" description="暂无日志" :image-size="50" />
             <div v-for="l in logs" :key="l.id" class="log-line">

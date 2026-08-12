@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post } from '@/api/client'
+import { reportLog } from '@/api/log'
 import { thumbUrl } from '@/stores/dedup'
 
 interface TrashItem {
@@ -57,6 +58,7 @@ async function purge(item: TrashItem) {
   try {
     await post(`/trash/${item.image_id}/purge`, {})
     ElMessage.success('已永久删除')
+    reportLog(`永久删除回收站图片 #${item.image_id}（${item.rel_path}）`)
     await load()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -74,6 +76,7 @@ async function purgeAll() {
   try {
     const r = await post<{ purged: number }>('/trash/purge-all', {})
     ElMessage.success(`已清空 ${r.purged} 项`)
+    reportLog(`清空回收站（${r.purged} 项）`)
     await load()
   } catch (e) {
     ElMessage.error((e as Error).message)

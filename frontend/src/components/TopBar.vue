@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { Sunny, Moon, List, Plus, FolderOpened } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { post } from '@/api/client'
+import { reportLog } from '@/api/log'
 
 const router = useRouter()
 
@@ -13,6 +14,7 @@ function toggleTheme() {
   isDark.value = !isDark.value
   document.documentElement.classList.toggle('dark', isDark.value)
   localStorage.setItem('moevault-theme', isDark.value ? 'dark' : 'light')
+  reportLog(`切换主题为${isDark.value ? '暗黑' : '亮色'}模式`)
 }
 
 // ---- 导入（全局入口：路径输入 / 文件夹选择 / 拖拽） ----
@@ -61,6 +63,7 @@ function onImportConfirm() {
   post<{ batch_id: number }>('/import', { paths, mode: importMode.value })
     .then((res) => {
       ElMessage.success(`导入任务 #${res.batch_id} 已创建（移动进库）`)
+      reportLog(`提交导入任务 #${res.batch_id}（${paths.length} 个路径，移动进库）`)
       importVisible.value = false
       importPaths.value = ''
       // 留在主目录看新分组（若已在主目录则刷新）

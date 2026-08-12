@@ -63,7 +63,13 @@ pub async fn run_aesthetic_pipeline(
             Err(e) => {
                 warn!(image_id, error = %e, "美学评分失败");
                 progress.failed += 1;
-                let _ = db.add_log("error", "aesthetic", &format!("图片 #{image_id} 美学评分失败：{e}"));
+                let rel = db
+                    .get_image_by_id(*image_id)
+                    .ok()
+                    .flatten()
+                    .map(|i| i.rel_path)
+                    .unwrap_or_default();
+                let _ = db.add_log("error", "aesthetic", &format!("图片 #{image_id}（{rel}）美学评分失败：{e}"));
             }
         }
         // 实时写回 job 进度（任务中心进度条可见推进）
@@ -116,12 +122,26 @@ impl crate::InferClient {
             .send()
             .await?;
         if !resp.status().is_success() {
+            let status = resp.status().to_string();
+            let body_snippet = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect::<String>();
             return Err(TaggerError::Invalid(format!(
-                "推理服务返回 {}",
-                resp.status()
+                "推理服务 /infer/aesthetic 返回 {status}，响应: {body_snippet}"
             )));
         }
-        let body: AestheticResp = resp.json().await?;
+        let body: AestheticResp = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(TaggerError::Invalid(format!(
+                    "推理服务 /infer/aesthetic 响应解析失败: {e}"
+                )));
+            }
+        };
         Ok(body.score)
     }
 }

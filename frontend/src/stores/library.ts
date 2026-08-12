@@ -48,6 +48,9 @@ export interface LibraryFilter {
   tags?: string[]
   excludeTags?: string[]
   aestheticMin?: number
+  aestheticMax?: number
+  /** 美学筛选时包含未评分图（默认 false：未评分图被排除） */
+  aestheticIncludeUnscored?: boolean
   clarityMin?: number
   source?: string
   format?: string
@@ -104,6 +107,8 @@ export const useLibraryStore = defineStore('library', () => {
       if (f.tags?.length) params.set('tags', f.tags.join(','))
       if (f.excludeTags?.length) params.set('exclude_tags', f.excludeTags.join(','))
       if (f.aestheticMin != null) params.set('aesthetic_min', String(f.aestheticMin))
+      if (f.aestheticMax != null) params.set('aesthetic_max', String(f.aestheticMax))
+      if (f.aestheticIncludeUnscored != null) params.set('aesthetic_include_unscored', f.aestheticIncludeUnscored ? '1' : '0')
       if (f.clarityMin != null) params.set('clarity_min', String(f.clarityMin))
       if (f.source) params.set('source', f.source)
       if (f.format) params.set('format', f.format)

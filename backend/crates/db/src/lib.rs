@@ -1639,15 +1639,27 @@ fn build_filter_conds(
         params.push(Box::new(v));
     }
     // 美学/清晰度范围
-    if let Some(v) = filter.aesthetic_min {
-        let t = format!("?{}", params.len() + 1);
-        conds.push(format!("i.aesthetic_score >= {t}"));
-        params.push(Box::new(v));
-    }
-    if let Some(v) = filter.aesthetic_max {
-        let t = format!("?{}", params.len() + 1);
-        conds.push(format!("i.aesthetic_score <= {t}"));
-        params.push(Box::new(v));
+    let has_aesthetic = filter.aesthetic_min.is_some() || filter.aesthetic_max.is_some();
+    if has_aesthetic {
+        // 含未评分：aesthetic_score IS NULL 的图也通过；否则 NULL 被比较排除
+        let include_unscored = filter.aesthetic_include_unscored.unwrap_or(false);
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = filter.aesthetic_min {
+            let t = format!("?{}", params.len() + 1);
+            parts.push(format!("i.aesthetic_score >= {t}"));
+            params.push(Box::new(v));
+        }
+        if let Some(v) = filter.aesthetic_max {
+            let t = format!("?{}", params.len() + 1);
+            parts.push(format!("i.aesthetic_score <= {t}"));
+            params.push(Box::new(v));
+        }
+        let cond = if include_unscored {
+            format!("(i.aesthetic_score IS NULL OR {})", parts.join(" AND "))
+        } else {
+            parts.join(" AND ")
+        };
+        conds.push(cond);
     }
     if let Some(v) = filter.clarity_min {
         let t = format!("?{}", params.len() + 1);
@@ -1851,6 +1863,50 @@ mod tests {
         assert_eq!(items.len(), 2, "应筛出 4.0 和 3.2 两张");
         // 按美学降序：第一张应是 4.0
         assert_eq!(items[0].aesthetic_score, Some(4.0));
+
+        // 含未评分：aesthetic_include_unscored=true 时，未评分（NULL）图也应通过
+        // 先插入一张未评分图
+        let unscored = Image {
+            id: 0,
+            md5: "md5_unscored".into(),
+            phash: 99,
+            rel_path: "p_unscored.png".into(),
+            width: 100,
+            height: 100,
+            format: "png".into(),
+            size_bytes: 1,
+            file_mtime: 0,
+            exif_datetime: None,
+            clarity_score: 5.0,
+            aesthetic_score: None,
+            dedup_group: None,
+            is_redundant: false,
+            status: STATUS_ACTIVE.into(),
+            source: SOURCE_LOCAL.into(),
+            source_url: None,
+            no_auto_sauce: false,
+            ai_metadata: None,
+            thumb_rel: "p_unscored.webp".into(),
+            imported_at: 9,
+            source_dir: None,
+        };
+        db.insert_images(&[unscored]).unwrap();
+        // 默认（不含未评分）：仍是 2 张
+        let (items, _) = db
+            .list_images_filtered("active", &filter, SortKey::Aesthetic, false, 100, None)
+            .unwrap();
+        assert_eq!(items.len(), 2, "默认应排除未评分图");
+        // 含未评分：3 张（4.0 + 3.2 + NULL）
+        let filter_inc = ImageFilter {
+            aesthetic_min: Some(3.0),
+            aesthetic_include_unscored: Some(true),
+            ..Default::default()
+        };
+        let (items, _) = db
+            .list_images_filtered("active", &filter_inc, SortKey::Aesthetic, false, 100, None)
+            .unwrap();
+        assert_eq!(items.len(), 3, "含未评分时应包含 NULL 评分图");
+        assert!(items.iter().any(|i| i.aesthetic_score.is_none()));
 
         // 标签筛选：给 img1 打标签后按标签过滤
         let tag_id = db.upsert_tag("1girl", "general").unwrap();

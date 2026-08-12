@@ -103,6 +103,8 @@ pub struct ImageFilter {
     /// 美学分范围（1-5）。
     pub aesthetic_min: Option<f64>,
     pub aesthetic_max: Option<f64>,
+    /// 美学筛选时包含未评分（aesthetic_score IS NULL）的图片。
+    pub aesthetic_include_unscored: Option<bool>,
     /// 清晰度范围。
     pub clarity_min: Option<f64>,
     pub clarity_max: Option<f64>,

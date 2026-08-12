@@ -6,6 +6,7 @@ import { useLibraryStore, type ImageItem } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
 import { useSettingsStore } from '@/stores/settings'
 import { post } from '@/api/client'
+import { reportLog } from '@/api/log'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 import { useRouter } from 'vue-router'
@@ -18,7 +19,11 @@ const library = useLibraryStore()
 const taskStore = useTaskStore()
 const settingsStore = useSettingsStore()
 const keyword = ref('')
-const aestheticMin = ref<number | null>(null)
+/** 美学分范围双端点（1-5，null 表示不限） */
+const aestheticRange = ref<[number, number]>([1, 5])
+const aestheticActive = ref(false)
+/** 美学筛选时包含未评分图 */
+const aestheticIncludeUnscored = ref(false)
 const source = ref('')
 const onlyRedundant = ref(false)
 const sauceStatus = ref('')
@@ -79,7 +84,9 @@ async function doSearch() {
   await library
     .applyFilter({
       q: keyword.value || undefined,
-      aestheticMin: aestheticMin.value ?? undefined,
+      aestheticMin: aestheticActive.value ? aestheticRange.value[0] : undefined,
+      aestheticMax: aestheticActive.value ? aestheticRange.value[1] : undefined,
+      aestheticIncludeUnscored: aestheticActive.value ? aestheticIncludeUnscored.value : undefined,
       source: source.value || undefined,
       isRedundant: onlyRedundant.value ? true : undefined,
       sauceStatus: sauceStatus.value || undefined,
@@ -88,11 +95,32 @@ async function doSearch() {
         : undefined,
     })
     .catch((e: Error) => ElMessage.error(e.message))
+  reportLog(
+    `执行搜索筛选（${keyword.value ? `关键字「${keyword.value}」` : ''}${aestheticActive.value ? ` 美学分 ${aestheticRange.value[0].toFixed(1)}-${aestheticRange.value[1].toFixed(1)}${aestheticIncludeUnscored.value ? '(含未评分)' : ''}` : ''}${source.value ? ` 来源=${source.value}` : ''}${onlyRedundant.value ? ' 仅冗余' : ''}${sauceStatus.value ? ` 溯源=${sauceStatus.value}` : ''}${tagsInput.value ? ` 标签=${tagsInput.value}` : ''}）`,
+  )
+}
+
+/** 美学分滑块松手后自动查询（拖动中仅实时显示数值）。 */
+function onAestheticChange() {
+  if (aestheticActive.value) doSearch()
+}
+
+/** 美学筛选开关变化：关闭则清除美学条件并刷新。 */
+async function onToggleAesthetic(val: boolean) {
+  aestheticActive.value = val
+  if (!val) {
+    await library.applyFilter({ aestheticMin: undefined, aestheticMax: undefined, aestheticIncludeUnscored: undefined })
+      .catch((e: Error) => ElMessage.error(e.message))
+  } else {
+    await doSearch()
+  }
 }
 
 async function clearSearch() {
   keyword.value = ''
-  aestheticMin.value = null
+  aestheticRange.value = [1, 5]
+  aestheticActive.value = false
+  aestheticIncludeUnscored.value = false
   source.value = ''
   onlyRedundant.value = false
   sauceStatus.value = ''
@@ -123,6 +151,7 @@ async function onRecycleSelected() {
     }
   }
   ElMessage.success(`已回收 ${ok} 张`)
+  reportLog(`批量回收 ${ok}/${ids.length} 张图片到回收站`)
   library.clearSelect()
   await library.fetchImages()
 }
@@ -206,8 +235,23 @@ async function onBatchDetectAi() {
         <el-form-item label="标签">
           <el-input v-model="tagsInput" placeholder="逗号分隔，如 1girl,blue_archive" style="width: 240px" clearable />
         </el-form-item>
-        <el-form-item label="美学分≥">
-          <el-input-number v-model="aestheticMin" :min="1" :max="5" :step="0.1" placeholder="不限" />
+        <el-form-item label="美学分">
+          <div class="aesthetic-filter">
+            <el-switch v-model="aestheticActive" @change="onToggleAesthetic" />
+            <el-slider
+              v-model="aestheticRange"
+              range
+              :min="1"
+              :max="5"
+              :step="0.1"
+              :disabled="!aestheticActive"
+              :format-tooltip="(v: number) => v.toFixed(1)"
+              style="width: 180px"
+              @change="onAestheticChange"
+            />
+            <span class="aesthetic-val">{{ aestheticActive ? `${aestheticRange[0].toFixed(1)} ~ ${aestheticRange[1].toFixed(1)}` : '不限' }}</span>
+            <el-checkbox v-model="aestheticIncludeUnscored" :disabled="!aestheticActive">含未评分</el-checkbox>
+          </div>
         </el-form-item>
         <el-form-item label="来源">
           <el-select v-model="source" clearable placeholder="不限" style="width: 130px">
@@ -298,5 +342,17 @@ async function onBatchDetectAi() {
 .hint {
   font-size: 12px;
   color: var(--el-text-color-secondary);
+}
+.aesthetic-filter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+.aesthetic-val {
+  font-size: 12px;
+  color: var(--el-text-color-primary);
+  min-width: 64px;
+  font-variant-numeric: tabular-nums;
 }
 </style>
