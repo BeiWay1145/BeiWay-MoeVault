@@ -99,6 +99,15 @@ async fn main() {
         app = app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)));
     }
 
+    // 全局 Cache-Control: no-cache（最后挂载，覆盖 API/静态/fallback 全部响应）：
+    // WebView2/浏览器每次启动都重新验证前端资源，避免桌面壳升级后仍显示缓存的旧版 UI。
+    use axum::http::HeaderValue;
+    use tower_http::set_header::SetResponseHeaderLayer;
+    app = app.layer(SetResponseHeaderLayer::overriding(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    ));
+
     let addr = format!("{}:{}", config.host, config.port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
