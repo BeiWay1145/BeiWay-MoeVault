@@ -272,14 +272,17 @@ async fn tag_one(
         .ok_or_else(|| TaggerError::Invalid(format!("图片 {image_id} 不存在")))?;
     let file_path = library_dir.join(&img.rel_path);
 
-    // AI 生成图：有 prompt 标签则用（不再跳过）；无标签则提取 prompt 或本地模型打标
-    let has_ai_tag = db
-        .image_tags(image_id)?
-        .iter()
-        .any(|t| t.source == "ai");
-    if img.ai_metadata.is_some() || has_ai_tag {
-        if !has_ai_tag {
-            // 已标记 AI 但未提取标签：尝试提取 prompt 标签
+    // AI 生成图：参与打标——已有非 AI 来源的内容标签才跳过；
+    // 否则提取 prompt 标签（source=ai）或本地模型打标，AI 标记不再导致打标被跳过。
+    let tags_now = db.image_tags(image_id)?;
+    let has_content_tag = tags_now.iter().any(|t| t.source != "ai");
+    if img.ai_metadata.is_some() || tags_now.iter().any(|t| t.source == "ai") {
+        if has_content_tag {
+            info!(image_id, "AI 图已有内容标签，跳过打标");
+            return Ok(());
+        }
+        // 无内容标签：先尝试提取 prompt 标签（仅当尚无 source=ai 标签时，避免重复）
+        if !tags_now.iter().any(|t| t.source == "ai") {
             if let Some(meta) = moevault_ingest::features::read_ai_metadata(&file_path) {
                 if !meta.tags.is_empty() {
                     let tag_ids: Vec<(i64, Option<f64>)> = meta
@@ -292,12 +295,9 @@ async fn tag_one(
                     return Ok(());
                 }
             }
-        } else {
-            info!(image_id, "AI 图已有 prompt 标签，跳过打标");
-            return Ok(());
         }
-        // 无 prompt 标签的 AI 图：走本地模型打标（AI 图不溯源，直接本地推理）
-        info!(image_id, "AI 图无 prompt 标签，本地模型打标");
+        // 无 prompt 内容标签（或仅有 source=ai 标记）：本地模型打标，真正执行
+        info!(image_id, "AI 图本地模型打标");
         return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
     }
 

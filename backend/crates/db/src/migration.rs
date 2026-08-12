@@ -19,6 +19,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("V6__jobs_rebuild", include_str!("../migrations/V6__jobs_rebuild.sql")),
     ("V7__source_dir", include_str!("../migrations/V7__source_dir.sql")),
     ("V8__app_logs", include_str!("../migrations/V8__app_logs.sql")),
+    ("V9__image_tags_ai_source", include_str!("../migrations/V9__image_tags_ai_source.sql")),
 ];
 
 fn now_secs() -> i64 {

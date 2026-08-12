@@ -1806,6 +1806,47 @@ mod tests {
         assert_eq!(s.total_tags, 0);
     }
 
+    /// V9 迁移：image_tags.source 允许 'ai'（AI 图 prompt 标签）。
+    /// 回归：此前 CHECK 约束吞掉 source='ai' 的 INSERT OR IGNORE，
+    /// 导致 AI 图打标任务"立即完成"但标签从未入库。
+    #[test]
+    fn insert_ai_source_tag() {
+        let db = test_db();
+        // 插入一张图 + 一个标签
+        let img = Image {
+            id: 0,
+            md5: "md5_ai".into(),
+            phash: 42,
+            rel_path: "p_ai.png".into(),
+            width: 100,
+            height: 100,
+            format: "png".into(),
+            size_bytes: 1,
+            file_mtime: 0,
+            exif_datetime: None,
+            clarity_score: 5.0,
+            aesthetic_score: None,
+            dedup_group: None,
+            is_redundant: false,
+            status: STATUS_ACTIVE.into(),
+            source: SOURCE_LOCAL.into(),
+            source_url: None,
+            no_auto_sauce: false,
+            ai_metadata: Some("[test] ai".into()),
+            thumb_rel: "p_ai.webp".into(),
+            imported_at: 1,
+            source_dir: None,
+        };
+        db.insert_images(&[img]).unwrap();
+        let tag_id = db.upsert_tag("1girl", "general").unwrap();
+        // source='ai' 插入必须成功（V9 之前被 CHECK 吞掉）
+        db.insert_image_tags(1, &[(tag_id, None)], "ai").expect("source='ai' 插入失败");
+        let tags = db.image_tags(1).unwrap();
+        assert_eq!(tags.len(), 1, "AI 标签应成功入库");
+        assert_eq!(tags[0].source, "ai");
+        assert_eq!(tags[0].name, "1girl");
+    }
+
     #[test]
     fn list_images_empty_and_filtered() {
         let db = test_db();

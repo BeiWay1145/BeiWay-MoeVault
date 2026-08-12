@@ -22,6 +22,8 @@ const emit = defineEmits<{
 // 原理：grid 多列 + 4px 行单元。每张卡片按测量高度算出 row span，
 // 再按"严格行序"显式定位：第 i 张卡片放第 (i % N) 列，行起始为该列累计高度。
 // → 阅读顺序严格从左到右、从上到下；各列独立堆叠形成错落（行尾参差）。
+// 注意：容器 align-items: start，卡片高度不受 grid 轨道压缩，offsetHeight 始终是真实高度，
+// 因此重排时无需切换 grid-auto-rows（避免布局塌缩闪烁）。
 const containerRef = ref<HTMLElement | null>(null)
 const COL_GAP = 12
 const ROW_UNIT = 4
@@ -30,8 +32,6 @@ const MAX_AUTO_COLS = 5
 
 /** 当前列数（0=尚未测量，用默认 1） */
 const cols = ref(0)
-/** 测量中：grid-auto-rows 切回 auto，item 自然高度（避免 4px 行高压扁） */
-const measuring = ref(true)
 /** 每张图片的定位：{col, rowStart, span}（grid 坐标 0 基） */
 const layout = ref<Record<number, { col: number; rowStart: number; span: number }>>({})
 
@@ -55,9 +55,6 @@ async function layoutWaterfall() {
     cols.value = newCols
     await nextTick()
   }
-  // 进入测量态（grid-auto-rows: auto），强制 reflow 读取自然高度
-  measuring.value = true
-  await nextTick()
   const items = el.querySelectorAll<HTMLElement>('.waterfall-item')
   // 第一遍：测每张卡片高度 → row span。
   // 注意：offsetHeight 不含 margin-bottom，但 item 在 grid 轨道内的实际占位 = 卡片高 + 12px 间距，
@@ -79,7 +76,6 @@ async function layoutWaterfall() {
     colHeights[col] += span
   })
   layout.value = map
-  measuring.value = false
 }
 
 // 列表变化（增删/筛选/排序/翻页）→ 重新布局（保持当前滚动位置，不打断浏览）
@@ -110,7 +106,7 @@ watch(
 )
 
 let resizeObs: ResizeObserver | null = null
-let resizeTimer: number | undefined
+let rafId: number | undefined
 onMounted(async () => {
   await nextTick()
   await layoutWaterfall()
@@ -118,12 +114,12 @@ onMounted(async () => {
   if (el) {
     resizeObs = new ResizeObserver(() => {
       // 窗口宽度变化（即使列数不变）也会改变卡片宽度 → aspect-ratio 高度变化 → span 失效。
-      // 因此任何宽度变化都需重新布局；防抖避免拖拽窗口时频繁重排。
-      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer)
-      resizeTimer = window.setTimeout(() => {
-        resizeTimer = undefined
+      // 用 requestAnimationFrame 合并：拖拽窗口时每帧最多重排一次，实时跟随且不塌缩闪烁。
+      if (rafId !== undefined) return
+      rafId = requestAnimationFrame(() => {
+        rafId = undefined
         layoutWaterfall()
-      }, 150)
+      })
     })
     resizeObs.observe(el)
   }
@@ -131,9 +127,9 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   resizeObs?.disconnect()
   resizeObs = null
-  if (resizeTimer !== undefined) {
-    window.clearTimeout(resizeTimer)
-    resizeTimer = undefined
+  if (rafId !== undefined) {
+    cancelAnimationFrame(rafId)
+    rafId = undefined
   }
 })
 
@@ -146,7 +142,6 @@ const waterfallStyle = computed(() => {
 
 /** 单张卡片的 grid 定位 style（0 基 → 1 基） */
 function itemStyle(img: ImageItem) {
-  if (measuring.value) return {}
   const p = layout.value[img.id]
   if (!p) return {}
   return {
@@ -164,7 +159,6 @@ function itemStyle(img: ImageItem) {
       name="flip"
       tag="div"
       class="waterfall"
-      :class="{ measuring }"
       :style="waterfallStyle"
     >
       <div
@@ -217,21 +211,16 @@ function itemStyle(img: ImageItem) {
 </template>
 
 <style scoped>
+/* 外层容器用 block：内层 .grid-wrap / .list-wrap 各自负责多列布局。
+   若外层是 grid 且只有一个子项，内层宽度会被约束为外层第一格（一列宽）→ 网格只显示靠左一列。 */
 .image-wall {
-  display: grid;
-  gap: 12px;
-}
-.view-grid {
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-}
-.view-list {
-  grid-template-columns: 1fr;
-  gap: 8px;
+  display: block;
 }
 .grid-wrap {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 12px;
+  width: 100%;
 }
 .list-wrap {
   display: flex;
@@ -253,9 +242,6 @@ function itemStyle(img: ImageItem) {
   column-gap: 12px;
   row-gap: 0;
   align-items: start;
-}
-.waterfall.measuring {
-  grid-auto-rows: auto; /* 测量态：恢复自然高度读取 offsetHeight */
 }
 .waterfall-item {
   break-inside: avoid;
