@@ -264,20 +264,19 @@ const displaySourceUrl = computed(() =>
 )
 
 /** BUG4：点击原图链接 → 桌面壳用系统浏览器打开；浏览器环境 fallback window.open。
- *  Tauri v2 标准判断：window.__TAURI__（避免 __TAURI_INTERNALS__ 误判）。
- *  加错误提示 + console.log 便于定位 opener 是否生效。 */
+ *  根因：window.__TAURI__ 需 withGlobalTauri:true（默认 false）→ 误判为非 Tauri 走了 window.open 被拦截。
+ *  改用始终注入的 window.__TAURI_INTERNALS__ 直接 invoke opener。 */
 async function openSourceUrl(url: string) {
-  const isTauri = !!(window as unknown as { __TAURI__?: unknown }).__TAURI__
-  console.log('[openSourceUrl]', { url, isTauri })
-  if (isTauri) {
+  const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } }).__TAURI_INTERNALS__
+  console.log('[openSourceUrl]', { url, hasInternals: !!internals })
+  if (internals?.invoke) {
     try {
-      const { openUrl } = await import('@tauri-apps/plugin-opener')
-      console.log('[openSourceUrl] 调用 opener.openUrl')
-      await openUrl(url)
-      console.log('[openSourceUrl] opener.openUrl 成功')
+      console.log('[openSourceUrl] invoke plugin:opener|open_url')
+      await internals.invoke('plugin:opener|open_url', { url })
+      console.log('[openSourceUrl] 调用成功')
       return
     } catch (e) {
-      console.error('[openSourceUrl] opener 调用失败:', e)
+      console.error('[openSourceUrl] invoke 失败:', e)
       ElMessage.error(`打开链接失败: ${(e as Error).message}`)
       return
     }
@@ -571,7 +570,7 @@ function fmtBytes(b: number): string {
       <div class="panel-block">
         <div class="panel-title">
           标签
-          <el-button size="small" type="primary" plain style="margin-left: 8px" @click="readAiInfo">
+          <el-button size="small" type="primary" plain @click="readAiInfo">
             读取 AI 生成信息
           </el-button>
           <el-button size="small" :type="aiChecked ? 'info' : 'warning'" plain @click="toggleAiMark">
@@ -582,19 +581,18 @@ function fmtBytes(b: number): string {
             size="small"
             type="success"
             plain
-            style="margin-left: 8px"
             @click="enterEditMode"
           >
             编辑模式
           </el-button>
           <template v-else>
-            <el-button size="small" type="success" style="margin-left: 8px" @click="applyTagChanges">
+            <el-button size="small" type="success" @click="applyTagChanges">
               生效修改
             </el-button>
             <el-button size="small" plain @click="exitEditMode">取消</el-button>
-            <span class="hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</span>
           </template>
         </div>
+        <div v-if="editMode" class="edit-hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</div>
         <div v-if="hasAnyTags || editMode" class="tag-groups">
           <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
             <span v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0 || editMode" class="tag-group-label">
@@ -905,6 +903,14 @@ function fmtBytes(b: number): string {
   margin-bottom: 8px;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.edit-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin: 0 0 8px;
+  line-height: 1.5;
 }
 .tag-groups {
   display: flex;
@@ -939,16 +945,19 @@ function fmtBytes(b: number): string {
 .tag-edit {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  margin: 2px 4px 2px 0;
-  padding: 2px 6px;
+  gap: 3px;
+  margin: 1px 3px 1px 0;
+  padding: 1px 5px;
   border: 1px dashed var(--el-border-color);
   border-radius: 6px;
   background: var(--el-fill-color-light);
   cursor: text;
   font-size: 12px;
+  line-height: 20px;
+  height: 22px;
   transition: opacity 0.15s;
   user-select: none;
+  max-width: 100%;
 }
 .tag-edit:hover {
   border-color: var(--el-color-primary);
@@ -959,11 +968,12 @@ function fmtBytes(b: number): string {
 }
 .tag-edit-input {
   width: 110px;
-  margin: 2px 4px 2px 0;
+  margin: 1px 3px 1px 0;
 }
 .tag-edit-input :deep(.el-input__wrapper) {
   box-shadow: none;
   padding: 0 6px;
+  min-height: 24px;
 }
 .tag-add {
   display: inline-flex;
