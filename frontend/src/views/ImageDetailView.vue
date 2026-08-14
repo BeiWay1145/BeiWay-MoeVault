@@ -263,16 +263,23 @@ const displaySourceUrl = computed(() =>
   image.value?.sourceUrl ? image.value.sourceUrl.replace(/\.json$/, '') : undefined,
 )
 
-/** BUG2：点击原图链接 → 桌面壳用系统浏览器打开；浏览器环境 fallback window.open。 */
+/** BUG4：点击原图链接 → 桌面壳用系统浏览器打开；浏览器环境 fallback window.open。
+ *  Tauri v2 标准判断：window.__TAURI__（避免 __TAURI_INTERNALS__ 误判）。
+ *  加错误提示 + console.log 便于定位 opener 是否生效。 */
 async function openSourceUrl(url: string) {
-  const tauri = (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
-  if (tauri) {
+  const isTauri = !!(window as unknown as { __TAURI__?: unknown }).__TAURI__
+  console.log('[openSourceUrl]', { url, isTauri })
+  if (isTauri) {
     try {
       const { openUrl } = await import('@tauri-apps/plugin-opener')
+      console.log('[openSourceUrl] 调用 opener.openUrl')
       await openUrl(url)
+      console.log('[openSourceUrl] opener.openUrl 成功')
       return
-    } catch {
-      /* 插件调用失败 fallback */
+    } catch (e) {
+      console.error('[openSourceUrl] opener 调用失败:', e)
+      ElMessage.error(`打开链接失败: ${(e as Error).message}`)
+      return
     }
   }
   window.open(url, '_blank', 'noopener')
@@ -386,6 +393,23 @@ function toggleTagDelete(name: string) {
 function startEditTag(name: string) {
   if (!editMode.value) return
   editingName.value = name
+  // 初始化输入缓冲为当前显示值
+  const e = tagEdits.value[name]
+  editBuffer.value = e?.newName ?? name
+}
+/** 编辑输入缓冲（v-model 双向绑定）。 */
+const editBuffer = ref('')
+/** 失焦/回车：提交缓冲到 tagEdits（有效修改才标记 dirty）。 */
+function commitEditTag(name: string) {
+  if (!editMode.value || editingName.value !== name) return
+  const e = tagEdits.value[name]
+  if (e) {
+    const trimmed = editBuffer.value.trim()
+    const valid = trimmed !== '' && trimmed !== name
+    e.dirty = valid
+    e.newName = valid ? trimmed : undefined
+  }
+  editingName.value = null
 }
 /** 输入变更：有效修改（≠原名且非空）标记 dirty。 */
 function applyTagEdit(name: string, newName: string) {
@@ -397,16 +421,29 @@ function applyTagEdit(name: string, newName: string) {
   e.newName = valid ? trimmed : undefined
 }
 /** 失焦/回车：退出当前编辑。 */
-function stopEditTag() {
-  editingName.value = null
+function stopEditTag(name: string) {
+  commitEditTag(name)
 }
 /** 新增标签：点蓝色 + 号，加入该分类的空标签输入框。 */
 function addNewTag(category: string) {
-  newTags.value.push({ key: ++newTagSeq, category, value: '' })
+  const key = ++newTagSeq
+  newTags.value.push({ key, category, value: '' })
+  editingNewKey.value = key
 }
-function applyNewTagEdit(key: number, v: string) {
+/** 正在输入的新增标签 key。 */
+const editingNewKey = ref<number | null>(null)
+/** 新增标签输入缓冲。 */
+const newTagBuffer = ref('')
+function startNewTagEdit(key: number) {
+  editingNewKey.value = key
   const t = newTags.value.find((x) => x.key === key)
-  if (t) t.value = v
+  newTagBuffer.value = t?.value ?? ''
+}
+/** 失焦/回车：提交缓冲到新标签，保留非空内容。 */
+function commitNewTagEdit(key: number) {
+  const t = newTags.value.find((x) => x.key === key)
+  if (t) t.value = newTagBuffer.value.trim()
+  editingNewKey.value = null
 }
 function removeNewTag(key: number) {
   newTags.value = newTags.value.filter((x) => x.key !== key)
@@ -575,13 +612,12 @@ function fmtBytes(b: number): string {
               <template v-if="editMode">
                 <el-input
                   v-if="editingName === t.name"
-                  :model-value="tagEdits[t.name]?.newName ?? t.name"
+                  v-model="editBuffer"
                   size="small"
                   class="tag-edit-input"
                   autofocus
-                  @change="(v: string) => applyTagEdit(t.name, v)"
-                  @blur="stopEditTag"
-                  @keyup.enter="stopEditTag"
+                  @blur="stopEditTag(t.name)"
+                  @keyup.enter="stopEditTag(t.name)"
                 />
                 <span
                   v-else
@@ -612,15 +648,24 @@ function fmtBytes(b: number): string {
             <!-- 改进1：新增标签输入框（编辑模式下） -->
             <template v-for="nt in newTagsOf(g.key)" :key="nt.key">
               <el-input
-                :model-value="nt.value"
+                v-if="editingNewKey === nt.key"
+                v-model="newTagBuffer"
                 size="small"
                 class="tag-edit-input"
                 autofocus
                 placeholder="输入新标签…"
-                @change="(v: string) => applyNewTagEdit(nt.key, v)"
-                @blur="removeNewTag(nt.key)"
-                @keyup.enter="removeNewTag(nt.key)"
+                @blur="commitNewTagEdit(nt.key)"
+                @keyup.enter="commitNewTagEdit(nt.key)"
               />
+              <span
+                v-else
+                class="tag-edit"
+                :class="{ 'new-tag': true }"
+                @click="startNewTagEdit(nt.key)"
+              >
+                {{ nt.value || '（空）' }}
+                <span class="tag-del" @click.stop="removeNewTag(nt.key)">✕</span>
+              </span>
             </template>
           </div>
         </div>

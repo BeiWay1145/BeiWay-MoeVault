@@ -507,17 +507,30 @@ async fn replace_from_url(
         let prefix = &md5_hex[..md5_hex.len().min(2)];
         let new_rel = format!("{prefix}/{md5_hex}.{ext}");
         let new_path = library_dir.join(&new_rel);
+        // 日志：目标目录可能不存在（新 md5 前缀是全新目录）→ 先建目录再写
+        tracing::info!(id, url = %url, bytes = bytes.len(), ext, new_rel = %new_rel,
+            "替换网络图：下载完成，准备写入");
+        if let Some(parent) = new_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                error_response(ErrorKind::Internal, format!("创建目录失败 {}: {e}", parent.display()))
+            })?;
+        }
         // 5. 写新文件（若与旧文件同路径则直接覆盖）
         std::fs::write(&new_path, &bytes)
             .map_err(|e| error_response(ErrorKind::Internal, format!("写入新文件失败: {e}")))?;
+        tracing::info!(id, new_path = %new_path.display(), "替换网络图：写入成功");
         // 6. 删旧文件（若非同一路径）
         if new_path != old_path {
-            let _ = std::fs::remove_file(&old_path);
+            match std::fs::remove_file(&old_path) {
+                Ok(_) => tracing::info!(id, old = %old_path.display(), "替换网络图：旧文件已删除"),
+                Err(e) => tracing::warn!(id, old = %old_path.display(), error = %e, "替换网络图：旧文件删除失败（忽略）"),
+            }
         }
         // 7. 重新生成缩略图
         let thumb_rel = format!("{prefix}/{md5_hex}.webp");
         let thumb_path = thumbs_dir.join(&thumb_rel);
         moevault_ingest::importer::generate_thumbnail(&new_path, &thumb_path);
+        tracing::info!(id, thumb = %thumb_rel, "替换网络图：缩略图已生成");
         // 8. 更新库记录
         db.replace_image_file(id, &md5_hex, &new_rel, w, h, ext, bytes.len() as i64)
             .map_err(db_error_response)?;

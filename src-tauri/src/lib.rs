@@ -5,14 +5,18 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+use tauri::{Manager, WindowEvent, RunEvent};
 
 const BACKEND_URL: &str = "http://127.0.0.1:9178";
 const BACKEND_PORT: u16 = 9178;
+
+/// 全局持有后端子进程句柄：托盘退出/应用退出时确保杀掉后端。
+static BACKEND_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -71,6 +75,7 @@ pub fn run() {
             }
           }
           "quit" => {
+            kill_backend();
             app.exit(0);
           }
           _ => {}
@@ -82,8 +87,9 @@ pub fn run() {
       // 启动后端
       match start_backend() {
         Ok(child) => {
-          // 持有子进程句柄防止被回收（Tauri 退出时 child drop 自动清理）
-          let _ = Box::leak(Box::new(child)) as *mut Child;
+          // 持有子进程句柄（全局）：托盘退出/应用退出时确保杀掉后端，避免残留占端口
+          let slot = BACKEND_CHILD.get_or_init(|| Mutex::new(None));
+          *slot.lock().unwrap() = Some(child);
           // 后台等待后端就绪
           let handle = app.handle().clone();
           thread::spawn(move || {
@@ -100,8 +106,24 @@ pub fn run() {
       }
       Ok(())
     })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(|_app_handle, event| {
+      // 应用退出（任何路径：托盘退出/窗口关闭/系统关机）→ 确保杀掉后端子进程
+      if let RunEvent::Exit = event {
+        kill_backend();
+      }
+    });
+}
+
+/// 杀掉后端子进程（托盘退出/应用退出时调用，避免残留占 9178 端口）。
+fn kill_backend() {
+    if let Some(slot) = BACKEND_CHILD.get() {
+        if let Some(mut child) = slot.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// 读取后端设置 close_to_tray（同步 HTTP GET，localhost 延迟可忽略）。
