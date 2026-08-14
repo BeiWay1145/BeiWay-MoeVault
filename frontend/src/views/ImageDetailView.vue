@@ -20,7 +20,31 @@ const stageRef = ref<HTMLElement | null>(null)
 /** 全屏查看模式（点击图片进入；叉号/ESC 退出；左右键切换）。 */
 const fullscreen = ref(false)
 
-const originalSrc = computed(() => (image.value ? originalUrl(image.value.id) : undefined))
+/** 上一张图的 src（新图加载完成前保留显示）。 */
+const prevSrc = ref<string | undefined>(undefined)
+/** 图片替换后强制绕过浏览器缓存（URL 加时间戳）。 */
+const cacheBust = ref(0)
+
+const originalSrc = computed(() => {
+  if (!image.value) return undefined
+  const base = originalUrl(image.value.id)
+  return cacheBust.value ? `${base}?t=${cacheBust.value}` : base
+})
+
+/** 改进2：切换图片时旧图保留，新图加载完成后淡入（避免灰色闪烁）。 */
+const imgLoaded = ref(true)
+function onStageImgLoad() {
+  imgLoaded.value = true
+}
+// 路由参数变化（切换图片）→ 新图未加载完成前保留旧图
+watch(
+  () => route.params.id,
+  (newId, oldId) => {
+    // 记住旧图的 src（新图加载前显示）
+    if (oldId) prevSrc.value = originalUrl(Number(oldId))
+    imgLoaded.value = false
+  },
+)
 
 // E3: 标签按 danbooru 分类（画师/系列/角色/常规），按后端 category 字段分组
 const tagGroups = computed(() => {
@@ -340,10 +364,14 @@ async function keepNetwork() {
   }
   try {
     await post(`/images/${image.value.id}/replace-from-url`, { url: netInfo.value.file_url })
-    ElMessage.success('已用网络原图替换库内图片')
+    // 改进3：替换后彻底刷新——更新库列表 + 详情 + 强制绕过浏览器图片缓存（URL 加时间戳）
     await library.fetchImages(500)
     await loadDetail()
+    prevSrc.value = originalSrc.value
+    imgLoaded.value = false
+    cacheBust.value++
     compareVisible.value = false
+    ElMessage.success('已用网络原图替换库内图片')
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -505,11 +533,24 @@ function fmtBytes(b: number): string {
       <button class="nav-close" title="返回" @click="goBack">✕</button>
       <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
       <div ref="stageRef" class="stage" @click="enterFullscreen">
-        <el-image :src="originalSrc" fit="contain" class="stage-img" :preview-src-list="[]">
-          <template #error>
-            <span class="placeholder-name">原图加载失败</span>
-          </template>
-        </el-image>
+        <!-- 旧图：新图加载完成前保持显示（避免灰色闪烁） -->
+        <el-image v-if="!imgLoaded" :src="prevSrc" fit="contain" class="stage-img prev-img" />
+        <!-- 新图：加载完成后淡入覆盖 -->
+        <Transition name="fade">
+          <el-image
+            v-if="imgLoaded"
+            :key="image.id"
+            :src="originalSrc"
+            fit="contain"
+            class="stage-img"
+            :preview-src-list="[]"
+            @load="onStageImgLoad"
+          >
+            <template #error>
+              <span class="placeholder-name">原图加载失败</span>
+            </template>
+          </el-image>
+        </Transition>
       </div>
       <button class="nav-arrow right" title="下一张" @click="gotoImage(1)">›</button>
     </div>
@@ -571,7 +612,7 @@ function fmtBytes(b: number): string {
         <div class="panel-title">
           标签
           <el-button size="small" type="primary" plain @click="readAiInfo">
-            读取 AI 生成信息
+            读取元数据
           </el-button>
           <el-button size="small" :type="aiChecked ? 'info' : 'warning'" plain @click="toggleAiMark">
             {{ aiChecked ? '取消 AI 标记' : '手动标记为 AI' }}
@@ -752,6 +793,20 @@ function fmtBytes(b: number): string {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+/* 改进2：切换图片过渡——旧图保持，新图淡入 */
+.stage-img.prev-img {
+  position: absolute;
+  inset: 0;
+}
+.fade-enter-active {
+  transition: opacity 0.25s ease;
+}
+.fade-enter-from {
+  opacity: 0;
+}
+.fade-leave-active {
+  display: none;
 }
 .nav-close {
   position: absolute;

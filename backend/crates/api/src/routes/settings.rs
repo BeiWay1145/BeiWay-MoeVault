@@ -39,6 +39,7 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "close_to_tray",
     "waterfall_columns",
     "log_clear_on_start",
+    "sidebar_hover_expand",
 ];
 
 pub fn router() -> Router<AppState> {

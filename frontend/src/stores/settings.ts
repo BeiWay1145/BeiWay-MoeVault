@@ -32,6 +32,8 @@ export interface SettingsState {
   waterfall_columns: string
   /** 启动时清空旧日志（默认开启） */
   log_clear_on_start: boolean
+  /** 侧边栏悬停自动展开（默认开启） */
+  sidebar_hover_expand: boolean
 }
 
 const defaults: SettingsState = {
@@ -52,6 +54,7 @@ const defaults: SettingsState = {
   close_to_tray: false,
   waterfall_columns: 'auto',
   log_clear_on_start: true,
+  sidebar_hover_expand: true,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -81,6 +84,7 @@ export const useSettingsStore = defineStore('settings', () => {
         close_to_tray: s.close_to_tray === true || s.close_to_tray === 'true',
         waterfall_columns: String(s.waterfall_columns ?? defaults.waterfall_columns),
         log_clear_on_start: s.log_clear_on_start === true || s.log_clear_on_start !== 'false',
+        sidebar_hover_expand: s.sidebar_hover_expand === true || s.sidebar_hover_expand !== 'false',
       }
       loaded.value = true
     } catch {
@@ -107,6 +111,7 @@ export const useSettingsStore = defineStore('settings', () => {
       close_to_tray: String(settings.value.close_to_tray),
       waterfall_columns: settings.value.waterfall_columns,
       log_clear_on_start: String(settings.value.log_clear_on_start),
+      sidebar_hover_expand: String(settings.value.sidebar_hover_expand),
     })
   }
 

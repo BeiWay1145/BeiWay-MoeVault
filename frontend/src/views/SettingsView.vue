@@ -343,6 +343,10 @@ onMounted(async () => {
             </el-select>
             <span class="hint">自动=传统瀑布流（紧密错落、按列填充）；固定列=网格按行排（无空隙）。影响图库/搜索</span>
           </el-form-item>
+          <el-form-item label="侧边栏悬停展开">
+            <el-switch v-model="settings.settings.sidebar_hover_expand" active-text="开启" inactive-text="关闭" />
+            <span class="hint">侧边栏收起后，鼠标悬停自动展开（默认开启）</span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 
