@@ -58,6 +58,34 @@ watch(
   },
 )
 
+// ---- 全屏大图（原生 img + opacity 叠加，杜绝 el-image 灰色占位） ----
+/** 全屏当前显示的原图 src。 */
+const fsSrc = ref<string | undefined>(undefined)
+/** 全屏新图是否加载完成（加载中旧图保持显示，无灰色）。 */
+const fsImgReady = ref(true)
+/** 全屏切换时保留的旧图 src（新图 onload 前显示）。 */
+const fsPrevSrc = ref<string | undefined>(undefined)
+
+function openFullscreen() {
+  fullscreen.value = true
+  fsSrc.value = originalSrc.value
+  fsImgReady.value = true
+  fsPrevSrc.value = undefined
+}
+/** 全屏切图：新图就位前旧图保持显示（opacity 叠加），onload 后淡入。 */
+function fsGoto(delta: number) {
+  const list = library.images
+  if (list.length === 0 || indexInList.value < 0) return
+  const next = list[(indexInList.value + delta + list.length) % list.length]
+  const newSrc = originalUrl(next.id)
+  // 保留当前图作为旧图
+  fsPrevSrc.value = fsSrc.value
+  fsImgReady.value = false
+  // 更新当前图 + 路由（组件 watch 会触发普通视图过渡）
+  router.replace(`/library/${next.id}`)
+  fsSrc.value = newSrc
+}
+
 /** 预加载当前图前后各 N 张原图（用 Image 对象触发浏览器缓存）。 */
 function preloadAround() {
   const list = library.images
@@ -124,7 +152,7 @@ function onKeydown(e: KeyboardEvent) {
 
 /** 点击图片区域进入全屏。 */
 function enterFullscreen() {
-  fullscreen.value = true
+  openFullscreen()
 }
 
 // 路由参数变化（左右切换/URL 直达）时刷新标签等详情数据（BUG1 修复）
@@ -596,19 +624,19 @@ function fmtBytes(b: number): string {
     <Transition name="fs">
       <div v-if="fullscreen" class="fullscreen" @click="fullscreen = false">
         <button class="fs-close" title="退出全屏" @click.stop="fullscreen = false">✕</button>
-        <button class="fs-arrow left" title="上一张" @click.stop="gotoImage(-1)">‹</button>
-        <!-- 全屏大图：与普通视图一致——旧图保留 + 新图缓存命中淡入（避免灰闪） -->
-        <el-image v-show="!imgLoaded && !!prevSrc" :src="prevSrc" fit="contain" class="fs-img prev-img" @click.stop />
-        <el-image
-          v-show="imgLoaded"
-          :key="image.id"
-          :src="originalSrc"
-          fit="contain"
+        <button class="fs-arrow left" title="上一张" @click.stop="fsGoto(-1)">‹</button>
+        <!-- 全屏大图：原生 img + opacity 叠加（旧图保持显示，新图 onload 后淡入，无灰色占位） -->
+        <img v-if="fsPrevSrc" :src="fsPrevSrc" class="fs-img" alt="" @click.stop />
+        <img
+          :src="fsSrc"
           class="fs-img"
-          :class="{ 'img-fade-in': imgLoaded }"
+          :class="{ 'img-fade-in': fsImgReady }"
+          :style="{ opacity: fsImgReady ? 1 : 0 }"
+          alt=""
+          @load="fsImgReady = true"
           @click.stop
         />
-        <button class="fs-arrow right" title="下一张" @click.stop="gotoImage(1)">›</button>
+        <button class="fs-arrow right" title="下一张" @click.stop="fsGoto(1)">›</button>
       </div>
     </Transition>
 
@@ -937,11 +965,10 @@ function fmtBytes(b: number): string {
   width: 100%;
   height: 100%;
   cursor: zoom-out;
-}
-/* 全屏大图：旧图叠加在新图下（切换过渡） */
-.fs-img.prev-img {
+  object-fit: contain;
   position: absolute;
   inset: 0;
+  transition: opacity 0.25s ease;
 }
 .fs-close {
   position: absolute;

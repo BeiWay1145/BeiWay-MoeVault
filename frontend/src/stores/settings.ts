@@ -57,7 +57,7 @@ const defaults: SettingsState = {
   waterfall_columns: 'auto',
   log_clear_on_start: true,
   sidebar_hover_expand: true,
-  preload_count: 2,
+  preload_count: 4,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
