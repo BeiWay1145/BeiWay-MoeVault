@@ -34,6 +34,8 @@ export interface SettingsState {
   log_clear_on_start: boolean
   /** 侧边栏悬停自动展开（默认开启） */
   sidebar_hover_expand: boolean
+  /** 详情页预加载图片张数（前后各 N 张，默认 2，0=关闭） */
+  preload_count: number
 }
 
 const defaults: SettingsState = {
@@ -55,6 +57,7 @@ const defaults: SettingsState = {
   waterfall_columns: 'auto',
   log_clear_on_start: true,
   sidebar_hover_expand: true,
+  preload_count: 2,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -85,6 +88,7 @@ export const useSettingsStore = defineStore('settings', () => {
         waterfall_columns: String(s.waterfall_columns ?? defaults.waterfall_columns),
         log_clear_on_start: s.log_clear_on_start === true || s.log_clear_on_start !== 'false',
         sidebar_hover_expand: s.sidebar_hover_expand === true || s.sidebar_hover_expand !== 'false',
+        preload_count: s.preload_count != null ? Number(s.preload_count) : defaults.preload_count,
       }
       loaded.value = true
     } catch {
@@ -112,6 +116,7 @@ export const useSettingsStore = defineStore('settings', () => {
       waterfall_columns: settings.value.waterfall_columns,
       log_clear_on_start: String(settings.value.log_clear_on_start),
       sidebar_hover_expand: String(settings.value.sidebar_hover_expand),
+      preload_count: String(settings.value.preload_count),
     })
   }
 

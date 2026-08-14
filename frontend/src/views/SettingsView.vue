@@ -359,6 +359,10 @@ onMounted(async () => {
               <el-option :value="100" label="100" />
             </el-select>
           </el-form-item>
+          <el-form-item label="预加载图片张数">
+            <el-input-number v-model="settings.settings.preload_count" :min="0" :max="5" />
+            <span class="hint">详情页切换图片时预加载前后各 N 张原图（0=关闭，默认 2），减少切换闪灰</span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 

@@ -4,12 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, originalUrl } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
+import { useSettingsStore } from '@/stores/settings'
 import { get, post, put, del } from '@/api/client'
 
 const route = useRoute()
 const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()
+const settingsStore = useSettingsStore()
 
 const image = computed(() => library.images.find((i) => i.id === Number(route.params.id)))
 const tags = ref<Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string }>>([])
@@ -51,8 +53,27 @@ watch(
     // 已加载完成的图（loadedImgId）才是旧图；仅记住真正的已显示图
     prevSrc.value = loadedImgId.value != null ? originalUrl(loadedImgId.value) : undefined
     imgLoaded.value = false
+    // 预加载前后 N 张原图（浏览器缓存命中 → 切换时立即显示，减少闪灰）
+    preloadAround()
   },
 )
+
+/** 预加载当前图前后各 N 张原图（用 Image 对象触发浏览器缓存）。 */
+function preloadAround() {
+  const list = library.images
+  const idx = indexInList.value
+  const n = settingsStore.settings.preload_count || 0
+  if (list.length === 0 || idx < 0 || n <= 0) return
+  for (let d = 1; d <= n; d++) {
+    for (const sign of [-1, 1]) {
+      const target = list[(idx + sign * d + list.length) % list.length]
+      if (target && target.id !== Number(route.params.id)) {
+        const img = new Image()
+        img.src = originalUrl(target.id)
+      }
+    }
+  }
+}
 
 // E3: 标签按 danbooru 分类（画师/系列/角色/常规），按后端 category 字段分组
 const tagGroups = computed(() => {
@@ -86,7 +107,8 @@ function gotoImage(delta: number) {
   const list = library.images
   if (list.length === 0 || indexInList.value < 0) return
   const next = list[(indexInList.value + delta + list.length) % list.length]
-  router.push(`/library/${next.id}`)
+  // 组件内切换：router.replace 不推入历史（返回时直接回图库而非逐张回退）
+  router.replace(`/library/${next.id}`)
 }
 
 // 键盘左右键切换 + Del 删除 + ESC 退出全屏
@@ -518,9 +540,11 @@ async function applyTagChanges() {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
+  await settingsStore.load().catch(() => {})
   loadDetail()
   window.addEventListener('keydown', onKeydown)
+  preloadAround()
 })
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)

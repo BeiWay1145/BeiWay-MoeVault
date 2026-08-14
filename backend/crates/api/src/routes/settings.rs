@@ -40,6 +40,7 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "waterfall_columns",
     "log_clear_on_start",
     "sidebar_hover_expand",
+    "preload_count",
 ];
 
 pub fn router() -> Router<AppState> {
