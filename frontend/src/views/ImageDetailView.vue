@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, originalUrl } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
-import { get, post, put } from '@/api/client'
+import { get, post, put, del } from '@/api/client'
 
 const route = useRoute()
 const router = useRouter()
@@ -12,7 +12,7 @@ const library = useLibraryStore()
 const taskStore = useTaskStore()
 
 const image = computed(() => library.images.find((i) => i.id === Number(route.params.id)))
-const tags = ref<Array<{ name: string; name_cn: string | null; category: string; source: string }>>([])
+const tags = ref<Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string }>>([])
 const aiInfo = ref<string | null>(null)
 const aiTags = ref<string[]>([])
 const aiChecked = ref(false)
@@ -92,7 +92,7 @@ async function loadDetail() {
   }
   // 标签
   try {
-    const t = await get<{ tags: Array<{ name: string; name_cn: string | null; category: string; source: string }> }>(
+    const t = await get<{ tags: Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string }> }>(
       `/images/${id}/tags`,
     )
     tags.value = t.tags
@@ -224,7 +224,7 @@ async function editSourceUrl() {
   const id = image.value.id
   const cur = image.value.sourceUrl ?? ''
   const { value } = await ElMessageBox.prompt('输入溯源来源链接（留空清除）', '编辑原图链接', {
-    inputValue: cur,
+    inputValue: cur.replace(/\.json$/, ''),
     inputPlaceholder: 'https://danbooru.donmai.us/posts/...',
   }).catch(() => ({ value: null as string | null }))
   if (value === null) return
@@ -238,6 +238,160 @@ async function editSourceUrl() {
   }
 }
 
+/** 改进1：重命名库内图片文件（保持哈希目录，冲突即失败）。 */
+async function renameImage() {
+  if (!image.value) return
+  const id = image.value.id
+  const { value } = await ElMessageBox.prompt('输入新文件名（含扩展名）', '重命名图片', {
+    inputValue: image.value.name,
+    inputPattern: /^[^\\/:*?"<>|]+$/,
+    inputErrorMessage: '文件名含非法字符（\\ / : * ? " < > |）',
+  }).catch(() => ({ value: null as string | null }))
+  if (!value || value === image.value.name) return
+  try {
+    const r = await put<{ ok: boolean; rel_path: string }>(`/images/${id}/rename`, { name: value })
+    const it = library.images.find((i) => i.id === id)
+    if (it) it.name = decodeURIComponent((r.rel_path as string).split(/[\\/]/).pop() ?? value)
+    ElMessage.success('已重命名')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 原图链接展示：去掉 .json 后缀（页面链接可点击跳转）。 */
+const displaySourceUrl = computed(() =>
+  image.value?.sourceUrl ? image.value.sourceUrl.replace(/\.json$/, '') : undefined,
+)
+
+// ---- 对比原图（图库图 vs 网络原图） ----
+const compareVisible = ref(false)
+const compareLoading = ref(false)
+const netInfo = ref<{
+  width: number | null
+  height: number | null
+  size_bytes: number | null
+  file_url: string | null
+} | null>(null)
+
+async function openCompare() {
+  if (!image.value) return
+  compareVisible.value = true
+  compareLoading.value = true
+  netInfo.value = null
+  try {
+    const r = await get<{
+      ok: boolean
+      page_url: string
+      info: { width: number | null; height: number | null; size_bytes: number | null; file_url: string | null }
+    }>(`/images/${image.value.id}/source-info`)
+    netInfo.value = r.info
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    compareLoading.value = false
+  }
+}
+
+/** 红绿白：红=网络大，绿=库大，白=相等；null 无法比较 → 灰。 */
+function cmpColor(local: number | null | undefined, net: number | null | undefined): string {
+  if (net == null || local == null) return ''
+  if (net > local) return 'cmp-red'
+  if (net < local) return 'cmp-green'
+  return 'cmp-white'
+}
+const localPixels = computed(() => (image.value ? image.value.width * image.value.height : null))
+const netPixels = computed(() =>
+  netInfo.value?.width && netInfo.value.height ? netInfo.value.width * netInfo.value.height : null,
+)
+const sizeColor = computed(() => cmpColor(image.value?.sizeBytes ?? null, netInfo.value?.size_bytes))
+const pxColor = computed(() => cmpColor(localPixels.value, netPixels.value))
+
+async function keepNetwork() {
+  if (!image.value || !netInfo.value?.file_url) return
+  try {
+    await ElMessageBox.confirm(
+      '下载网络原图替换库内图片？\n标签/评分/来源链接保留，旧文件将被删除。',
+      '保留网络原图',
+      { type: 'warning', confirmButtonText: '替换', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await post(`/images/${image.value.id}/replace-from-url`, { url: netInfo.value.file_url })
+    ElMessage.success('已用网络原图替换库内图片')
+    await library.fetchImages(500)
+    await loadDetail()
+    compareVisible.value = false
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+// ---- 标签编辑模式 ----
+const editMode = ref(false)
+interface TagEdit {
+  original: string
+  tagId: number
+  newName?: string
+  deleted?: boolean
+  /** 文本是否有有效修改（一个字没动不算） */
+  dirty: boolean
+}
+const tagEdits = ref<Record<string, TagEdit>>({})
+
+function enterEditMode() {
+  editMode.value = true
+  tagEdits.value = {}
+  for (const t of tags.value) tagEdits.value[t.name] = { original: t.name, tagId: t.tag_id, dirty: false }
+}
+function exitEditMode() {
+  editMode.value = false
+  tagEdits.value = {}
+}
+/** 点 ×：划掉（待删除），再点恢复。 */
+function toggleTagDelete(name: string) {
+  const e = tagEdits.value[name]
+  if (e) e.deleted = !e.deleted
+}
+/** 编辑标签文本：有效修改（≠原名且非空）标记 dirty，无效则还原。 */
+function applyTagEdit(name: string, newName: string) {
+  const e = tagEdits.value[name]
+  if (!e) return
+  const trimmed = newName.trim()
+  const valid = trimmed !== '' && trimmed !== name
+  e.dirty = valid
+  e.newName = valid ? trimmed : undefined
+}
+function tagDisplayName(name: string): string {
+  const e = tagEdits.value[name]
+  return e?.newName || name
+}
+/** 生效修改：一次性提交删除 + 重命名（仅本图）。 */
+async function applyTagChanges() {
+  if (!image.value) return
+  const id = image.value.id
+  let ok = 0
+  try {
+    for (const e of Object.values(tagEdits.value)) {
+      if (e.deleted) {
+        await del(`/images/${id}/tags/${e.tagId}`)
+        ok++
+      } else if (e.dirty && e.newName) {
+        // 仅本图重命名 = 删旧标签 + 添加新文本标签
+        await del(`/images/${id}/tags/${e.tagId}`)
+        await post(`/images/${id}/tags`, { name: e.newName, category: 'general' })
+        ok++
+      }
+    }
+    ElMessage.success(`已生效 ${ok} 项修改`)
+    exitEditMode()
+    await loadDetail()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 onMounted(() => {
   loadDetail()
   window.addEventListener('keydown', onKeydown)
@@ -245,6 +399,14 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
 })
+
+/** 文件大小格式化。 */
+function fmtBytes(b: number): string {
+  if (b >= 1 << 30) return `${(b / (1 << 30)).toFixed(2)} GB`
+  if (b >= 1 << 20) return `${(b / (1 << 20)).toFixed(1)} MB`
+  if (b >= 1 << 10) return `${(b / (1 << 10)).toFixed(0)} KB`
+  return `${b} B`
+}
 </script>
 
 <template>
@@ -278,6 +440,10 @@ onUnmounted(() => {
 
     <div class="panel">
       <el-descriptions :column="1" title="基本信息" border>
+        <el-descriptions-item label="文件名">
+          <span class="file-name">{{ image.name }}</span>
+          <el-button size="small" text type="primary" style="margin-left: 8px" @click="renameImage">重命名</el-button>
+        </el-descriptions-item>
         <el-descriptions-item label="格式">{{ image.format?.toUpperCase() ?? (image.name.split('.').pop() ?? '').toUpperCase() }}</el-descriptions-item>
         <el-descriptions-item label="尺寸">{{ image.width }} × {{ image.height }}</el-descriptions-item>
         <el-descriptions-item label="清晰度">
@@ -288,9 +454,10 @@ onUnmounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="导入时间">{{ new Date(image.importedAt * 1000).toLocaleDateString() }}</el-descriptions-item>
         <el-descriptions-item label="原图链接">
-          <a v-if="image.sourceUrl" :href="image.sourceUrl" target="_blank" rel="noopener" class="src-link">{{ image.sourceUrl }}</a>
+          <a v-if="displaySourceUrl" :href="displaySourceUrl" target="_blank" rel="noopener" class="src-link">{{ displaySourceUrl }}</a>
           <span v-else class="muted">未溯源</span>
           <el-button size="small" text type="primary" style="margin-left: 8px" @click="editSourceUrl">编辑</el-button>
+          <el-button v-if="displaySourceUrl" size="small" text type="success" style="margin-left: 4px" @click="openCompare">对比原图</el-button>
         </el-descriptions-item>
         <el-descriptions-item label="状态">
           <el-tag v-if="image.isRedundant" type="warning">冗余候选</el-tag>
@@ -314,13 +481,58 @@ onUnmounted(() => {
           <el-button size="small" :type="aiChecked ? 'info' : 'warning'" plain @click="toggleAiMark">
             {{ aiChecked ? '取消 AI 标记' : '手动标记为 AI' }}
           </el-button>
+          <el-button
+            v-if="!editMode"
+            size="small"
+            type="success"
+            plain
+            style="margin-left: 8px"
+            @click="enterEditMode"
+          >
+            编辑模式
+          </el-button>
+          <template v-else>
+            <el-button size="small" type="success" style="margin-left: 8px" @click="applyTagChanges">
+              生效修改
+            </el-button>
+            <el-button size="small" plain @click="exitEditMode">取消</el-button>
+            <span class="hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</span>
+          </template>
         </div>
         <div v-if="hasAnyTags" class="tag-groups">
           <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
             <span v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0" class="tag-group-label">{{ g.label }}</span>
-            <el-tag v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name" class="tag" size="small" :type="g.type">
-              {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
-            </el-tag>
+            <template v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name">
+              <!-- 编辑模式：可编辑文本 + × 删除 + 还原 -->
+              <span
+                v-if="editMode"
+                class="tag-edit"
+                :class="{ deleted: tagEdits[t.name]?.deleted }"
+              >
+                <el-input
+                  :model-value="tagEdits[t.name]?.newName ?? t.name"
+                  size="small"
+                  class="tag-edit-input"
+                  @change="(v: string) => applyTagEdit(t.name, v)"
+                />
+                <span
+                  v-if="tagEdits[t.name]?.dirty && !tagEdits[t.name]?.deleted"
+                  class="tag-revert"
+                  title="还原文本（不还原删除状态）"
+                  @click="applyTagEdit(t.name, t.name)"
+                >↻</span>
+                <span
+                  class="tag-del"
+                  :class="{ armed: tagEdits[t.name]?.deleted }"
+                  :title="tagEdits[t.name]?.deleted ? '再点恢复' : '标记删除'"
+                  @click="toggleTagDelete(t.name)"
+                >✕</span>
+              </span>
+              <!-- 普通模式 -->
+              <el-tag v-else :key="t.name" class="tag" size="small" :type="g.type">
+                {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
+              </el-tag>
+            </template>
           </div>
         </div>
         <el-empty v-else description="暂无标签（可点击上方按钮读取 AI 生成信息）" :image-size="50" />
@@ -337,7 +549,45 @@ onUnmounted(() => {
       </div>
     </div>
   </div>
-  <el-empty v-else description="图片不存在或已删除" />
+
+  <!-- 对比原图弹窗：左=图库图，右=网络原图；红=网络大 绿=库大 白=相等 -->
+  <el-dialog v-model="compareVisible" title="对比原图" width="900px" :append-to-body="true">
+    <div v-loading="compareLoading" class="compare-body">
+      <div class="compare-side">
+        <div class="compare-side-title">图库原图</div>
+        <el-image :src="originalSrc" fit="contain" class="compare-img" />
+        <div class="compare-meta">
+          <div :class="pxColor">分辨率：{{ image?.width }} × {{ image?.height }}</div>
+          <div :class="sizeColor">文件大小：{{ fmtBytes(image?.sizeBytes ?? 0) }}</div>
+        </div>
+      </div>
+      <div class="compare-divider">vs</div>
+      <div class="compare-side">
+        <div class="compare-side-title">网络原图</div>
+        <template v-if="netInfo">
+          <el-image v-if="netInfo.file_url" :src="netInfo.file_url" fit="contain" class="compare-img" :preview-src-list="[netInfo.file_url]">
+            <template #error><span class="placeholder-name">网络图加载失败</span></template>
+          </el-image>
+          <div v-else class="compare-img placeholder-name">无网络图链接</div>
+          <div class="compare-meta">
+            <div :class="pxColor">
+              分辨率：{{ netInfo.width && netInfo.height ? `${netInfo.width} × ${netInfo.height}` : '未知' }}
+            </div>
+            <div :class="sizeColor">
+              文件大小：{{ netInfo.size_bytes != null ? fmtBytes(netInfo.size_bytes) : '未知' }}
+            </div>
+          </div>
+        </template>
+        <el-empty v-else-if="!compareLoading" description="无法获取网络图信息" :image-size="50" />
+      </div>
+    </div>
+    <template #footer>
+      <span class="hint" style="margin-right: auto">红色=网络图更大 绿色=图库图更大 白色=相等</span>
+      <el-button @click="compareVisible = false">保留图库原图</el-button>
+      <el-button type="primary" :disabled="!netInfo?.file_url" @click="keepNetwork">保留网络原图</el-button>
+    </template>
+  </el-dialog>
+  <el-empty v-if="!image" description="图片不存在或已删除" />
 </template>
 
 <style scoped>
@@ -549,5 +799,118 @@ onUnmounted(() => {
   word-break: break-all;
   max-height: 200px;
   overflow-y: auto;
+}
+
+/* 改进2：标签编辑模式 */
+.tag-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 4px 2px 0;
+  padding: 1px 4px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
+  transition: opacity 0.15s;
+}
+.tag-edit.deleted {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+.tag-edit-input {
+  width: 110px;
+}
+.tag-edit-input :deep(.el-input__wrapper) {
+  box-shadow: none;
+  padding: 0 6px;
+}
+.tag-del {
+  cursor: pointer;
+  color: var(--el-color-danger);
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px;
+  border-radius: 4px;
+  user-select: none;
+}
+.tag-del:hover {
+  background: var(--el-color-danger-light-7);
+}
+.tag-del.armed {
+  color: #fff;
+  background: var(--el-color-danger);
+}
+.tag-revert {
+  cursor: pointer;
+  color: var(--el-color-warning);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px;
+  border-radius: 4px;
+  user-select: none;
+}
+.tag-revert:hover {
+  background: var(--el-color-warning-light-7);
+}
+.hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-left: 8px;
+}
+
+/* 改进1：对比原图弹窗 */
+.file-name {
+  word-break: break-all;
+}
+.compare-body {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  min-height: 300px;
+}
+.compare-side {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.compare-side-title {
+  text-align: center;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.compare-img {
+  flex: 1;
+  min-height: 240px;
+  background: var(--el-fill-color-light);
+  border-radius: 6px;
+}
+.compare-img :deep(.el-image__inner) {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.compare-divider {
+  align-self: center;
+  font-weight: 700;
+  color: var(--el-text-color-secondary);
+}
+.compare-meta {
+  margin-top: 8px;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cmp-red {
+  color: var(--el-color-danger);
+  font-weight: 600;
+}
+.cmp-green {
+  color: var(--el-color-success);
+  font-weight: 600;
+}
+.cmp-white {
+  color: var(--el-text-color-primary);
 }
 </style>

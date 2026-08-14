@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use moevault_core::models::{ImageFilter, Page, SortKey, Stats, STATUS_ACTIVE};
@@ -28,6 +28,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/images/{id}/ai-info", post(read_ai_info))
         .route("/api/v1/images/{id}/mark-ai", post(mark_ai))
         .route("/api/v1/images/{id}/source-url", put(update_source_url))
+        .route("/api/v1/images/{id}/rename", put(rename_image))
+        .route("/api/v1/images/{id}/source-info", get(source_info))
+        .route("/api/v1/images/{id}/replace-from-url", post(replace_from_url))
+        .route("/api/v1/images/{id}/tags/{tag_id}", delete(remove_image_tag))
+        .route("/api/v1/images/{id}/tags", post(add_image_tag))
         .route("/api/v1/images/reprocess", post(reprocess_images))
 }
 
@@ -201,6 +206,7 @@ async fn update_source_url(
         .get("url")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
+        .map(|s| strip_json_suffix(&s)) // 存储时去掉 .json（API 链接→页面链接）
         .filter(|s| !s.is_empty());
     let db = state.db.clone();
     let url_for_db = url.clone();
@@ -242,6 +248,322 @@ async fn generate_sidecar(
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
 
     Ok(Json(json!({ "ok": true, "path": result })))
+}
+
+/// PUT /api/v1/images/{id}/rename：重命名库内图片文件。
+/// body `{ "name": "新名字.jpg" }`；保持哈希目录前缀不变，冲突即失败。
+async fn rename_image(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_response(ErrorKind::InvalidInput, "name 不能为空"))?;
+    // 校验：不能包含路径分隔符 / 反斜杠 / 冒号等
+    if name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+        return Err(error_response(ErrorKind::InvalidInput, "文件名包含非法字符"));
+    }
+    if name.len() > 200 {
+        return Err(error_response(ErrorKind::InvalidInput, "文件名过长"));
+    }
+    let db = state.db.clone();
+    let library_dir = state.library_dir();
+    let result = tokio::task::spawn_blocking(move || {
+        let img = db
+            .get_image_by_id(id)
+            .map_err(db_error_response)?
+            .ok_or_else(|| error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")))?;
+        // 取原 rel_path 的目录前缀（如 61/），新 rel_path = 前缀 + 新名字
+        let prefix = img
+            .rel_path
+            .rsplit_once(['/', '\\'])
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let new_rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let src = library_dir.join(&img.rel_path);
+        let dst = library_dir.join(&new_rel);
+        if dst.exists() {
+            return Err(error_response(
+                ErrorKind::InvalidInput,
+                format!("文件已存在: {name}"),
+            ));
+        }
+        std::fs::rename(&src, &dst).map_err(|e| {
+            error_response(ErrorKind::Internal, format!("文件改名失败: {e}"))
+        })?;
+        db.rename_image_file(id, &new_rel).map_err(db_error_response)?;
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(new_rel)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(json!({ "ok": true, "rel_path": result })))
+}
+
+/// 把 danbooru/gelbooru 的 .json API 链接转成页面链接（去掉 .json 后缀）。
+fn strip_json_suffix(url: &str) -> String {
+    let trimmed = url.trim_end();
+    if let Some(stripped) = trimmed.strip_suffix(".json") {
+        stripped.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// GET /api/v1/images/{id}/source-info：解析原图链接页面/API 获取网络图信息
+/// （分辨率 + 文件大小 + 网络图直链）。支持 danbooru / gelbooru。
+async fn source_info(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let img = tokio::task::spawn_blocking(move || db.get_image_by_id(id))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?
+        .ok_or_else(|| error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")))?;
+    let Some(url) = img.source_url.as_deref().filter(|u| !u.is_empty()) else {
+        return Err(error_response(ErrorKind::NotFound, "该图片没有原图链接"));
+    };
+    let page_url = strip_json_suffix(url);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("MoeVault/0.1")
+        .build()
+        .map_err(|e| error_response(ErrorKind::Internal, format!("HTTP 客户端构建失败: {e}")))?;
+    // 尝试解析帖子 id 并请求官方 API
+    let info = parse_remote_source_info(&client, &page_url).await;
+    Ok(Json(json!({
+        "ok": true,
+        "page_url": page_url,
+        "info": info,
+    })))
+}
+
+/// 解析网络来源信息：danbooru /posts/{id}.json、gelbooru dapi。
+async fn parse_remote_source_info(
+    client: &reqwest::Client,
+    page_url: &str,
+) -> Value {
+    let lower = page_url.to_lowercase();
+    // danbooru.donmai.us/posts/6019533
+    if lower.contains("danbooru.donmai.us") {
+        if let Some(pid) = extract_post_id(page_url) {
+            let api = format!("https://danbooru.donmai.us/posts/{pid}.json");
+            if let Ok(resp) = client.get(&api).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(post) = body.as_array().and_then(|a| a.first()) {
+                        let fw = post.get("image_width").and_then(|v| v.as_i64());
+                        let fh = post.get("image_height").and_then(|v| v.as_i64());
+                        let fs = post.get("file_size").and_then(|v| v.as_i64());
+                        let file_url = post.get("file_url").and_then(|v| v.as_str()).map(String::from);
+                        if fw.is_some() || fs.is_some() {
+                            return json!({
+                                "width": fw, "height": fh, "size_bytes": fs, "file_url": file_url,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // gelbooru.com/index.php?page=dapi&s=post&q=index ... id=xxx
+    if lower.contains("gelbooru.com") {
+        if let Some(pid) = extract_post_id(page_url) {
+            let api = format!("https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&id={pid}");
+            if let Ok(resp) = client.get(&api).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(post) = body
+                        .pointer("/post")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                    {
+                        let fw = post.get("image_width").and_then(|v| v.as_i64());
+                        let fh = post.get("image_height").and_then(|v| v.as_i64());
+                        let fs = post.get("image_size").and_then(|v| v.as_i64());
+                        let file_url = post.get("file_url").and_then(|v| v.as_str()).map(String::from);
+                        if fw.is_some() || fs.is_some() {
+                            return json!({
+                                "width": fw, "height": fh, "size_bytes": fs, "file_url": file_url,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    json!({ "width": null, "height": null, "size_bytes": null, "file_url": null })
+}
+
+/// 从 URL 中提取帖子 id（/posts/6019533 或 ?id=6019533）。
+fn extract_post_id(url: &str) -> Option<String> {
+    // /posts/6019533
+    if let Some(idx) = url.find("/posts/") {
+        let rest = &url[idx + "/posts/".len()..];
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    // ?id=6019533
+    if let Some(idx) = url.find("id=") {
+        let rest = &url[idx + 3..];
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// POST /api/v1/images/{id}/replace-from-url：下载网络原图替换库内文件。
+/// body `{ "url": "网络图直链" }`；重新哈希入库（保持 id），更新尺寸/格式/缩略图，
+/// 旧文件删除；标签/评分/来源链接保留。
+async fn replace_from_url(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let url = req
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_response(ErrorKind::InvalidInput, "url 不能为空"))?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(error_response(ErrorKind::InvalidInput, "url 必须是 http(s) 链接"));
+    }
+    let db = state.db.clone();
+    let library_dir = state.library_dir();
+    let thumbs_dir = state.thumbs_dir();
+    let result = tokio::task::spawn_blocking(move || {
+        // 1. 取原图记录
+        let img = db
+            .get_image_by_id(id)
+            .map_err(db_error_response)?
+            .ok_or_else(|| error_response(ErrorKind::NotFound, format!("图片 {id} 不存在")))?;
+        let old_path = library_dir.join(&img.rel_path);
+        // 2. 同步下载（reqwest block）
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent("MoeVault/0.1")
+            .build()
+            .map_err(|e| error_response(ErrorKind::Internal, format!("HTTP 客户端构建失败: {e}")))?;
+        let bytes = client
+            .get(&url)
+            .send()
+            .map_err(|e| error_response(ErrorKind::Internal, format!("下载失败: {e}")))?
+            .bytes()
+            .map_err(|e| error_response(ErrorKind::Internal, format!("读取下载内容失败: {e}")))?;
+        if bytes.is_empty() {
+            return Err(error_response(ErrorKind::InvalidInput, "下载内容为空"));
+        }
+        // 3. 解码验证 + 嗅探格式
+        let format_guess = image::guess_format(&bytes).map_err(|e| {
+            error_response(ErrorKind::InvalidInput, format!("下载内容不是有效图片: {e}"))
+        })?;
+        let ext = match format_guess {
+            image::ImageFormat::Png => "png",
+            image::ImageFormat::Jpeg => "jpg",
+            image::ImageFormat::WebP => "webp",
+            image::ImageFormat::Gif => "gif",
+            image::ImageFormat::Bmp => "bmp",
+            _ => return Err(error_response(ErrorKind::InvalidInput, "不支持的图片格式")),
+        };
+        let decoded = image::load_from_memory(&bytes)
+            .map_err(|e| error_response(ErrorKind::InvalidInput, format!("图片解码失败: {e}")))?;
+        let (w, h) = (decoded.width(), decoded.height());
+        // 4. 重新哈希 → 新分片路径
+        use md5::Digest;
+        let digest = md5::Md5::digest(&bytes);
+        let md5_hex = format!("{digest:x}");
+        let prefix = &md5_hex[..md5_hex.len().min(2)];
+        let new_rel = format!("{prefix}/{md5_hex}.{ext}");
+        let new_path = library_dir.join(&new_rel);
+        // 5. 写新文件（若与旧文件同路径则直接覆盖）
+        std::fs::write(&new_path, &bytes)
+            .map_err(|e| error_response(ErrorKind::Internal, format!("写入新文件失败: {e}")))?;
+        // 6. 删旧文件（若非同一路径）
+        if new_path != old_path {
+            let _ = std::fs::remove_file(&old_path);
+        }
+        // 7. 重新生成缩略图
+        let thumb_rel = format!("{prefix}/{md5_hex}.webp");
+        let thumb_path = thumbs_dir.join(&thumb_rel);
+        moevault_ingest::importer::generate_thumbnail(&new_path, &thumb_path);
+        // 8. 更新库记录
+        db.replace_image_file(id, &md5_hex, &new_rel, w, h, ext, bytes.len() as i64)
+            .map_err(db_error_response)?;
+        Ok::<_, (axum::http::StatusCode, Json<Value>)>(json!({
+            "ok": true,
+            "md5": md5_hex,
+            "rel_path": new_rel,
+            "width": w,
+            "height": h,
+            "format": ext,
+            "size_bytes": bytes.len(),
+            "thumb_rel": thumb_rel,
+        }))
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+    Ok(Json(result))
+}
+
+/// DELETE /api/v1/images/{id}/tags/{tag_id}：从本图移除标签（仅本图）。
+async fn remove_image_tag(
+    State(state): State<AppState>,
+    Path((id, tag_id)): Path<(i64, i64)>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.remove_image_tag(id, tag_id))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /api/v1/images/{id}/tags：给本图添加标签（source=manual）。
+/// body `{ "name": "1girl", "category": "general" }`（category 可选，默认 general）。
+async fn add_image_tag(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| error_response(ErrorKind::InvalidInput, "name 不能为空"))?;
+    if name.len() > 100 {
+        return Err(error_response(ErrorKind::InvalidInput, "标签名过长"));
+    }
+    let category = req
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "general".to_string());
+    let db = state.db.clone();
+    let tag_id = tokio::task::spawn_blocking(move || db.add_image_tag(id, &name, &category))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(db_error_response)?;
+    Ok(Json(json!({ "ok": true, "tag_id": tag_id })))
 }
 
 #[derive(Debug, Deserialize)]

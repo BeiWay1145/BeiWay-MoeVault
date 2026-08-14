@@ -209,7 +209,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), IngestError> {
 }
 
 /// 生成 512px WebP 缩略图（best-effort：失败仅告警，不阻塞入库）。
-fn generate_thumbnail(src: &Path, dst: &Path) {
+pub fn generate_thumbnail(src: &Path, dst: &Path) {
     let result = (|| -> Result<(), IngestError> {
         // 按文件头嗅探解码（修复 jpg 实际是 PNG 时缩略图失败）
         let img = crate::features::decode_image(src)?;

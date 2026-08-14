@@ -113,11 +113,13 @@ impl crate::InferClient {
         struct Req<'a> {
             path: &'a str,
         }
+        // 传绝对路径（推理服务 cwd 与后端不同，相对路径会 404）
+        let abs_path = crate::pipeline::to_absolute_path(path)?;
         let resp = self
             .http()
             .post(format!("{}/infer/aesthetic", self.base_url))
             .json(&Req {
-                path: &path.to_string_lossy(),
+                path: &abs_path,
             })
             .send()
             .await?;

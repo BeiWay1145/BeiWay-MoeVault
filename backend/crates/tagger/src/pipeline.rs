@@ -102,11 +102,14 @@ impl InferClient {
         struct TagResp {
             tags: Vec<TagItem>,
         }
+        // 传绝对路径：推理服务（python）cwd 与后端不同，
+        // 相对路径（data\library\...）会导致「文件不存在」404。
+        let abs_path = to_absolute_path(path)?;
         let resp = self
             .http
             .post(format!("{}/infer/tags", self.base_url))
             .json(&Req {
-                path: &path.to_string_lossy(),
+                path: &abs_path,
                 threshold,
             })
             .send()
@@ -278,7 +281,7 @@ async fn tag_one(
     let has_content_tag = tags_now.iter().any(|t| t.source != "ai");
     if img.ai_metadata.is_some() || tags_now.iter().any(|t| t.source == "ai") {
         if has_content_tag {
-            info!(image_id, "AI 图已有内容标签，跳过打标");
+            info!(image_id, "AI 图已用 prompt 内容标签，无需打标");
             return Ok(());
         }
         // 无内容标签：先尝试提取 prompt 标签（仅当尚无 source=ai 标签时，避免重复）
@@ -638,4 +641,23 @@ async fn apply_local_tags(
     db.set_image_source(image_id, "local", None)?;
     info!(image_id, tag_count = tags.len(), "本地打标成功");
     Ok(())
+}
+
+/// 把路径转为绝对路径（用于传给推理服务等跨进程消费方）。
+/// 相对路径基于后端 cwd 解析；文件不存在时 canonicalize 失败则回退 current_dir join。
+pub(crate) fn to_absolute_path(path: &Path) -> Result<String, TaggerError> {
+    use std::path::PathBuf;
+    let abs: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    // canonicalize 解析 .. / 符号链接，但要求文件存在；失败则用未解析的绝对路径
+    Ok(abs
+        .canonicalize()
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .into_owned())
 }

@@ -1215,6 +1215,54 @@ impl Db {
         Ok(())
     }
 
+    /// 重命名库内图片：更新 rel_path（文件名部分改为新名字，哈希目录前缀不变）。
+    /// 物理改名由调用方完成；此处只校验新文件名格式并写库。
+    pub fn rename_image_file(&self, image_id: i64, new_rel_path: &str) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET rel_path = ?2 WHERE id = ?1",
+            params![image_id, new_rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// 图片被网络图替换后更新文件相关信息（md5/rel_path/尺寸/格式/大小）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_image_file(
+        &self,
+        image_id: i64,
+        md5: &str,
+        rel_path: &str,
+        width: u32,
+        height: u32,
+        format: &str,
+        size_bytes: i64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE images SET md5 = ?2, rel_path = ?3, width = ?4, height = ?5, format = ?6, size_bytes = ?7 WHERE id = ?1",
+            params![image_id, md5, rel_path, width, height, format, size_bytes],
+        )?;
+        Ok(())
+    }
+
+    /// 从本图移除指定标签关联（仅本图，其他图不受影响）。
+    pub fn remove_image_tag(&self, image_id: i64, tag_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2",
+            params![image_id, tag_id],
+        )?;
+        Ok(())
+    }
+
+    /// 给本图添加一个标签（upsert 标签记录 + 关联本图，source=manual）。
+    pub fn add_image_tag(&self, image_id: i64, name: &str, category: &str) -> Result<i64, DbError> {
+        let tag_id = self.upsert_tag(name, category)?;
+        self.insert_image_tags(image_id, &[(tag_id, None)], "manual")?;
+        Ok(tag_id)
+    }
+
     /// 写入美学评分。
     pub fn set_aesthetic_score(&self, image_id: i64, score: f64) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();

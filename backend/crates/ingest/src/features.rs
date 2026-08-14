@@ -237,12 +237,16 @@ pub fn read_ai_metadata(path: &Path) -> Option<AiMetadata> {
 }
 
 /// 从 prompt 文本提取有效 tag。
-/// 逗号分隔；忽略 `artist:xxx` 前缀；忽略质量黑名单；去空白。
+/// 逗号分隔；忽略 `artist:xxx` 前缀；忽略质量黑名单；忽略生图语法
+/// （`<lora:...>` `<embedding:...>` `<lyco:...>` `<hypernet:...>` 等尖括号块）；
+/// 忽略空段与 `BREAK` 等控制词；去空白。
 pub fn extract_prompt_tags(prompt: &str) -> Vec<String> {
     prompt
         .split(',')
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
+        .filter(|t| !t.contains('<') && !t.contains('>')) // 生图语法块（lora/embedding/lyco/hypernet）
+        .filter(|t| !t.eq_ignore_ascii_case("BREAK")) // ComfyUI/ADetailer 段分隔
         .filter(|t| !t.to_lowercase().starts_with("artist:"))
         .filter(|t| !is_quality_tag(t))
         .map(|t| t.to_string())
@@ -365,5 +369,18 @@ mod tests {
         let dyn_img = decode_image(&path).expect("decode_image 应能解 jpg 扩展名的 PNG 内容");
         assert_eq!(dyn_img.dimensions(), (64, 48));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_prompt_tags_filters_generation_syntax() {
+        // 回归：<lora:...> 等生图语法不应被当作正面标签
+        let prompt = "1girl, blue_archive, <lora:EMS-1038199-EMS.safetensors:0.300000>, masterpiece, <embedding:bad-hands>, BREAK, artist:someone, very aesthetic";
+        let tags = extract_prompt_tags(prompt);
+        assert!(!tags.iter().any(|t| t.contains("lora")), "不应包含 lora 语法: {tags:?}");
+        assert!(!tags.iter().any(|t| t.contains("embedding")), "不应包含 embedding 语法: {tags:?}");
+        assert!(!tags.iter().any(|t| t.eq_ignore_ascii_case("BREAK")), "不应包含 BREAK: {tags:?}");
+        assert!(!tags.iter().any(|t| t.contains("masterpiece")), "不应包含质量词: {tags:?}");
+        assert!(!tags.iter().any(|t| t.contains("artist:")), "不应包含 artist 前缀: {tags:?}");
+        assert_eq!(tags, vec!["1girl", "blue_archive"], "应只剩有效标签: {tags:?}");
     }
 }
