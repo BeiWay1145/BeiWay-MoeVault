@@ -33,15 +33,18 @@ const originalSrc = computed(() => {
 
 /** 改进2：切换图片时旧图保留，新图加载完成后淡入（避免灰色闪烁）。 */
 const imgLoaded = ref(true)
+/** 当前已加载完成显示的图片 id（用于追踪旧图，避免 AB 串图）。 */
+const loadedImgId = ref<number | null>(null)
 function onStageImgLoad() {
   imgLoaded.value = true
+  if (image.value) loadedImgId.value = image.value.id
 }
-// 路由参数变化（切换图片）→ 新图未加载完成前保留旧图
+// 路由参数变化（切换图片）→ 新图未加载完成前保留旧图（旧图 = 已加载的那张）
 watch(
   () => route.params.id,
   (newId, oldId) => {
-    // 记住旧图的 src（新图加载前显示）
-    if (oldId) prevSrc.value = originalUrl(Number(oldId))
+    // 已加载完成的图（loadedImgId）才是旧图；仅记住真正的已显示图
+    prevSrc.value = loadedImgId.value != null ? originalUrl(loadedImgId.value) : undefined
     imgLoaded.value = false
   },
 )

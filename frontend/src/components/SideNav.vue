@@ -57,10 +57,14 @@ function onMouseEnter() {
 }
 function onMouseLeave() {
   if (hoverTimer !== undefined) window.clearTimeout(hoverTimer)
-  // 悬停展开后离开 → 延迟收回
-  leaveTimer = window.setTimeout(() => {
-    collapsed.value = true
-  }, 300)
+  // 仅悬停自动展开开启时，离开才收回；关闭时侧边栏保持手动展开状态（只有按钮能收起）
+  if (hoverExpand.value) {
+    leaveTimer = window.setTimeout(() => {
+      collapsed.value = true
+    }, 300)
+  } else if (leaveTimer !== undefined) {
+    window.clearTimeout(leaveTimer)
+  }
 }
 onUnmounted(() => {
   if (hoverTimer !== undefined) window.clearTimeout(hoverTimer)
