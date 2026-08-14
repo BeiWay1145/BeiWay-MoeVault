@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   DataAnalysis,
@@ -24,7 +24,7 @@ const settingsStore = useSettingsStore()
 const SIDEBAR_KEY = 'moevault-sidebar-collapsed'
 const collapsed = ref(false)
 
-// 悬停自动展开（通用设置可配，默认开）
+// 悬停自动展开（通用设置可配，默认开）——响应式：设置变化即时生效
 const hoverExpand = ref(true)
 let hoverTimer: number | undefined
 let leaveTimer: number | undefined
@@ -38,6 +38,19 @@ onMounted(async () => {
   await settingsStore.load().catch(() => {})
   hoverExpand.value = settingsStore.settings.sidebar_hover_expand
 })
+
+// 设置页修改悬停展开 → 即时生效（无需重启前端）
+watch(
+  () => settingsStore.settings.sidebar_hover_expand,
+  (v) => {
+    hoverExpand.value = v
+    // 关闭悬停展开时清理待执行的收起定时器，避免误收起
+    if (!v && leaveTimer !== undefined) {
+      window.clearTimeout(leaveTimer)
+      leaveTimer = undefined
+    }
+  },
+)
 
 function toggleCollapse() {
   collapsed.value = !collapsed.value

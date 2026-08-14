@@ -597,11 +597,17 @@ function fmtBytes(b: number): string {
       <div v-if="fullscreen" class="fullscreen" @click="fullscreen = false">
         <button class="fs-close" title="退出全屏" @click.stop="fullscreen = false">✕</button>
         <button class="fs-arrow left" title="上一张" @click.stop="gotoImage(-1)">‹</button>
-        <el-image :src="originalSrc" fit="contain" class="fs-img" @click.stop>
-          <template #error>
-            <span class="placeholder-name">原图加载失败</span>
-          </template>
-        </el-image>
+        <!-- 全屏大图：与普通视图一致——旧图保留 + 新图缓存命中淡入（避免灰闪） -->
+        <el-image v-show="!imgLoaded && !!prevSrc" :src="prevSrc" fit="contain" class="fs-img prev-img" @click.stop />
+        <el-image
+          v-show="imgLoaded"
+          :key="image.id"
+          :src="originalSrc"
+          fit="contain"
+          class="fs-img"
+          :class="{ 'img-fade-in': imgLoaded }"
+          @click.stop
+        />
         <button class="fs-arrow right" title="下一张" @click.stop="gotoImage(1)">›</button>
       </div>
     </Transition>
@@ -931,6 +937,11 @@ function fmtBytes(b: number): string {
   width: 100%;
   height: 100%;
   cursor: zoom-out;
+}
+/* 全屏大图：旧图叠加在新图下（切换过渡） */
+.fs-img.prev-img {
+  position: absolute;
+  inset: 0;
 }
 .fs-close {
   position: absolute;
