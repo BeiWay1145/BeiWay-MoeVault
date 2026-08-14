@@ -39,6 +39,11 @@ function onStageImgLoad() {
   imgLoaded.value = true
   if (image.value) loadedImgId.value = image.value.id
 }
+/** 新图加载失败：也恢复显示（避免一直停留在旧图）。 */
+function onStageImgError() {
+  imgLoaded.value = true
+  if (image.value) loadedImgId.value = image.value.id
+}
 // 路由参数变化（切换图片）→ 新图未加载完成前保留旧图（旧图 = 已加载的那张）
 watch(
   () => route.params.id,
@@ -536,24 +541,29 @@ function fmtBytes(b: number): string {
       <button class="nav-close" title="返回" @click="goBack">✕</button>
       <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
       <div ref="stageRef" class="stage" @click="enterFullscreen">
-        <!-- 旧图：新图加载完成前保持显示（避免灰色闪烁） -->
-        <el-image v-if="!imgLoaded" :src="prevSrc" fit="contain" class="stage-img prev-img" />
-        <!-- 新图：加载完成后淡入覆盖 -->
-        <Transition name="fade">
-          <el-image
-            v-if="imgLoaded"
-            :key="image.id"
-            :src="originalSrc"
-            fit="contain"
-            class="stage-img"
-            :preview-src-list="[]"
-            @load="onStageImgLoad"
-          >
-            <template #error>
-              <span class="placeholder-name">原图加载失败</span>
-            </template>
-          </el-image>
-        </Transition>
+        <!-- 旧图：新图加载完成前保持显示（v-show 不卸载；无旧图时隐藏） -->
+        <el-image
+          v-show="!imgLoaded && !!prevSrc"
+          :src="prevSrc"
+          fit="contain"
+          class="stage-img prev-img"
+        />
+        <!-- 新图：始终渲染（v-show 而非 v-if，确保加载时能触发 @load），加载完成淡入 -->
+        <el-image
+          v-show="imgLoaded"
+          :key="image.id"
+          :src="originalSrc"
+          fit="contain"
+          class="stage-img"
+          :class="{ 'img-fade-in': imgLoaded }"
+          :preview-src-list="[]"
+          @load="onStageImgLoad"
+          @error="onStageImgError"
+        >
+          <template #error>
+            <span class="placeholder-name">原图加载失败</span>
+          </template>
+        </el-image>
       </div>
       <button class="nav-arrow right" title="下一张" @click="gotoImage(1)">›</button>
     </div>
@@ -802,14 +812,17 @@ function fmtBytes(b: number): string {
   position: absolute;
   inset: 0;
 }
-.fade-enter-active {
-  transition: opacity 0.25s ease;
+/* 切换图片：新图加载完成（v-show 显示）时淡入 */
+.img-fade-in {
+  animation: imgFade 0.25s ease;
 }
-.fade-enter-from {
-  opacity: 0;
-}
-.fade-leave-active {
-  display: none;
+@keyframes imgFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 .nav-close {
   position: absolute;
