@@ -3,13 +3,12 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDedupStore } from '@/stores/dedup'
 import { useTaskStore } from '@/stores/tasks'
-import { useLibraryStore, thumbUrl } from '@/stores/library'
+import { thumbUrl } from '@/stores/library'
 import { get } from '@/api/client'
 
 const router = useRouter()
 const dedupStore = useDedupStore()
 const taskStore = useTaskStore()
-const libraryStore = useLibraryStore()
 
 // 真实统计（/api/v1/stats + /tagging/stats）
 const totalImages = ref(0)
@@ -17,6 +16,9 @@ const monthImported = ref(0)
 const avgAesthetic = ref('—')
 const untaggedCount = ref(0)
 const runningTasks = ref(0)
+
+// 最近导入（独立局部数据，避免污染全局 library store——否则切到总览会把画廊数据覆盖成 12 张）
+const recentImages = ref<Array<{ id: number; name: string; thumbRel: string }>>([])
 
 onMounted(async () => {
   // 总览统计（/api/v1/stats 含平均美学分/本月导入）
@@ -45,7 +47,17 @@ onMounted(async () => {
   }
   taskStore.load()
   runningTasks.value = taskStore.running
-  libraryStore.fetchImages(12).catch(() => {})
+  // 最近导入：直接调 API 取最近 12 张（不写全局 store）
+  try {
+    const d = await get<{ items: Array<Record<string, unknown>> }>('/images?limit=12&sort=imported&order=desc')
+    recentImages.value = (d.items ?? []).map((it) => ({
+      id: it.id as number,
+      name: decodeURIComponent(((it.rel_path as string) ?? '').split(/[\\/]/).pop() ?? ''),
+      thumbRel: (it.thumb_rel as string) ?? '',
+    }))
+  } catch {
+    /* 静默 */
+  }
 })
 
 const quickLinks = [
@@ -114,7 +126,7 @@ const quickLinks = [
 
     <el-card class="block" header="最近导入">
       <div class="recent">
-        <el-tooltip v-for="img in libraryStore.images.slice(0, 12)" :key="img.id" :content="img.name">
+        <el-tooltip v-for="img in recentImages" :key="img.id" :content="img.name">
           <el-image
             class="recent-thumb"
             :src="thumbUrl(img.thumbRel)"

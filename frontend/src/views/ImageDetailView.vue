@@ -807,6 +807,12 @@ function fmtBytes(b: number): string {
   height: 100%;
   object-fit: contain;
 }
+/* BUG1：el-image 加载中默认浅灰占位 → 改为透明（露出黑色 stage），暗色模式不刺眼 */
+.stage-img :deep(.el-image__placeholder),
+.stage-img :deep(.el-image__error) {
+  background: transparent;
+  color: var(--el-text-color-secondary);
+}
 /* 改进2：切换图片过渡——旧图保持，新图淡入 */
 .stage-img.prev-img {
   position: absolute;

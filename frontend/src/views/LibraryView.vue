@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Grid, List, Close, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -65,18 +65,32 @@ onMounted(async () => {
   restorePos()
 })
 
-/** 恢复滚动位置：定位到上次查看详情的图片附近。 */
+// keep-alive 激活（从其他板块切回 / 从详情页返回）：重新拉取数据
+// （keep-alive 缓存组件时 onMounted 不会再次触发，需 onActivated 刷新）
+onActivated(async () => {
+  await fetchPage().catch((e: Error) => ElMessage.error(e.message))
+  await nextTick()
+  // 从详情页返回：恢复上次浏览位置；从其他板块切回：回到顶部
+  const restored = restorePos()
+  if (!restored) {
+    const scroller = document.querySelector('.app-main')
+    if (scroller) scroller.scrollTop = 0
+  }
+})
+
+/** 恢复滚动位置：定位到上次查看详情的图片附近。返回是否成功恢复。 */
 function restorePos() {
   const pos = library.restoreDetailPos('library')
-  if (!pos) return
+  if (!pos) return false
   const el = document.querySelector<HTMLElement>(`.app-main [data-image-id="${pos.imageId}"]`)
   if (el) {
     el.scrollIntoView({ block: 'center' })
-    return
+    return true
   }
   // 图片不在当前列表（可能已删除/筛选变化）：按比例恢复滚动
   const scroller = document.querySelector('.app-main')
   if (scroller && pos.scrollTop > 0) scroller.scrollTop = pos.scrollTop
+  return true
 }
 
 const viewOptions: { key: ViewMode; icon: typeof Grid; label: string }[] = [

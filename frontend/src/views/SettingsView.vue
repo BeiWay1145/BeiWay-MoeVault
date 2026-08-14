@@ -347,6 +347,18 @@ onMounted(async () => {
             <el-switch v-model="settings.settings.sidebar_hover_expand" active-text="开启" inactive-text="关闭" />
             <span class="hint">侧边栏收起后，鼠标悬停自动展开（默认开启）</span>
           </el-form-item>
+          <el-form-item label="分页模式">
+            <el-switch v-model="settings.settings.pagination_enabled" active-text="开启" inactive-text="关闭" />
+            <span class="hint">开启后图库按每页固定条数分页（适合低配置 PC），关闭则一次加载全部</span>
+          </el-form-item>
+          <el-form-item v-if="settings.settings.pagination_enabled" label="每页条数">
+            <el-select v-model="settings.settings.page_size" style="width: 120px">
+              <el-option :value="25" label="25" />
+              <el-option :value="50" label="50" />
+              <el-option :value="75" label="75" />
+              <el-option :value="100" label="100" />
+            </el-select>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onActivated, onMounted, ref } from 'vue'
 import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useLibraryStore, type ImageItem } from '@/stores/library'
@@ -45,17 +45,29 @@ onMounted(async () => {
   restorePos()
 })
 
+// keep-alive 激活（从其他板块切回 / 从详情页返回）：重新拉取数据
+onActivated(async () => {
+  await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
+  await nextTick()
+  const restored = restorePos()
+  if (!restored) {
+    const scroller = document.querySelector('.app-main')
+    if (scroller) scroller.scrollTop = 0
+  }
+})
+
 /** 恢复滚动位置。 */
 function restorePos() {
   const pos = library.restoreDetailPos('search')
-  if (!pos) return
+  if (!pos) return false
   const el = document.querySelector<HTMLElement>(`.app-main [data-image-id="${pos.imageId}"]`)
   if (el) {
     el.scrollIntoView({ block: 'center' })
-    return
+    return true
   }
   const scroller = document.querySelector('.app-main')
   if (scroller && pos.scrollTop > 0) scroller.scrollTop = pos.scrollTop
+  return true
 }
 
 const selectedCount = computed(() => library.selected.size)
