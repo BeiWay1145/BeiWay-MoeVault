@@ -348,6 +348,7 @@ async fn source_info(
 }
 
 /// 解析网络来源信息：danbooru /posts/{id}.json、gelbooru dapi。
+/// danbooru 返回单个 JSON 对象；gelbooru dapi 返回 `{"post": [...]}`。
 async fn parse_remote_source_info(
     client: &reqwest::Client,
     page_url: &str,
@@ -359,11 +360,20 @@ async fn parse_remote_source_info(
             let api = format!("https://danbooru.donmai.us/posts/{pid}.json");
             if let Ok(resp) = client.get(&api).send().await {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    if let Some(post) = body.as_array().and_then(|a| a.first()) {
+                    // 兼容：单个对象 或 数组（取第一个）
+                    let post = body.as_object().map(|_| &body)
+                        .or_else(|| body.as_array().and_then(|a| a.first()));
+                    if let Some(post) = post {
                         let fw = post.get("image_width").and_then(|v| v.as_i64());
                         let fh = post.get("image_height").and_then(|v| v.as_i64());
                         let fs = post.get("file_size").and_then(|v| v.as_i64());
-                        let file_url = post.get("file_url").and_then(|v| v.as_str()).map(String::from);
+                        // 原图直链优先，缺失回退大图/缩略图
+                        let file_url = post
+                            .get("file_url")
+                            .or_else(|| post.get("large_file_url"))
+                            .or_else(|| post.get("sample_url"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                         if fw.is_some() || fs.is_some() {
                             return json!({
                                 "width": fw, "height": fh, "size_bytes": fs, "file_url": file_url,
@@ -388,7 +398,11 @@ async fn parse_remote_source_info(
                         let fw = post.get("image_width").and_then(|v| v.as_i64());
                         let fh = post.get("image_height").and_then(|v| v.as_i64());
                         let fs = post.get("image_size").and_then(|v| v.as_i64());
-                        let file_url = post.get("file_url").and_then(|v| v.as_str()).map(String::from);
+                        let file_url = post
+                            .get("file_url")
+                            .or_else(|| post.get("sample_url"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                         if fw.is_some() || fs.is_some() {
                             return json!({
                                 "width": fw, "height": fh, "size_bytes": fs, "file_url": file_url,

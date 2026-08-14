@@ -17,6 +17,7 @@ const BACKEND_PORT: u16 = 9178;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .plugin(tauri_plugin_opener::init())
     .on_window_event(|window, event| {
       // 关闭窗口：根据后端设置 close_to_tray 决定 最小化到托盘 or 正常退出
       if let WindowEvent::CloseRequested { api, .. } = event {

@@ -263,6 +263,21 @@ const displaySourceUrl = computed(() =>
   image.value?.sourceUrl ? image.value.sourceUrl.replace(/\.json$/, '') : undefined,
 )
 
+/** BUG2：点击原图链接 → 桌面壳用系统浏览器打开；浏览器环境 fallback window.open。 */
+async function openSourceUrl(url: string) {
+  const tauri = (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
+  if (tauri) {
+    try {
+      const { openUrl } = await import('@tauri-apps/plugin-opener')
+      await openUrl(url)
+      return
+    } catch {
+      /* 插件调用失败 fallback */
+    }
+  }
+  window.open(url, '_blank', 'noopener')
+}
+
 // ---- 对比原图（图库图 vs 网络原图） ----
 const compareVisible = ref(false)
 const compareLoading = ref(false)
@@ -339,22 +354,40 @@ interface TagEdit {
   dirty: boolean
 }
 const tagEdits = ref<Record<string, TagEdit>>({})
+/** 正在编辑（显示输入框）的标签名。 */
+const editingName = ref<string | null>(null)
+/** 新增标签（分类 → 临时新标签列表；key 用自增 id）。 */
+interface NewTag {
+  key: number
+  category: string
+  value: string
+}
+const newTags = ref<NewTag[]>([])
+let newTagSeq = 0
 
 function enterEditMode() {
   editMode.value = true
   tagEdits.value = {}
+  newTags.value = []
   for (const t of tags.value) tagEdits.value[t.name] = { original: t.name, tagId: t.tag_id, dirty: false }
 }
 function exitEditMode() {
   editMode.value = false
   tagEdits.value = {}
+  newTags.value = []
+  editingName.value = null
 }
 /** 点 ×：划掉（待删除），再点恢复。 */
 function toggleTagDelete(name: string) {
   const e = tagEdits.value[name]
   if (e) e.deleted = !e.deleted
 }
-/** 编辑标签文本：有效修改（≠原名且非空）标记 dirty，无效则还原。 */
+/** 点标签本体：进入编辑（显示输入框，自动聚焦）。 */
+function startEditTag(name: string) {
+  if (!editMode.value) return
+  editingName.value = name
+}
+/** 输入变更：有效修改（≠原名且非空）标记 dirty。 */
 function applyTagEdit(name: string, newName: string) {
   const e = tagEdits.value[name]
   if (!e) return
@@ -363,11 +396,25 @@ function applyTagEdit(name: string, newName: string) {
   e.dirty = valid
   e.newName = valid ? trimmed : undefined
 }
-function tagDisplayName(name: string): string {
-  const e = tagEdits.value[name]
-  return e?.newName || name
+/** 失焦/回车：退出当前编辑。 */
+function stopEditTag() {
+  editingName.value = null
 }
-/** 生效修改：一次性提交删除 + 重命名（仅本图）。 */
+/** 新增标签：点蓝色 + 号，加入该分类的空标签输入框。 */
+function addNewTag(category: string) {
+  newTags.value.push({ key: ++newTagSeq, category, value: '' })
+}
+function applyNewTagEdit(key: number, v: string) {
+  const t = newTags.value.find((x) => x.key === key)
+  if (t) t.value = v
+}
+function removeNewTag(key: number) {
+  newTags.value = newTags.value.filter((x) => x.key !== key)
+}
+function newTagsOf(category: string): NewTag[] {
+  return newTags.value.filter((x) => x.category === category)
+}
+/** 生效修改：一次性提交删除 + 重命名 + 新增（仅本图；空白新增自动丢弃）。 */
 async function applyTagChanges() {
   if (!image.value) return
   const id = image.value.id
@@ -383,6 +430,13 @@ async function applyTagChanges() {
         await post(`/images/${id}/tags`, { name: e.newName, category: 'general' })
         ok++
       }
+    }
+    // 新增标签：空白自动丢弃
+    for (const t of newTags.value) {
+      const name = t.value.trim()
+      if (!name) continue
+      await post(`/images/${id}/tags`, { name, category: t.category })
+      ok++
     }
     ElMessage.success(`已生效 ${ok} 项修改`)
     exitEditMode()
@@ -454,7 +508,12 @@ function fmtBytes(b: number): string {
         </el-descriptions-item>
         <el-descriptions-item label="导入时间">{{ new Date(image.importedAt * 1000).toLocaleDateString() }}</el-descriptions-item>
         <el-descriptions-item label="原图链接">
-          <a v-if="displaySourceUrl" :href="displaySourceUrl" target="_blank" rel="noopener" class="src-link">{{ displaySourceUrl }}</a>
+          <a
+            v-if="displaySourceUrl"
+            :href="displaySourceUrl"
+            class="src-link"
+            @click.prevent="openSourceUrl(displaySourceUrl)"
+          >{{ displaySourceUrl }}</a>
           <span v-else class="muted">未溯源</span>
           <el-button size="small" text type="primary" style="margin-left: 8px" @click="editSourceUrl">编辑</el-button>
           <el-button v-if="displaySourceUrl" size="small" text type="success" style="margin-left: 4px" @click="openCompare">对比原图</el-button>
@@ -499,39 +558,69 @@ function fmtBytes(b: number): string {
             <span class="hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</span>
           </template>
         </div>
-        <div v-if="hasAnyTags" class="tag-groups">
+        <div v-if="hasAnyTags || editMode" class="tag-groups">
           <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
-            <span v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0" class="tag-group-label">{{ g.label }}</span>
-            <template v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name">
-              <!-- 编辑模式：可编辑文本 + × 删除 + 还原 -->
+            <span v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0 || editMode" class="tag-group-label">
+              {{ g.label }}
+              <!-- 改进1：编辑模式下每分类蓝色 + 号 -->
               <span
                 v-if="editMode"
-                class="tag-edit"
-                :class="{ deleted: tagEdits[t.name]?.deleted }"
-              >
+                class="tag-add"
+                title="新增标签"
+                @click="addNewTag(g.key)"
+              >＋</span>
+            </span>
+            <template v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name">
+              <!-- 编辑模式：点标签变输入框 + × 删除 + 还原 -->
+              <template v-if="editMode">
                 <el-input
+                  v-if="editingName === t.name"
                   :model-value="tagEdits[t.name]?.newName ?? t.name"
                   size="small"
                   class="tag-edit-input"
+                  autofocus
                   @change="(v: string) => applyTagEdit(t.name, v)"
+                  @blur="stopEditTag"
+                  @keyup.enter="stopEditTag"
                 />
                 <span
-                  v-if="tagEdits[t.name]?.dirty && !tagEdits[t.name]?.deleted"
-                  class="tag-revert"
-                  title="还原文本（不还原删除状态）"
-                  @click="applyTagEdit(t.name, t.name)"
-                >↻</span>
-                <span
-                  class="tag-del"
-                  :class="{ armed: tagEdits[t.name]?.deleted }"
-                  :title="tagEdits[t.name]?.deleted ? '再点恢复' : '标记删除'"
-                  @click="toggleTagDelete(t.name)"
-                >✕</span>
-              </span>
+                  v-else
+                  class="tag-edit"
+                  :class="{ deleted: tagEdits[t.name]?.deleted }"
+                  @click="startEditTag(t.name)"
+                >
+                  {{ tagEdits[t.name]?.newName ?? (t.name_cn ? `${t.name}(${t.name_cn})` : t.name) }}
+                  <span
+                    v-if="tagEdits[t.name]?.dirty && !tagEdits[t.name]?.deleted"
+                    class="tag-revert"
+                    title="还原文本（不还原删除状态）"
+                    @click.stop="applyTagEdit(t.name, t.name)"
+                  >↻</span>
+                  <span
+                    class="tag-del"
+                    :class="{ armed: tagEdits[t.name]?.deleted }"
+                    :title="tagEdits[t.name]?.deleted ? '再点恢复' : '标记删除'"
+                    @click.stop="toggleTagDelete(t.name)"
+                  >✕</span>
+                </span>
+              </template>
               <!-- 普通模式 -->
               <el-tag v-else :key="t.name" class="tag" size="small" :type="g.type">
                 {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
               </el-tag>
+            </template>
+            <!-- 改进1：新增标签输入框（编辑模式下） -->
+            <template v-for="nt in newTagsOf(g.key)" :key="nt.key">
+              <el-input
+                :model-value="nt.value"
+                size="small"
+                class="tag-edit-input"
+                autofocus
+                placeholder="输入新标签…"
+                @change="(v: string) => applyNewTagEdit(nt.key, v)"
+                @blur="removeNewTag(nt.key)"
+                @keyup.enter="removeNewTag(nt.key)"
+              />
             </template>
           </div>
         </div>
@@ -807,11 +896,17 @@ function fmtBytes(b: number): string {
   align-items: center;
   gap: 4px;
   margin: 2px 4px 2px 0;
-  padding: 1px 4px;
-  border: 1px solid var(--el-border-color);
+  padding: 2px 6px;
+  border: 1px dashed var(--el-border-color);
   border-radius: 6px;
   background: var(--el-fill-color-light);
+  cursor: text;
+  font-size: 12px;
   transition: opacity 0.15s;
+  user-select: none;
+}
+.tag-edit:hover {
+  border-color: var(--el-color-primary);
 }
 .tag-edit.deleted {
   opacity: 0.45;
@@ -819,10 +914,30 @@ function fmtBytes(b: number): string {
 }
 .tag-edit-input {
   width: 110px;
+  margin: 2px 4px 2px 0;
 }
 .tag-edit-input :deep(.el-input__wrapper) {
   box-shadow: none;
   padding: 0 6px;
+}
+.tag-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 4px;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--el-color-primary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  vertical-align: middle;
+  user-select: none;
+}
+.tag-add:hover {
+  opacity: 0.85;
 }
 .tag-del {
   cursor: pointer;
