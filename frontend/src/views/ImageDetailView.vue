@@ -625,13 +625,21 @@ function fmtBytes(b: number): string {
       <div v-if="fullscreen" class="fullscreen" @click="fullscreen = false">
         <button class="fs-close" title="退出全屏" @click.stop="fullscreen = false">✕</button>
         <button class="fs-arrow left" title="上一张" @click.stop="fsGoto(-1)">‹</button>
-        <!-- 全屏大图：原生 img + opacity 叠加（旧图保持显示，新图 onload 后淡入，无灰色占位） -->
-        <img v-if="fsPrevSrc" :src="fsPrevSrc" class="fs-img" alt="" @click.stop />
+        <!-- 全屏大图：原生 img + opacity 交叉淡化（新图就位前旧图显示；就位后旧图淡出+新图淡入） -->
         <img
+          v-if="fsPrevSrc"
+          :key="'prev-' + fsPrevSrc"
+          :src="fsPrevSrc"
+          class="fs-img"
+          :style="{ opacity: fsImgReady ? 0 : 1, transition: 'opacity 0.25s ease' }"
+          alt=""
+          @click.stop
+        />
+        <img
+          :key="'cur-' + fsSrc"
           :src="fsSrc"
           class="fs-img"
-          :class="{ 'img-fade-in': fsImgReady }"
-          :style="{ opacity: fsImgReady ? 1 : 0 }"
+          :style="{ opacity: fsImgReady ? 1 : 0, transition: 'opacity 0.25s ease' }"
           alt=""
           @load="fsImgReady = true"
           @click.stop
