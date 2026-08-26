@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Sunny, Moon, List, Plus, FolderOpened } from '@element-plus/icons-vue'
+import { Sunny, Moon, List, Plus, FolderOpened, Monitor } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { post } from '@/api/client'
 import { reportLog } from '@/api/log'
+import { fetchInferHealth, summarizeHealth, type InferOverall } from '@/api/infer'
 
 const router = useRouter()
 
@@ -78,6 +79,41 @@ function onImportConfirm() {
       submitting.value = false
     })
 }
+
+// ---- 推理服务状态（圆点）：运行中绿 / 模型异常橙 / 未启动灰 ----
+const inferState = ref<InferOverall>('stopped')
+const inferTip = ref('推理服务：检测中')
+let inferTimer: number | undefined
+
+async function refreshInferState() {
+  try {
+    const h = await fetchInferHealth()
+    inferState.value = summarizeHealth(h)
+    inferTip.value =
+      inferState.value === 'running'
+        ? '推理服务运行中'
+        : '推理服务异常（模型加载失败），点击查看'
+  } catch {
+    inferState.value = 'stopped'
+    inferTip.value = '推理服务未启动，点击查看'
+  }
+}
+
+function startInferPolling() {
+  stopInferPolling()
+  refreshInferState()
+  inferTimer = window.setInterval(refreshInferState, 5000)
+}
+
+function stopInferPolling() {
+  if (inferTimer !== undefined) {
+    window.clearInterval(inferTimer)
+    inferTimer = undefined
+  }
+}
+
+onMounted(startInferPolling)
+onBeforeUnmount(stopInferPolling)
 </script>
 
 <template>
@@ -86,6 +122,17 @@ function onImportConfirm() {
       <el-button type="primary" :icon="Plus" @click="importVisible = true">导入</el-button>
     </div>
     <div class="right">
+      <!-- 推理服务状态圆点：点击跳转设置页「本地推理」 -->
+      <el-tooltip :content="inferTip" placement="bottom">
+        <el-button
+          :icon="Monitor"
+          text
+          class="infer-dot-btn"
+          @click="router.push('/settings?tab=inference')"
+        >
+          <span class="infer-dot" :class="`dot-${inferState}`" />
+        </el-button>
+      </el-tooltip>
       <el-button :icon="List" text @click="router.push('/tasks')" title="任务中心" />
       <el-button :icon="isDark ? Sunny : Moon" text @click="toggleTheme" :title="isDark ? '切换亮色模式' : '切换暗黑模式'" />
     </div>
@@ -148,5 +195,25 @@ function onImportConfirm() {
   margin-left: 8px;
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+.infer-dot-btn {
+  padding: 0 10px;
+}
+.infer-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--el-text-color-placeholder);
+  box-shadow: 0 0 0 2px var(--el-bg-color), 0 0 3px rgba(0, 0, 0, 0.2);
+}
+.dot-running {
+  background: var(--el-color-success);
+}
+.dot-degraded {
+  background: var(--el-color-warning);
+}
+.dot-stopped {
+  background: var(--el-text-color-placeholder);
 }
 </style>

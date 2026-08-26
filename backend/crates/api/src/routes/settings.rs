@@ -50,46 +50,65 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/settings/saucenao-keys/{name}", delete(delete_key))
         .route("/api/v1/settings/saucenao-keys/{name}/quota", put(set_key_quota))
         .route("/api/v1/devices", get(proxy_devices))
+        .route("/api/v1/infer/health", get(proxy_infer_health))
+}
+
+/// 转发一个 GET 请求到 Python 推理服务并返回 JSON body（备/admin 用途的轻量代理）。
+/// 手动 TCP 实现（api crate 无 reqwest 依赖），超时 3s。
+fn proxy_python_get(base: &str, path: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    // base 形如 http://127.0.0.1:8001
+    let base2 = base.trim_end_matches('/');
+    let rest = base2
+        .strip_prefix("http://")
+        .or_else(|| base2.strip_prefix("https://"))
+        .unwrap_or(base2);
+    let (host_port, _path) = match rest.split_once('/') {
+        Some((hp, _)) => (hp, true),
+        None => (rest, false),
+    };
+    let (host, port) = match host_port.split_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(8001)),
+        None => (host_port.to_string(), 8001),
+    };
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| format!("推理服务不可达: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .ok();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    Ok(text.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+}
+
+/// GET /api/v1/infer/health：转发到 Python 推理服务 /health（模型加载状态 + 当前模型路径）。
+async fn proxy_infer_health(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    proxy_json(&state, "/health").await
 }
 
 /// GET /api/v1/devices：转发到 Python 推理服务 /devices（获取可用推理设备）。
 async fn proxy_devices(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    proxy_json(&state, "/devices").await
+}
+
+/// 通用：代理 Python GET 并解析 JSON（/health、/devices 共用）。
+async fn proxy_json(
+    state: &AppState,
+    path: &str,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let base = state.infer_base_url.clone();
-    // 手动 HTTP GET（api crate 无 reqwest 依赖）
-    let body = tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        // base 形如 http://127.0.0.1:8001
-        let base2 = base.trim_end_matches('/');
-        let rest = base2
-            .strip_prefix("http://")
-            .or_else(|| base2.strip_prefix("https://"))
-            .unwrap_or(base2);
-        let (host_port, _path) = match rest.split_once('/') {
-            Some((hp, _)) => (hp, true),
-            None => (rest, false),
-        };
-        let (host, port) = match host_port.split_once(':') {
-            Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(8001)),
-            None => (host_port.to_string(), 8001),
-        };
-        let mut stream = std::net::TcpStream::connect((host.as_str(), port))
-            .map_err(|e| format!("推理服务不可达: {e}"))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-            .ok();
-        let req = format!("GET /devices HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        let text = String::from_utf8_lossy(&buf);
-        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-        Ok::<String, String>(body)
-    })
-    .await
-    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
-    .map_err(|e| error_response(ErrorKind::Internal, e))?;
+    let path = path.to_string();
+    let body = tokio::task::spawn_blocking(move || proxy_python_get(&base, &path))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
+        .map_err(|e| error_response(ErrorKind::Internal, e))?;
     let parsed: Value = serde_json::from_str(&body)
         .map_err(|e| error_response(ErrorKind::Internal, format!("推理服务响应解析失败: {e}")))?;
     Ok(Json(parsed))

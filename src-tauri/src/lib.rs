@@ -15,13 +15,19 @@ use tauri::{Manager, WindowEvent, RunEvent};
 const BACKEND_URL: &str = "http://127.0.0.1:9178";
 const BACKEND_PORT: u16 = 9178;
 
+const INFER_URL: &str = "http://127.0.0.1:8001";
+const INFER_PORT: u16 = 8001;
+
 /// 全局持有后端子进程句柄：托盘退出/应用退出时确保杀掉后端。
 static BACKEND_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+/// 全局持有推理服务（Python uvicorn）子进程句柄：应用退出时一并杀掉。
+static INFER_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
+    .invoke_handler(tauri::generate_handler![infer_start, infer_stop, infer_status])
     .on_window_event(|window, event| {
       // 关闭窗口：根据后端设置 close_to_tray 决定 最小化到托盘 or 正常退出
       if let WindowEvent::CloseRequested { api, .. } = event {
@@ -90,6 +96,7 @@ pub fn run() {
           }
           "quit" => {
             kill_backend();
+            kill_infer();
             app.exit(0);
           }
           _ => {}
@@ -118,6 +125,21 @@ pub fn run() {
           eprintln!("[MoeVault] 后端启动失败: {e}");
         }
       }
+
+      // 启动推理服务（Python uvicorn，端口 8001）：未就绪则降级，不阻止窗口加载
+      match start_infer() {
+        Ok(child) => {
+          if let Some(child) = child {
+            let slot = INFER_CHILD.get_or_init(|| Mutex::new(None));
+            *slot.lock().unwrap() = Some(child);
+          }
+          // 后台等待推理服务就绪（仅记录日志，不阻塞窗口）
+          thread::spawn(wait_for_infer);
+        }
+        Err(e) => {
+          eprintln!("[MoeVault] 推理服务启动失败: {e}");
+        }
+      }
       Ok(())
     })
     .build(tauri::generate_context!())
@@ -126,6 +148,7 @@ pub fn run() {
       // 应用退出（任何路径：托盘退出/窗口关闭/系统关机）→ 确保杀掉后端子进程
       if let RunEvent::Exit = event {
         kill_backend();
+        kill_infer();
       }
     });
 }
@@ -133,6 +156,16 @@ pub fn run() {
 /// 杀掉后端子进程（托盘退出/应用退出时调用，避免残留占 9178 端口）。
 fn kill_backend() {
     if let Some(slot) = BACKEND_CHILD.get() {
+        if let Some(mut child) = slot.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// 杀掉推理服务子进程（应用退出时调用，避免残留占 8001 端口）。
+fn kill_infer() {
+    if let Some(slot) = INFER_CHILD.get() {
         if let Some(mut child) = slot.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -305,4 +338,207 @@ fn backend_healthy() -> bool {
     }
     Err(_) => false,
   }
+}
+
+/// 检查推理服务 /health 是否返回 200（TCP 直连 8001）。
+fn infer_healthy() -> bool {
+  match std::net::TcpStream::connect_timeout(
+    &format!("127.0.0.1:{INFER_PORT}").parse().unwrap(),
+    Duration::from_millis(150),
+  ) {
+    Ok(mut stream) => {
+      use std::io::Write;
+      let _ = stream.write_all(
+        b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+      );
+      use std::io::Read;
+      let mut buf = [0u8; 128];
+      match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+          let text = String::from_utf8_lossy(&buf[..n]);
+          text.contains(" 200 ")
+        }
+        _ => false,
+      }
+    }
+    Err(_) => false,
+  }
+}
+
+/// 定位推理服务 python 目录（server 包所在目录）。
+/// - debug：workspace 根 python/
+/// - release：exe 同目录 python/（便携安装），其次 resources/python/
+fn infer_python_dir() -> PathBuf {
+  if cfg!(debug_assertions) {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+    PathBuf::from(manifest).join("..").join("python")
+  } else {
+    let exe_dir = std::env::current_exe()
+      .ok()
+      .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+      .unwrap_or_else(|| PathBuf::from("."));
+    let p1 = exe_dir.join("python");
+    if p1.join("server").is_dir() {
+      return p1;
+    }
+    let p2 = exe_dir.join("resources").join("python");
+    if p2.join("server").is_dir() {
+      return p2;
+    }
+    p1
+  }
+}
+
+/// 解析推理服务 python 候选启动器（按优先级）：
+/// 1) python/.venv/Scripts/python.exe（Windows，setup.bat 创建）
+/// 2) python/.venv/bin/python（类 unix）
+/// 3) PATH 上的 py 启动器 / python
+fn infer_python_candidates() -> Vec<(String, Vec<String>)> {
+  let py_dir = infer_python_dir();
+  let mut out = Vec::new();
+  #[cfg(target_os = "windows")]
+  {
+    for p in [
+      py_dir.join(".venv").join("Scripts").join("python.exe"),
+      py_dir.join("venv").join("Scripts").join("python.exe"),
+      py_dir.join(".venv").join("Scripts").join("pythonw.exe"),
+    ] {
+      if p.is_file() {
+        out.push((p.to_string_lossy().into_owned(), Vec::new()));
+      }
+    }
+    out.push(("py".into(), vec!["-3".into()]));
+    out.push(("python".into(), Vec::new()));
+  }
+  #[cfg(not(target_os = "windows"))]
+  {
+    for p in [
+      py_dir.join(".venv").join("bin").join("python3"),
+      py_dir.join(".venv").join("bin").join("python"),
+    ] {
+      if p.is_file() {
+        out.push((p.to_string_lossy().into_owned(), Vec::new()));
+      }
+    }
+    out.push(("python3".into(), Vec::new()));
+    out.push(("python".into(), Vec::new()));
+  }
+  out
+}
+
+/// 启动推理服务（Python uvicorn，端口 8001）。
+/// - 若 8001 已健康（外部已启动）→ 返回 Ok(None)，不重复拉起
+/// - 否则按候选列表尝试 spawn（venv python → py -3 → python）
+/// 使用 CREATE_NO_WINDOW 隐藏控制台；日志写 <python>/infer.log
+fn start_infer() -> std::io::Result<Option<Child>> {
+  if infer_healthy() {
+    eprintln!("[MoeVault] 推理服务已在运行（外部实例），跳过启动");
+    return Ok(None);
+  }
+  let cwd = infer_python_dir();
+  let _ = std::fs::create_dir_all(&cwd);
+  let log_path = cwd.join("infer.log");
+  let log_file = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&log_path)?;
+  let port = INFER_PORT.to_string();
+  let mut last_err: Option<std::io::Error> = None;
+
+  for (exe, prefix) in infer_python_candidates() {
+    let mut cmd = Command::new(&exe);
+    cmd
+      .current_dir(&cwd)
+      .stdout(Stdio::from(log_file.try_clone()?))
+      .stderr(Stdio::from(log_file.try_clone()?));
+    cmd.args(&prefix);
+    cmd.args([
+      "-m",
+      "uvicorn",
+      "server.main:app",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      &port,
+    ]);
+    // Windows：隐藏推理服务控制台窗口
+    #[cfg(target_os = "windows")]
+    {
+      use std::os::windows::process::CommandExt;
+      const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+      cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    eprintln!(
+      "[MoeVault] 启动推理服务: {} {} (cwd: {}, log: {})",
+      exe,
+      prefix.join(" "),
+      cwd.display(),
+      log_path.display()
+    );
+    match cmd.spawn() {
+      Ok(child) => return Ok(Some(child)),
+      Err(e) => {
+        eprintln!("[MoeVault] 尝试推理服务启动器 {exe} 失败: {e}");
+        last_err = Some(e);
+      }
+    }
+  }
+  Err(last_err.unwrap_or_else(|| {
+    std::io::Error::new(
+      std::io::ErrorKind::NotFound,
+      "未找到可用的 Python 解释器（请先运行 python/setup.bat 或安装 Python）",
+    )
+  }))
+}
+
+/// 轮询推理服务 /health 直到就绪（最多 60 秒；模型首次加载可能较慢）。
+fn wait_for_infer() {
+  for _ in 0..300 {
+    if infer_healthy() {
+      eprintln!("[MoeVault] 推理服务就绪: {INFER_URL}");
+      return;
+    }
+    thread::sleep(Duration::from_millis(200));
+  }
+  eprintln!("[MoeVault] 推理服务 60 秒内未就绪（可能缺依赖，见 python/infer.log）");
+}
+
+/// 桌面壳命令：手动启动推理服务（设置页「启动服务」按钮）。
+#[tauri::command]
+fn infer_start() -> Result<String, String> {
+  // 已有子进程句柄（壳已拉起）或外部实例健康 → 已在运行
+  if let Some(slot) = INFER_CHILD.get() {
+    if slot.lock().unwrap().is_some() {
+      return Ok("推理服务已在运行".into());
+    }
+  }
+  if infer_healthy() {
+    return Ok("推理服务已在运行（外部实例）".into());
+  }
+  match start_infer() {
+    Ok(Some(child)) => {
+      let slot = INFER_CHILD.get_or_init(|| Mutex::new(None));
+      *slot.lock().unwrap() = Some(child);
+      Ok("推理服务启动中…".into())
+    }
+    Ok(None) => Ok("推理服务已在运行（外部实例）".into()),
+    Err(e) => Err(format!("推理服务启动失败: {e}")),
+  }
+}
+
+/// 桌面壳命令：停止推理服务（设置页「停止服务」按钮）。
+#[tauri::command]
+fn infer_stop() -> Result<(), String> {
+  kill_infer();
+  Ok(())
+}
+
+/// 桌面壳命令：查询推理服务运行状态（供前端判断按钮可用性）。
+#[tauri::command]
+fn infer_status() -> Result<serde_json::Value, String> {
+  let owned = INFER_CHILD
+    .get()
+    .map(|s| s.lock().unwrap().is_some())
+    .unwrap_or(false);
+  Ok(serde_json::json!({ "running": infer_healthy(), "owned": owned }))
 }

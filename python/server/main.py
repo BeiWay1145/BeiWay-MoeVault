@@ -64,6 +64,7 @@ def health():
             "tagger": {"state": tagger_state, "error": _tagger.load_error},
             "aesthetic": {"state": aesthetic_state, "error": _aesthetic.load_error},
         },
+        "paths": config.detected_paths(),
     }
 
 

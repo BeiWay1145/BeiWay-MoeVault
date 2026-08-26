@@ -8,6 +8,10 @@ python/.venv/
 __pycache__/
 *.pyc
 
+# ---- 本地模型（体积巨大，不纳入版本库；自动探测目录）----
+models/
+python/models/
+
 # ---- Rust ----
 backend/target/
 

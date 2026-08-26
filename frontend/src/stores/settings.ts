@@ -41,8 +41,9 @@ export interface SettingsState {
 const defaults: SettingsState = {
   saucenao_min_sim: 75,
   tag_threshold: 0.5,
-  tagger_model_dir: 'D:/Game/AI/cl_tagger/models',
-  tagger_model_name: 'cl_tagger (SIGLIP2 ONNX)',
+  // 空 = 自动探测（推荐）：服务按 项目内 models/tagger → 旧位置 → 自定义 顺序自动定位
+  tagger_model_dir: '',
+  tagger_model_name: '自动探测',
   aesthetic_model: 'trojblue/distill-q-align-aesthetic-siglip2-base',
   tagger_device: 'auto',
   aesthetic_device: 'auto',

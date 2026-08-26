@@ -8,41 +8,57 @@
 ```
 python/
 ├── server/
-│   ├── config.py            # 配置（环境变量可覆盖）
+│   ├── config.py            # 配置（环境变量可覆盖 + 模型路径自动探测）
 │   ├── main.py              # FastAPI 入口（/health /infer/tags /infer/aesthetic ...）
 │   └── models/
 │       ├── tagger_model.py  # cl_tagger 核心推理抽取（ONNX，不含 Gradio）
 │       └── aesthetic_model.py
 ├── requirements.txt
-├── run_server.bat           # Windows 启动脚本
+├── setup.bat                # 一键创建 .venv 并安装全部依赖（推荐首次运行）
+├── run_server.bat           # 启动脚本（优先项目内 .venv）
 └── README.md
 ```
 
+## 首次搭建（推荐）
+
+```bat
+cd python
+setup.bat
+```
+
+创建 `python/.venv` 并安装全部依赖（torch / transformers / onnxruntime 等，走清华镜像，失败自动回退官方 PyPI）。
+
 ## 启动
 
-直接运行 `run_server.bat`，或手动：
-
 ```bash
-# 复用现有 cl_tagger 的 .venv（有 fastapi/transformers/onnxruntime，缺 torch → 美学会报错）
-D:/Game/AI/cl_tagger/.venv/Scripts/python.exe -m uvicorn server.main:app --port 8001
-
-# 或自建独立 venv（推荐，全功能）
-python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt
-.venv/Scripts/python -m uvicorn server.main:app --port 8001
+run_server.bat               # 优先 python/.venv，其次系统 python（py -3 / python）
+# 或手动
+.venv\Scripts\python.exe -m uvicorn server.main:app --port 8001
 ```
+
+Python 解释器解析顺序：`python/.venv` → `py -3` → `python`。**不再依赖任何外部固定路径**（如 cl_tagger/.venv）。
+
+## 模型路径自动探测（消除「依赖强绑定本机」）
+
+| 优先级 | 打标模型 `TAGGER_MODEL_DIR` | 美学模型 `AESTHETIC_MODEL` |
+|---|---|---|
+| 1 | 环境变量 `TAGGER_MODEL_DIR` | 环境变量 `AESTHETIC_MODEL` |
+| 2 | 项目根 `models/tagger/`（含 model.onnx + vocabulary） | 项目根 `models/aesthetic/`（含 config.json） |
+| 3 | 旧位置 `D:/Game/AI/cl_tagger/models`（兼容迁移回退） | HF 仓库 `trojblue/distill-q-align-aesthetic-siglip2-base`（首次联网下载） |
+
+`/health` 返回 `paths` 字段（`tagger_model_dir` / `aesthetic_model`），前端设置页据此展示当前生效路径。
 
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `INFER_HOST` / `INFER_PORT` | `127.0.0.1` / `8001` | 监听地址 |
-| `TAGGER_MODEL_DIR` | `D:/Game/AI/cl_tagger/models` | cl_tagger 模型目录（model.onnx + vocabulary） |
+| `TAGGER_MODEL_DIR` | 自动探测（见上表） | 打标模型目录（model.onnx + vocabulary） |
 | `TAGGER_DEFAULT_THRESHOLD` | `0.5` | 打标置信度阈值 |
-| `AESTHETIC_MODEL` | `trojblue/distill-q-align-aesthetic-siglip2-base` | 美学模型（HF 仓库名或本地目录） |
+| `AESTHETIC_MODEL` | 自动探测（见上表） | 美学模型（HF 仓库名或本地目录） |
 | `AESTHETIC_SIGMOID` | `0` | `1` 时评分改为 `sigmoid(logit)*4+1`（实测后按需切换） |
 
-> 美学模型基座为 `google/siglip2-base-patch16-512`，首次运行会联网下载（模型 + processor，约数百 MB）。已下载到本地后可用本地目录路径替代仓库名离线加载。
+> 美学模型基座为 `google/siglip2-base-patch16-512`，未放置本地目录时首次运行会联网下载（模型 + processor，约数百 MB）。已下载到本地后可用本地目录路径替代仓库名离线加载。
 
 ## 快速验证
 

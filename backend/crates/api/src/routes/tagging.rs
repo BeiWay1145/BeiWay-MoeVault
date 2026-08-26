@@ -254,8 +254,12 @@ pub(crate) async fn init_pool_public(
 }
 
 /// 通知推理服务切换打标模型目录（可选）。
+/// 空/未设置 = 自动探测模式：跳过切换，推理服务保持其自动探测到的目录。
 async fn sync_tagger_model(state: &AppState, model_dir: &Option<String>) {
     if let Some(dir) = model_dir {
+        if dir.trim().is_empty() {
+            return; // 自动探测模式，无需切换
+        }
         let st = state.clone();
         let dir = dir.clone();
         tokio::spawn(async move {

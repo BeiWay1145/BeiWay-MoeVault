@@ -1,14 +1,29 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Delete } from '@element-plus/icons-vue'
+import { useRoute } from 'vue-router'
+import { Delete, CaretRight, VideoPause, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post, del, put } from '@/api/client'
 import { useSettingsStore, type SauceKeyConfig } from '@/stores/settings'
 import { reportLog } from '@/api/log'
+import {
+  fetchInferHealth,
+  inferStart,
+  inferStop,
+  isTauri,
+  summarizeHealth,
+  type InferHealth,
+  type InferModelState,
+  type InferOverall,
+} from '@/api/infer'
 
 const settings = useSettingsStore()
-// 默认打开「通用」设置页
+const route = useRoute()
+// 默认打开「通用」设置页；支持 ?tab=inference 直达本地推理状态
 const activeTab = ref('library')
+if (route.query.tab === 'inference') {
+  activeTab.value = 'inference'
+}
 
 // ---- SauceNAO 多 key ----
 const newKey = ref('')
@@ -18,11 +33,83 @@ const keys = ref<SauceKeyConfig[] & Array<Record<string, unknown>>>([])
 const manageVisible = ref(false)
 const saving = ref(false)
 
-// ---- 打标模型 ----
+// ---- 打标模型：自动探测（推荐）/ 自定义目录 ----
+// 自动探测顺序：项目内 models/tagger → 旧位置 D:/Game/AI/cl_tagger/models → 自定义目录
 const taggerModelOptions = [
-  { name: 'cl_tagger (SIGLIP2 ONNX)', dir: 'D:/Game/AI/cl_tagger/models' },
-  { name: '自定义目录', dir: '' },
+  { name: '自动探测（推荐）', dir: '' },
+  { name: '自定义目录', dir: '__custom__' },
 ]
+
+// ---- 推理服务状态卡片 ----
+const inferHealth = ref<InferHealth | null>(null)
+const inferOverall = ref<InferOverall>('stopped')
+const inferLoading = ref(false)
+const inferBusy = ref(false)
+
+async function loadInferHealth() {
+  inferLoading.value = true
+  try {
+    const h = await fetchInferHealth()
+    inferHealth.value = h
+    inferOverall.value = summarizeHealth(h)
+  } catch {
+    inferHealth.value = null
+    inferOverall.value = 'stopped'
+  } finally {
+    inferLoading.value = false
+  }
+}
+
+async function onInferStart() {
+  inferBusy.value = true
+  try {
+    const msg = await inferStart()
+    ElMessage.success(msg)
+    // 稍等片刻再刷新（服务启动需要时间）
+    setTimeout(loadInferHealth, 1500)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    inferBusy.value = false
+  }
+}
+
+async function onInferStop() {
+  inferBusy.value = true
+  try {
+    await inferStop()
+    ElMessage.success('推理服务已停止')
+    inferHealth.value = null
+    inferOverall.value = 'stopped'
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    inferBusy.value = false
+  }
+}
+
+const inferStatusText = () =>
+  ({
+    running: '运行中',
+    degraded: '异常（模型加载失败）',
+    stopped: '未启动',
+  })[inferOverall.value]
+
+const inferStatusType = () =>
+  ({ running: 'success', degraded: 'warning', stopped: 'info' })[inferOverall.value] as
+    | 'success'
+    | 'warning'
+    | 'info'
+
+/** 单个模型的加载状态文案。 */
+const modelStateText = (m?: InferModelState) =>
+  !m
+    ? '未知'
+    : m.state === 'ok'
+      ? '已加载'
+      : m.state === 'failed'
+        ? `加载失败：${m.error ?? ''}`
+        : '未加载（首次调用时加载）'
 
 async function loadKeys() {
   try {
@@ -266,8 +353,17 @@ const logCategoryLabel = (c: string) =>
 
 function onModelSelect(name: string) {
   const opt = taggerModelOptions.find((o) => o.name === name)
-  if (opt && opt.dir) {
-    settings.settings.tagger_model_dir = opt.dir
+  if (!opt) return
+  if (opt.dir === '') {
+    // 自动探测：清空自定义目录
+    settings.settings.tagger_model_dir = ''
+  } else if (opt.dir === '__custom__') {
+    // 自定义目录：保留用户当前输入（若为空，提示先输入）
+    if (settings.settings.tagger_model_dir.trim()) {
+      ElMessage.info('已切换到自定义目录，请保存设置后生效')
+    } else {
+      ElMessage.info('请输入自定义模型目录，或保持自动探测')
+    }
   }
 }
 
@@ -317,6 +413,7 @@ onMounted(async () => {
   await loadKeys()
   await loadDevices()
   loadLogSettings()
+  loadInferHealth()
 })
 </script>
 
@@ -393,22 +490,46 @@ onMounted(async () => {
       </el-tab-pane>
 
       <el-tab-pane label="本地推理" name="inference">
+        <!-- 推理服务状态卡片：服务健康 + 当前模型路径 + 启动/停止（桌面版） -->
+        <el-card header="推理服务" shadow="never" class="inf-card">
+          <div class="infer-status-row">
+            <el-tag :type="inferStatusType()">{{ inferStatusText() }}</el-tag>
+            <el-button size="small" :icon="Refresh" :loading="inferLoading" @click="loadInferHealth">刷新</el-button>
+            <template v-if="isTauri()">
+              <el-button size="small" type="primary" plain :icon="CaretRight" :loading="inferBusy" :disabled="inferOverall === 'running'" @click="onInferStart">启动服务</el-button>
+              <el-button size="small" type="danger" plain :icon="VideoPause" :loading="inferBusy" :disabled="inferOverall === 'stopped'" @click="onInferStop">停止服务</el-button>
+            </template>
+            <span v-else class="hint">浏览器模式仅展示状态；启动请运行 python/run_server.bat</span>
+          </div>
+          <el-descriptions :column="1" size="small" border class="infer-desc">
+            <el-descriptions-item label="打标模型目录">
+              <span class="mono">{{ inferHealth?.paths?.tagger_model_dir || '（服务未启动）' }}</span>
+              <span v-if="inferHealth && !settings.settings.tagger_model_dir" class="hint">自动探测</span>
+              <span v-else-if="settings.settings.tagger_model_dir" class="hint">自定义（设置保存后生效）</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="打标模型状态">{{ modelStateText(inferHealth?.models?.tagger) }}</el-descriptions-item>
+            <el-descriptions-item label="美学模型">
+              <span class="mono">{{ inferHealth?.paths?.aesthetic_model || '（服务未启动）' }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="美学模型状态">{{ modelStateText(inferHealth?.models?.aesthetic) }}</el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+
         <el-card header="打标" shadow="never" class="inf-card">
           <el-form label-width="160px" style="max-width: 720px">
-            <el-form-item label="打标模型">
+            <el-form-item label="打标模型来源">
               <el-select
-                :model-value="settings.settings.tagger_model_name"
+                :model-value="settings.settings.tagger_model_dir ? '自定义目录' : '自动探测（推荐）'"
                 style="width: 260px"
                 @change="onModelSelect"
               >
                 <el-option v-for="o in taggerModelOptions" :key="o.name" :label="o.name" :value="o.name" />
               </el-select>
-              <el-button style="margin-left: 8px" @click="ElMessage.info('当前: ' + settings.settings.tagger_model_dir)">
-                模型路径
-              </el-button>
+              <span class="hint">推荐自动探测：项目内 models/tagger → 旧位置 → 自定义</span>
             </el-form-item>
-            <el-form-item label="模型目录">
-              <el-input v-model="settings.settings.tagger_model_dir" placeholder="D:/Game/AI/cl_tagger/models" style="width: 400px" />
+            <el-form-item label="自定义目录">
+              <el-input v-model="settings.settings.tagger_model_dir" placeholder="留空 = 自动探测（推荐）" style="width: 400px" />
+              <span class="hint">留空自动探测；填写后保存设置并重跑打标任务生效</span>
             </el-form-item>
             <el-form-item label="置信度阈值">
               <el-slider v-model="settings.settings.tag_threshold" :min="0" :max="1" :step="0.05" show-input style="width: 260px" />
@@ -558,6 +679,21 @@ onMounted(async () => {
 }
 .inf-card {
   margin-bottom: 12px;
+}
+.infer-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.infer-desc {
+  margin-top: 4px;
+}
+.mono {
+  font-family: monospace;
+  font-size: 12px;
+  word-break: break-all;
 }
 .warn {
   color: var(--el-color-danger);
