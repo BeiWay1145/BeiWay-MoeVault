@@ -1,4 +1,4 @@
-# ---- Node / 前端 ----
+﻿# ---- Node / 鍓嶇 ----
 frontend/node_modules/
 frontend/dist/
 frontend/.npm-cache/
@@ -8,17 +8,17 @@ python/.venv/
 __pycache__/
 *.pyc
 
-# ---- 本地模型（体积巨大，不纳入版本库；自动探测目录）----
+# ---- 鏈湴妯″瀷锛堜綋绉法澶э紝涓嶇撼鍏ョ増鏈簱锛涜嚜鍔ㄦ帰娴嬬洰褰曪級----
 models/
 python/models/
 
 # ---- Rust ----
 backend/target/
 
-# ---- 运行时数据（库目录/缩略图/回收站/数据库）----
+# ---- 杩愯鏃舵暟鎹紙搴撶洰褰?缂╃暐鍥?鍥炴敹绔?鏁版嵁搴擄級----
 data/
 
-# ---- 系统 ----
+# ---- 绯荤粺 ----
 .DS_Store
 Thumbs.db
 desktop.ini
@@ -27,8 +27,12 @@ desktop.ini
 .idea/
 .vscode/
 
-# ---- Reasonix 工具元数据 ----
+# ---- Reasonix 宸ュ叿鍏冩暟鎹?----
 .reasonix/
 
-# DSH vision toolkit artifacts.dsh-vision-toolkit/
+# DSH vision toolkit artifacts
+.dsh-vision-toolkit/
+
+# 自动化测试脚本（本地保留，不入库）
+scripts/
 
