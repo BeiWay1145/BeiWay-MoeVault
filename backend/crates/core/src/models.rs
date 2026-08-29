@@ -121,6 +121,8 @@ pub struct ImageFilter {
     pub is_ai: Option<bool>,
     /// 溯源状态：sauced（已溯源）/unsauced（未溯源）/un-sauced（不可溯源：no_auto_sauce 或 AI 图）。
     pub sauce_status: Option<String>,
+    /// 打标状态：true=已打标（有任一标签）/ false=未打标。
+    pub tagged: Option<bool>,
 }
 
 /// 排序键。
@@ -267,6 +269,8 @@ pub struct ImageTagView {
     /// 来源：danbooru/gelbooru/local/manual。
     pub source: String,
     pub confidence: Option<f64>,
+    /// 词频：该标签关联的图片数（详情页标签栏展示）。
+    pub image_count: i64,
 }
 
 /// 标签列表项（含关联图数）。
@@ -279,6 +283,25 @@ pub struct TagWithCount {
     pub is_custom: bool,
     pub is_blacklisted: bool,
     pub image_count: i64,
+}
+
+/// 分类浏览标签卡片项（含封面缩略图；封面规则可配置，见 settings.tag_cover_rule）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TagBrowseItem {
+    pub id: i64,
+    pub name: String,
+    pub name_cn: Option<String>,
+    pub category: String,
+    pub image_count: i64,
+    pub cover_thumb: Option<String>,
+}
+
+/// 标签中文别名（一个 tag 可有多条）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TagAlias {
+    pub id: i64,
+    pub tag_id: i64,
+    pub alias: String,
 }
 
 /// 单图打标状态。

@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/images/{id}/rename", put(rename_image))
         .route("/api/v1/images/{id}/source-info", get(source_info))
         .route("/api/v1/images/{id}/replace-from-url", post(replace_from_url))
+        .route("/api/v1/proxy-image", get(proxy_image))
         .route("/api/v1/images/{id}/tags/{tag_id}", delete(remove_image_tag))
         .route("/api/v1/images/{id}/tags", post(add_image_tag))
         .route("/api/v1/images/reprocess", post(reprocess_images))
@@ -347,6 +348,70 @@ async fn source_info(
     })))
 }
 
+/// 代理下载网络图片（对比原图/外部图用）。
+/// 原因：WebView2 网络栈可能访问不了 booru 图片 CDN（本机网络差异），
+/// 而后端 reqwest 可达；且 moebooru 系有 Referer 防盗链。
+/// 校验 url 必须为 http(s)；带 UA + 按域名推断 Referer。
+#[derive(Debug, Deserialize)]
+pub struct ProxyImageParams {
+    pub url: Option<String>,
+}
+
+async fn proxy_image(
+    Query(params): Query<ProxyImageParams>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, Json<Value>)> {
+    let Some(url) = params.url.filter(|u| u.starts_with("http://") || u.starts_with("https://")) else {
+        return Err(error_response(ErrorKind::InvalidInput, "url 必须为 http(s) 链接"));
+    };
+    // 按域名推断 Referer（防盗链）：yande.re/konachan 等 moebooru 需同站 Referer
+    let referer = if url.contains("yande.re") {
+        Some("https://yande.re/")
+    } else if url.contains("konachan.com") {
+        Some("https://konachan.com/")
+    } else if url.contains("lolibooru.moe") {
+        Some("https://lolibooru.moe/")
+    } else if url.contains("donmai.us") {
+        Some("https://danbooru.donmai.us/")
+    } else if url.contains("gelbooru.com") {
+        Some("https://gelbooru.com/")
+    } else {
+        None
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("MoeVault/0.1")
+        .build()
+        .map_err(|e| error_response(ErrorKind::Internal, format!("HTTP 客户端构建失败: {e}")))?;
+    let mut req = client.get(&url);
+    if let Some(r) = referer {
+        req = req.header("Referer", r);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("下载网络图失败: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(error_response(
+            ErrorKind::Internal,
+            format!("下载网络图失败: HTTP {}", resp.status()),
+        ));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("读取网络图失败: {e}")))?;
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, mime)
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
+}
+
 /// 解析网络来源信息：danbooru /posts/{id}.json、gelbooru dapi。
 /// danbooru 返回单个 JSON 对象；gelbooru dapi 返回 `{"post": [...]}`。
 async fn parse_remote_source_info(
@@ -413,7 +478,52 @@ async fn parse_remote_source_info(
             }
         }
     }
+    // yande.re / konachan / lolibooru（moebooru 系）：/post/show/{id} 或 /post.json?tags=id:{id}
+    if lower.contains("yande.re") || lower.contains("konachan.com") || lower.contains("lolibooru.moe") {
+        if let Some(pid) = extract_moebooru_id(page_url) {
+            let base = if lower.contains("yande.re") {
+                "https://yande.re"
+            } else if lower.contains("konachan.com") {
+                "https://konachan.com"
+            } else {
+                "https://lolibooru.moe"
+            };
+            let api = format!("{base}/post.json?tags=id:{pid}");
+            if let Ok(resp) = client.get(&api).send().await {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(post) = body.as_array().and_then(|a| a.first()) {
+                        let fw = post.get("width").and_then(|v| v.as_i64());
+                        let fh = post.get("height").and_then(|v| v.as_i64());
+                        let fs = post.get("file_size").and_then(|v| v.as_i64());
+                        let file_url = post
+                            .get("file_url")
+                            .or_else(|| post.get("sample_url"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        if fw.is_some() || fs.is_some() {
+                            return json!({
+                                "width": fw, "height": fh, "size_bytes": fs, "file_url": file_url,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
     json!({ "width": null, "height": null, "size_bytes": null, "file_url": null })
+}
+
+/// 从 moebooru 系 URL 提取帖子 id：/post/show/1239119 或 ?id=1239119。
+fn extract_moebooru_id(url: &str) -> Option<String> {
+    if let Some(idx) = url.find("/post/show/") {
+        let rest = &url[idx + "/post/show/".len()..];
+        let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    // 回退：任意数字段（?id=123 或 /posts/123 结尾）
+    extract_post_id(url)
 }
 
 /// 从 URL 中提取帖子 id（/posts/6019533 或 ?id=6019533）。
@@ -656,6 +766,8 @@ pub struct ListParams {
     pub is_ai: Option<String>,
     /// 溯源状态：sauced / unsauced / un-sauced。
     pub sauce_status: Option<String>,
+    /// 打标状态：tagged / untagged。
+    pub tagged: Option<String>,
     /// 排序键：imported/date/aesthetic/clarity/size/random。
     pub sort: Option<String>,
     /// asc/desc。
@@ -727,6 +839,11 @@ impl ListParams {
             is_redundant: self.parse_redundant()?,
             is_ai: self.parse_ai()?,
             sauce_status: self.sauce_status.clone(),
+            tagged: match self.tagged.as_deref() {
+                Some("tagged") => Some(true),
+                Some("untagged") => Some(false),
+                _ => None,
+            },
         })
     }
 

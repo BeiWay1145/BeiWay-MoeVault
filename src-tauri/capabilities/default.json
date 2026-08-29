@@ -1,10 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables the default permissions",
+  "description": "enables the default permissions (local + 桌面壳加载的本地后端 origin，供 Tauri 事件/插件 IPC 使用)",
   "windows": [
     "main"
   ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:9178",
+      "http://localhost:9178"
+    ]
+  },
   "permissions": [
     "core:default",
     "opener:default",

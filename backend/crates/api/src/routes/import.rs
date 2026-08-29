@@ -1,6 +1,6 @@
 //! 导入接口：POST /api/v1/import、GET /api/v1/import/batches[/:id]。
 //!
-//! 对应 docs/TECH_DETAILS.md 第 2.2 节。骨架阶段仅支持"移动进库"模式。
+//! 对应 docs/TECH_DETAILS.md 第 2.2 节。支持 move（移动进库）/ copy（复制进库）两种模式。
 
 use std::path::PathBuf;
 
@@ -31,7 +31,7 @@ pub fn router() -> Router<AppState> {
 pub struct ImportRequest {
     /// 源路径（文件或目录），支持相对/绝对。
     pub paths: Vec<String>,
-    /// move（默认）/ copy（暂未实现）。
+    /// move（默认，移动进库）/ copy（复制进库，保留源文件）。
     pub mode: Option<String>,
 }
 
@@ -39,14 +39,18 @@ async fn create_import(
     State(state): State<AppState>,
     Json(req): Json<ImportRequest>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    if let Some(m) = &req.mode {
-        if m != "move" {
+    // 解析导入模式：move（默认）/ copy。
+    // move = 移动进库（源文件移入库目录）；copy = 复制进库（保留源文件）。
+    let mode = match req.mode.as_deref() {
+        None | Some("move") => moevault_ingest::ImportMode::Move,
+        Some("copy") => moevault_ingest::ImportMode::Copy,
+        Some(m) => {
             return Err(error_response(
                 ErrorKind::InvalidInput,
-                format!("导入模式 {m} 暂未支持（M2 仅支持 move）"),
-            ));
+                format!("导入模式 {m} 无效（仅支持 move / copy）"),
+            ))
         }
-    }
+    };
     // 过滤空白/空字符串路径
     let paths: Vec<String> = req
         .paths
@@ -89,7 +93,7 @@ async fn create_import(
         let library = st.library_dir();
         let thumbs = st.thumbs_dir();
         let result = tokio::task::spawn_blocking(move || {
-            moevault_ingest::run_import(&db, batch_id, path_bufs, &library, &thumbs)
+            moevault_ingest::run_import(&db, batch_id, path_bufs, &library, &thumbs, mode)
         })
         .await;
 

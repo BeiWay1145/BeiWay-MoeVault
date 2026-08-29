@@ -61,7 +61,11 @@ def health():
     return {
         "status": "ok",
         "models": {
-            "tagger": {"state": tagger_state, "error": _tagger.load_error},
+            "tagger": {
+                "state": tagger_state,
+                "error": _tagger.load_error,
+                "kind": _tagger.kind,
+            },
             "aesthetic": {"state": aesthetic_state, "error": _aesthetic.load_error},
         },
         "paths": config.detected_paths(),
@@ -99,21 +103,24 @@ def devices():
 # ---------- 打标 ----------
 class TaggerConfigRequest(BaseModel):
     model_dir: str
+    # 可选：cl_tagger / wd14 / auto（缺省 auto=按目录内容判定）
+    model_kind: str | None = None
 
 
 @app.post("/infer/tagger/config")
 def tagger_config(req: TaggerConfigRequest):
-    """切换打标模型目录（重新加载模型）。"""
+    """切换打标模型目录/种类（重新加载模型）。"""
     import os
 
     if not os.path.isdir(req.model_dir):
         raise HTTPException(status_code=404, detail=f"模型目录不存在: {req.model_dir}")
     try:
         with _infer_lock:
-            _tagger.load_from_dir(req.model_dir)
+            _tagger.load_from_dir(req.model_dir, kind=req.model_kind)
         return {
             "ok": True,
             "model_dir": _tagger.model_dir,
+            "model_kind": _tagger.kind,
             "tags": len(_tagger._idx_to_tag),
         }
     except Exception as e:  # noqa: BLE001
@@ -129,7 +136,7 @@ def infer_tags(req: TagRequest):
             tags = _tagger.infer(req.path, req.threshold)
         return {
             "tags": [{"name": k, "confidence": v} for k, v in tags.items()],
-            "model": "siglip2-tagger",
+            "model": _tagger.kind or "unknown",
             "elapsed_ms": time_ms(t0),
         }
     except Exception as e:  # noqa: BLE001

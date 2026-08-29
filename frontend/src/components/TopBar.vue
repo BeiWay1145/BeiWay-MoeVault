@@ -52,19 +52,17 @@ function onImportConfirm() {
     ElMessage.warning('请输入文件/文件夹路径')
     return
   }
-  if (importMode.value === 'copy') {
-    ElMessage.warning('复制导入暂未支持（M2 仅支持移动导入）')
-    return
-  }
+  const mode = importMode.value
+  const modeLabel = mode === 'copy' ? '复制进库' : '移动进库'
   const paths = importPaths.value
     .split('\n')
     .map((s) => s.trim())
     .filter(Boolean)
   submitting.value = true
-  post<{ batch_id: number }>('/import', { paths, mode: importMode.value })
+  post<{ batch_id: number }>('/import', { paths, mode })
     .then((res) => {
-      ElMessage.success(`导入任务 #${res.batch_id} 已创建（移动进库）`)
-      reportLog(`提交导入任务 #${res.batch_id}（${paths.length} 个路径，移动进库）`)
+      ElMessage.success(`导入任务 #${res.batch_id} 已创建（${modeLabel}）`)
+      reportLog(`提交导入任务 #${res.batch_id}（${paths.length} 个路径，${modeLabel}）`)
       importVisible.value = false
       importPaths.value = ''
       // 留在主目录看新分组（若已在主目录则刷新）

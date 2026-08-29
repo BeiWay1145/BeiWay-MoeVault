@@ -19,6 +19,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::aesthetic::router())
         .merge(routes::tasks::router())
         .merge(routes::logs::router())
+        .merge(routes::search::router())
+        .merge(routes::dict::router())
         .merge(routes::settings::router())
         .merge(routes::ws::router())
         .with_state(state)

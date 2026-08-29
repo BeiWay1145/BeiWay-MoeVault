@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown, ArrowRight, ArrowLeft } from '@element-plus/icons-vue'
+import { displayTagName, searchTagKey } from '@/utils/tagNormalize'
 import { useLibraryStore, originalUrl } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
 import { useSettingsStore } from '@/stores/settings'
@@ -14,7 +16,7 @@ const taskStore = useTaskStore()
 const settingsStore = useSettingsStore()
 
 const image = computed(() => library.images.find((i) => i.id === Number(route.params.id)))
-const tags = ref<Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string }>>([])
+const tags = ref<Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string; image_count: number }>>([])
 const aiInfo = ref<string | null>(null)
 const aiTags = ref<string[]>([])
 const aiChecked = ref(false)
@@ -74,30 +76,31 @@ function openFullscreen() {
 }
 /** 全屏切图：新图就位前旧图保持显示（opacity 叠加），onload 后淡入。 */
 function fsGoto(delta: number) {
-  const list = library.images
-  if (list.length === 0 || indexInList.value < 0) return
-  const next = list[(indexInList.value + delta + list.length) % list.length]
-  const newSrc = originalUrl(next.id)
+  const ids = orderedIds.value
+  if (ids.length === 0 || indexInList.value < 0) return
+  const nextId = ids[(indexInList.value + delta + ids.length) % ids.length]
+  const newSrc = originalUrl(nextId)
   // 保留当前图作为旧图
   fsPrevSrc.value = fsSrc.value
   fsImgReady.value = false
   // 更新当前图 + 路由（组件 watch 会触发普通视图过渡）
-  router.replace(`/library/${next.id}`)
+  router.replace(`/library/${nextId}`)
   fsSrc.value = newSrc
 }
 
 /** 预加载当前图前后各 N 张原图（用 Image 对象触发浏览器缓存）。 */
 function preloadAround() {
-  const list = library.images
+  const ids = orderedIds.value
   const idx = indexInList.value
   const n = settingsStore.settings.preload_count || 0
-  if (list.length === 0 || idx < 0 || n <= 0) return
+  if (ids.length === 0 || idx < 0 || n <= 0) return
+  const cur = Number(route.params.id)
   for (let d = 1; d <= n; d++) {
     for (const sign of [-1, 1]) {
-      const target = list[(idx + sign * d + list.length) % list.length]
-      if (target && target.id !== Number(route.params.id)) {
+      const target = ids[(idx + sign * d + ids.length) % ids.length]
+      if (target !== cur) {
         const img = new Image()
-        img.src = originalUrl(target.id)
+        img.src = originalUrl(target)
       }
     }
   }
@@ -120,23 +123,33 @@ const tagGroups = computed(() => {
   }
   return groups
 })
-const tagGroupDefs = [
-  { key: 'artist', label: '画师', type: 'danger' as const },
-  { key: 'copyright', label: '系列', type: 'warning' as const },
-  { key: 'character', label: '角色', type: 'success' as const },
-  { key: 'general', label: '常规', type: 'primary' as const },
+type TagGroupKey = 'artist' | 'copyright' | 'character' | 'general'
+const tagGroupDefs: Array<{ key: TagGroupKey; label: string; type: 'danger' | 'warning' | 'success' | 'primary' }> = [
+  { key: 'artist', label: '画师', type: 'danger' },
+  { key: 'copyright', label: '系列', type: 'warning' },
+  { key: 'character', label: '角色', type: 'success' },
+  { key: 'general', label: '常规', type: 'primary' },
 ]
 const hasAnyTags = computed(() => tags.value.length > 0)
 
-// 上一张/下一张（基于当前列表顺序）
-const indexInList = computed(() => library.images.findIndex((i) => i.id === image.value?.id))
+/** 增强2：有序导航 id 列表——浏览上下文（来源目录组/筛选结果/搜索结果）优先，
+ *  当前图不在上下文（直达 URL/刷新）时回退全局库顺序。 */
+const orderedIds = computed<number[]>(() => {
+  const ctx = library.viewerContext
+  const id = Number(route.params.id)
+  if (ctx && ctx.ids.length > 0 && ctx.ids.includes(id)) return ctx.ids
+  return library.images.map((i) => i.id)
+})
+
+// 上一张/下一张（在浏览上下文内循环）
+const indexInList = computed(() => orderedIds.value.indexOf(Number(route.params.id)))
 
 function gotoImage(delta: number) {
-  const list = library.images
-  if (list.length === 0 || indexInList.value < 0) return
-  const next = list[(indexInList.value + delta + list.length) % list.length]
+  const ids = orderedIds.value
+  if (ids.length === 0 || indexInList.value < 0) return
+  const next = ids[(indexInList.value + delta + ids.length) % ids.length]
   // 组件内切换：router.replace 不推入历史（返回时直接回图库而非逐张回退）
-  router.replace(`/library/${next.id}`)
+  router.replace(`/library/${next}`)
 }
 
 // 键盘左右键切换 + Del 删除 + ESC 退出全屏
@@ -174,7 +187,7 @@ async function loadDetail() {
   }
   // 标签
   try {
-    const t = await get<{ tags: Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string }> }>(
+    const t = await get<{ tags: Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string; image_count: number }> }>(
       `/images/${id}/tags`,
     )
     tags.value = t.tags
@@ -230,22 +243,23 @@ async function toggleAiMark() {
   }
 }
 
-// 放入回收站：无提示；删除后跳到上一张，无上一张则下一张，无则回图库
+// 放入回收站：无提示；删除后跳到上下文内的上一张，无则下一张，无则回图库
 async function recycle() {
   if (!image.value) return
   const id = image.value.id
-  const list = [...library.images]
-  const idx = list.findIndex((i) => i.id === id)
+  const ids = [...orderedIds.value]
+  const idx = ids.indexOf(id)
   try {
     await post(`/images/${id}/recycle`, { reason: 'manual' })
-    // 从本地列表移除，避免 computed 失效
+    // 从本地列表与浏览上下文移除，避免 computed 失效
     library.removeImageById(id)
-    // 目标：优先上一张，无则下一张，无则回图库
-    let target: { id: number } | undefined
-    if (idx > 0) target = list[idx - 1]
-    else if (idx === 0 && list.length > 1) target = list[1]
-    if (target) {
-      router.push(`/library/${target.id}`)
+    library.removeFromViewerContext(id)
+    // 目标：优先上下文内上一张，无则下一张，无则回图库
+    let targetId: number | undefined
+    if (idx > 0) targetId = ids[idx - 1]
+    else if (idx === 0 && ids.length > 1) targetId = ids[1]
+    if (targetId != null) {
+      router.push(`/library/${targetId}`)
     } else {
       router.back()
     }
@@ -254,11 +268,10 @@ async function recycle() {
   }
 }
 
-/** 返回来源页（画廊/搜索/主目录）——叉号点击直接返回，不受浏览多张影响。 */
+/** 返回来源页（画廊/主目录）——叉号点击直接返回，不受浏览多张影响。 */
 function goBack() {
   const from = library.detailPos?.from
-  if (from === 'search') router.push('/search')
-  else if (from === 'imports') router.push('/imports')
+  if (from === 'imports') router.push('/imports')
   else router.push('/library')
 }
 
@@ -381,6 +394,8 @@ async function openCompare() {
   compareVisible.value = true
   compareLoading.value = true
   netInfo.value = null
+  netImgOk.value = false
+  compareError.value = ''
   try {
     const r = await get<{
       ok: boolean
@@ -388,11 +403,25 @@ async function openCompare() {
       info: { width: number | null; height: number | null; size_bytes: number | null; file_url: string | null }
     }>(`/images/${image.value.id}/source-info`)
     netInfo.value = r.info
+    // 信息为空 → 明确提示（源站不可达 / 域名未收录），而非静默空白
+    if (!r.info.file_url && !r.info.width && !r.info.size_bytes) {
+      compareError.value = `无法获取网络图信息：源站（${r.page_url || '未知'}）不可达或域名未收录`
+    }
   } catch (e) {
-    ElMessage.error((e as Error).message)
+    compareError.value = (e as Error).message
   } finally {
     compareLoading.value = false
   }
+}
+/** 对比原图错误提示（信息为空时显示）。 */
+const compareError = ref('')
+/** 网络原图是否加载成功（原生 img @load/@error）。 */
+const netImgOk = ref(false)
+
+/** 网络图经后端代理加载（绕开 WebView2 网络栈差异 + 防盗链）。 */
+function proxyUrl(url: string | null): string | undefined {
+  if (!url) return undefined
+  return `/api/v1/proxy-image?url=${encodeURIComponent(url)}`
 }
 
 /** 红绿白：红=网络大，绿=库大，白=相等；null 无法比较 → 灰。 */
@@ -562,9 +591,122 @@ async function applyTagChanges() {
     }
     ElMessage.success(`已生效 ${ok} 项修改`)
     exitEditMode()
+    editDialogVisible.value = false
     await loadDetail()
   } catch (e) {
     ElMessage.error((e as Error).message)
+  }
+}
+
+// ---- 增强2：标签栏（左栏 danbooru 风格）----
+/** 修改标签二级窗口。 */
+const editDialogVisible = ref(false)
+/** 标签栏折叠状态（增强1：整栏收起；增强2：localStorage 持久化）。 */
+const tagPanelCollapsed = ref(localStorage.getItem('moevault-detail-tag-collapsed') === '1')
+/** 基本信息栏折叠状态（增强1：整栏收起；增强2：localStorage 持久化）。 */
+const infoPanelCollapsed = ref(localStorage.getItem('moevault-detail-info-collapsed') === '1')
+watch(tagPanelCollapsed, (v) => localStorage.setItem('moevault-detail-tag-collapsed', v ? '1' : '0'))
+watch(infoPanelCollapsed, (v) => localStorage.setItem('moevault-detail-info-collapsed', v ? '1' : '0'))
+
+function openEditDialog() {
+  enterEditMode()
+  editDialogVisible.value = true
+}
+
+// ---- 追加增强1：修改原始标签文本（三级窗口）----
+const rawTagsVisible = ref(false)
+const rawTagsText = ref('')
+
+/** 生成当前标签的原始文本（画师名,\n角色名,\n作品名,\n常规1,常规2,…，显示用空格形式）。 */
+function buildRawTagsText(): string {
+  const lines: string[] = []
+  for (const g of tagGroupDefs) {
+    const list = tagGroups.value[g.key]
+    if (list.length === 0) continue
+    lines.push(`${list.map((t) => displayTagName(t.name)).join(',')},`)
+  }
+  return lines.join('\n')
+}
+
+function openRawTagsDialog() {
+  rawTagsText.value = buildRawTagsText()
+  rawTagsVisible.value = true
+}
+
+/** 解析原始文本（每行逗号分隔）→ 分类标签。返回失败信息或 null。 */
+function parseRawTags(text: string): Array<{ name: string; category: string }> | string {
+  const out: Array<{ name: string; category: string }> = []
+  const cats: Record<string, string> = { 画师: 'artist', 角色: 'character', 作品: 'copyright', 常规: 'general' }
+  const lines = text.split('\n')
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line) continue
+    // 支持「画师: xxx」或裸行；行尾逗号可忽略
+    const content = line.replace(/,$/, '')
+    const catMatch = content.match(/^(画师|角色|作品|常规)\s*[:：]\s*(.*)$/)
+    const items = catMatch ? catMatch[2].split(',') : content.split(',')
+    const cat = catMatch ? cats[catMatch[1]] : 'general'
+    for (const it of items) {
+      const name = it.trim()
+      if (name) out.push({ name, category: cat })
+    }
+  }
+  return out
+}
+
+/** 生效：删除全部旧标签，按解析结果重建（保留来源 manual）。 */
+async function applyRawTags() {
+  if (!image.value) return
+  const id = image.value.id
+  const parsed = parseRawTags(rawTagsText.value)
+  if (typeof parsed === 'string') {
+    ElMessage.error(parsed)
+    return
+  }
+  try {
+    // 删旧
+    for (const t of tags.value) {
+      await del(`/images/${id}/tags/${t.tag_id}`)
+    }
+    // 建新（按分类；BUG1：空格输入归一化为下划线规范名）
+    for (const p of parsed) {
+      await post(`/images/${id}/tags`, { name: searchTagKey(p.name), category: p.category })
+    }
+    ElMessage.success(`已重建 ${parsed.length} 个标签`)
+    rawTagsVisible.value = false
+    exitEditMode()
+    editDialogVisible.value = false
+    await loadDetail()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 点标签 → 跳到图库页并只搜索该标签。 */
+function jumpTag(name: string) {
+  library.filter = { ...library.filter, tags: [name] }
+  router.push('/library')
+}
+
+/** 一键复制标签（用户指定格式）：
+ *  画师名,
+ *  角色名,
+ *  作品名,
+ *  常规标签1,常规标签2,常规标签3,常规标签4,
+ *  每类一行，行内逗号分隔，行尾逗号。 */
+async function copyTags() {
+  const lines: string[] = []
+  for (const g of tagGroupDefs) {
+    const list = tagGroups.value[g.key]
+    if (list.length === 0) continue
+    lines.push(`${list.map((t) => t.name).join(',')},`)
+  }
+  const text = lines.join('\n')
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success(`已复制 ${tags.value.length} 个标签到剪贴板`)
+  } catch {
+    ElMessage.error('复制失败（剪贴板不可用）')
   }
 }
 
@@ -589,8 +731,59 @@ function fmtBytes(b: number): string {
 
 <template>
   <div v-if="image" class="detail">
+    <!-- 增强1：左栏收起后的展开条 -->
+    <div v-if="tagPanelCollapsed" class="panel-expand-bar left" title="展开标签栏" @click="tagPanelCollapsed = false">
+      <el-icon><ArrowRight /></el-icon>
+    </div>
+    <!-- 增强2：左侧标签栏；BUG3：常驻元素 + 宽度过渡（动画生效、无瞬时偏移） -->
+    <div class="tag-panel-wrap" :class="{ collapsed: tagPanelCollapsed }">
+    <div class="tag-panel">
+      <div class="tag-panel-header">
+        <span class="tag-panel-title">
+          标签（{{ tags.length }}）
+        </span>
+        <div class="tag-panel-actions">
+          <el-button size="small" type="primary" plain @click="copyTags">一键复制</el-button>
+          <el-button size="small" type="success" plain @click="openEditDialog">修改标签</el-button>
+          <el-button size="small" text :title="'收起标签栏'" @click="tagPanelCollapsed = true">◀ 收起</el-button>
+        </div>
+      </div>
+      <div class="tag-panel-sub">
+        <el-button size="small" text type="primary" @click="readAiInfo">读取元数据</el-button>
+        <el-button size="small" :type="aiChecked ? 'info' : 'warning'" text plain @click="toggleAiMark">
+          {{ aiChecked ? '取消 AI 标记' : '标记为 AI' }}
+        </el-button>
+      </div>
+      <div v-if="hasAnyTags" class="tag-panel-body">
+        <div v-for="g in tagGroupDefs" :key="g.key" class="tag-sec">
+          <div v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0" class="tag-sec-label">
+            {{ g.label }}（{{ tagGroups[g.key as keyof typeof tagGroups].length }}）
+          </div>
+          <div
+            v-for="t in tagGroups[g.key as keyof typeof tagGroups]"
+            :key="t.name"
+            class="tag-line"
+            :title="`${t.name}：${t.image_count} 张`"
+            @click="jumpTag(t.name)"
+          >
+            <span class="tag-line-name">{{ displayTagName(t.name) }}</span>
+            <span v-if="t.name_cn" class="tag-line-cn">[“{{ t.name_cn }}”]</span>
+            <span class="tag-line-freq">{{ t.image_count }}</span>
+          </div>
+        </div>
+      </div>
+      <el-empty v-else description="暂无标签（可读取元数据）" :image-size="50" />
+      <pre v-if="aiInfo" class="ai-info">{{ aiInfo }}</pre>
+    </div>
+    </div>
+
     <div class="viewer">
       <button class="nav-close" title="返回" @click="goBack">✕</button>
+      <!-- 增强2：浏览上下文位置（来源目录组/筛选结果内的序号；无上下文时为全局库顺序） -->
+      <div class="nav-pos" :title="library.viewerContext ? `浏览范围：${library.viewerContext.label}` : '浏览范围：全部图片'">
+        {{ indexInList >= 0 ? indexInList + 1 : '?' }} / {{ orderedIds.length }}
+        <span v-if="library.viewerContext" class="nav-pos-label">{{ library.viewerContext.label }}</span>
+      </div>
       <button class="nav-arrow left" title="上一张" @click="gotoImage(-1)">‹</button>
       <div ref="stageRef" class="stage" @click="enterFullscreen">
         <!-- 旧图：新图加载完成前保持显示（v-show 不卸载；无旧图时隐藏） -->
@@ -648,8 +841,22 @@ function fmtBytes(b: number): string {
       </div>
     </Transition>
 
+    <!-- 增强1：右栏收起后的展开条 -->
+    <div v-if="infoPanelCollapsed" class="panel-expand-bar" title="展开右侧信息栏" @click="infoPanelCollapsed = false">
+      <el-icon><ArrowLeft /></el-icon>
+    </div>
+    <!-- BUG3：右栏常驻 + 宽度过渡 -->
+    <div class="panel-wrap" :class="{ collapsed: infoPanelCollapsed }">
     <div class="panel">
-      <el-descriptions :column="1" title="基本信息" border>
+      <!-- 增强1：整栏收起按钮（右栏收起 → 图片区变大） -->
+      <div class="panel-collapse-bar">
+        <el-button size="small" text :title="'收起右侧信息栏'" @click="infoPanelCollapsed = true">▶ 收起</el-button>
+      </div>
+      <div class="panel-block">
+        <div class="panel-title">
+          基本信息
+        </div>
+        <el-descriptions :column="1" border>
         <el-descriptions-item label="文件名">
           <span class="file-name">{{ image.name }}</span>
           <el-button size="small" text type="primary" style="margin-left: 8px" @click="renameImage">重命名</el-button>
@@ -686,109 +893,6 @@ function fmtBytes(b: number): string {
           <el-tag v-else type="warning" plain style="margin-left: 6px">未打标</el-tag>
         </el-descriptions-item>
       </el-descriptions>
-
-      <div class="panel-block">
-        <div class="panel-title">
-          标签
-          <el-button size="small" type="primary" plain @click="readAiInfo">
-            读取元数据
-          </el-button>
-          <el-button size="small" :type="aiChecked ? 'info' : 'warning'" plain @click="toggleAiMark">
-            {{ aiChecked ? '取消 AI 标记' : '手动标记为 AI' }}
-          </el-button>
-          <el-button
-            v-if="!editMode"
-            size="small"
-            type="success"
-            plain
-            @click="enterEditMode"
-          >
-            编辑模式
-          </el-button>
-          <template v-else>
-            <el-button size="small" type="success" @click="applyTagChanges">
-              生效修改
-            </el-button>
-            <el-button size="small" plain @click="exitEditMode">取消</el-button>
-          </template>
-        </div>
-        <div v-if="editMode" class="edit-hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</div>
-        <div v-if="hasAnyTags || editMode" class="tag-groups">
-          <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
-            <span v-if="tagGroups[g.key as keyof typeof tagGroups].length > 0 || editMode" class="tag-group-label">
-              {{ g.label }}
-              <!-- 改进1：编辑模式下每分类蓝色 + 号 -->
-              <span
-                v-if="editMode"
-                class="tag-add"
-                title="新增标签"
-                @click="addNewTag(g.key)"
-              >＋</span>
-            </span>
-            <template v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name">
-              <!-- 编辑模式：点标签变输入框 + × 删除 + 还原 -->
-              <template v-if="editMode">
-                <el-input
-                  v-if="editingName === t.name"
-                  v-model="editBuffer"
-                  size="small"
-                  class="tag-edit-input"
-                  autofocus
-                  @blur="stopEditTag(t.name)"
-                  @keyup.enter="stopEditTag(t.name)"
-                />
-                <span
-                  v-else
-                  class="tag-edit"
-                  :class="{ deleted: tagEdits[t.name]?.deleted }"
-                  @click="startEditTag(t.name)"
-                >
-                  {{ tagEdits[t.name]?.newName ?? (t.name_cn ? `${t.name}(${t.name_cn})` : t.name) }}
-                  <span
-                    v-if="tagEdits[t.name]?.dirty && !tagEdits[t.name]?.deleted"
-                    class="tag-revert"
-                    title="还原文本（不还原删除状态）"
-                    @click.stop="applyTagEdit(t.name, t.name)"
-                  >↻</span>
-                  <span
-                    class="tag-del"
-                    :class="{ armed: tagEdits[t.name]?.deleted }"
-                    :title="tagEdits[t.name]?.deleted ? '再点恢复' : '标记删除'"
-                    @click.stop="toggleTagDelete(t.name)"
-                  >✕</span>
-                </span>
-              </template>
-              <!-- 普通模式 -->
-              <el-tag v-else :key="t.name" class="tag" size="small" :type="g.type">
-                {{ t.name_cn ? `${t.name}(${t.name_cn})` : t.name }}
-              </el-tag>
-            </template>
-            <!-- 改进1：新增标签输入框（编辑模式下） -->
-            <template v-for="nt in newTagsOf(g.key)" :key="nt.key">
-              <el-input
-                v-if="editingNewKey === nt.key"
-                v-model="newTagBuffer"
-                size="small"
-                class="tag-edit-input"
-                autofocus
-                placeholder="输入新标签…"
-                @blur="commitNewTagEdit(nt.key)"
-                @keyup.enter="commitNewTagEdit(nt.key)"
-              />
-              <span
-                v-else
-                class="tag-edit"
-                :class="{ 'new-tag': true }"
-                @click="startNewTagEdit(nt.key)"
-              >
-                {{ nt.value || '（空）' }}
-                <span class="tag-del" @click.stop="removeNewTag(nt.key)">✕</span>
-              </span>
-            </template>
-          </div>
-        </div>
-        <el-empty v-else description="暂无标签（可点击上方按钮读取 AI 生成信息）" :image-size="50" />
-        <pre v-if="aiInfo" class="ai-info">{{ aiInfo }}</pre>
       </div>
 
       <div class="panel-block">
@@ -799,6 +903,7 @@ function fmtBytes(b: number): string {
         <el-button type="success" plain @click="rescoreAesthetic">美学处理</el-button>
         <el-button plain @click="trySauce">尝试溯源</el-button>
       </div>
+    </div>
     </div>
   </div>
 
@@ -817,10 +922,16 @@ function fmtBytes(b: number): string {
       <div class="compare-side">
         <div class="compare-side-title">网络原图</div>
         <template v-if="netInfo">
-          <el-image v-if="netInfo.file_url" :src="netInfo.file_url" fit="contain" class="compare-img" :preview-src-list="[netInfo.file_url]">
-            <template #error><span class="placeholder-name">网络图加载失败</span></template>
-          </el-image>
-          <div v-else class="compare-img placeholder-name">无网络图链接</div>
+          <img
+            v-if="netInfo.file_url"
+            :src="proxyUrl(netInfo.file_url)"
+            class="compare-img compare-img-native"
+            alt="网络原图"
+            @load="netImgOk = true"
+            @error="netImgOk = false"
+          />
+          <div v-if="netInfo.file_url && !netImgOk" class="compare-img placeholder-name">网络图加载失败</div>
+          <div v-else-if="!netInfo.file_url" class="compare-img placeholder-name">无网络图链接</div>
           <div class="compare-meta">
             <div :class="pxColor">
               分辨率：{{ netInfo.width && netInfo.height ? `${netInfo.width} × ${netInfo.height}` : '未知' }}
@@ -830,13 +941,103 @@ function fmtBytes(b: number): string {
             </div>
           </div>
         </template>
-        <el-empty v-else-if="!compareLoading" description="无法获取网络图信息" :image-size="50" />
+        <el-empty v-else-if="!compareLoading && !compareError" description="无法获取网络图信息" :image-size="50" />
+        <el-empty v-else-if="!compareLoading && compareError" :description="compareError" :image-size="50" />
       </div>
     </div>
     <template #footer>
       <span class="hint" style="margin-right: auto">红色=网络图更大 绿色=图库图更大 白色=相等</span>
       <el-button @click="compareVisible = false">保留图库原图</el-button>
       <el-button type="primary" :disabled="!netInfo?.file_url" @click="keepNetwork">保留网络原图</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- 增强2：修改标签二级窗口（复用原标签编辑模式逻辑） -->
+  <el-dialog v-model="editDialogVisible" title="修改标签" width="560px" append-to-body @closed="exitEditMode">
+    <div class="edit-hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</div>
+    <!-- 追加增强1：修改原始标签文本入口 -->
+    <div class="edit-hint">
+      <el-button size="small" text type="primary" @click="openRawTagsDialog">修改原始标签文本…</el-button>
+    </div>
+    <div class="tag-groups">
+      <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
+        <!-- 追加BUG2：空分类也显示 + 号，允许新增任意分类标签 -->
+        <span class="tag-group-label">
+          {{ g.label }}
+          <span class="tag-add" title="新增标签" @click="addNewTag(g.key)">＋</span>
+        </span>
+        <template v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name">
+          <el-input
+            v-if="editingName === t.name"
+            v-model="editBuffer"
+            size="small"
+            class="tag-edit-input"
+            autofocus
+            @blur="stopEditTag(t.name)"
+            @keyup.enter="stopEditTag(t.name)"
+          />
+          <span
+            v-else
+            class="tag-edit"
+            :class="{ deleted: tagEdits[t.name]?.deleted }"
+            @click="startEditTag(t.name)"
+          >
+            {{ tagEdits[t.name]?.newName ?? (t.name_cn ? `${t.name}(${t.name_cn})` : t.name) }}
+            <span
+              v-if="tagEdits[t.name]?.dirty && !tagEdits[t.name]?.deleted"
+              class="tag-revert"
+              title="还原文本（不还原删除状态）"
+              @click.stop="applyTagEdit(t.name, t.name)"
+            >↻</span>
+            <span
+              class="tag-del"
+              :class="{ armed: tagEdits[t.name]?.deleted }"
+              :title="tagEdits[t.name]?.deleted ? '再点恢复' : '标记删除'"
+              @click.stop="toggleTagDelete(t.name)"
+            >✕</span>
+          </span>
+        </template>
+        <template v-for="nt in newTagsOf(g.key)" :key="nt.key">
+          <el-input
+            v-if="editingNewKey === nt.key"
+            v-model="newTagBuffer"
+            size="small"
+            class="tag-edit-input"
+            autofocus
+            placeholder="输入新标签…"
+            @blur="commitNewTagEdit(nt.key)"
+            @keyup.enter="commitNewTagEdit(nt.key)"
+          />
+          <span
+            v-else
+            class="tag-edit"
+            :class="{ 'new-tag': true }"
+            @click="startNewTagEdit(nt.key)"
+          >
+            {{ nt.value || '（空）' }}
+            <span class="tag-del" @click.stop="removeNewTag(nt.key)">✕</span>
+          </span>
+        </template>
+      </div>
+    </div>
+    <template #footer>
+      <el-button @click="editDialogVisible = false">取消</el-button>
+      <el-button type="success" @click="applyTagChanges">生效修改</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- 追加增强1：修改原始标签文本（三级窗口） -->
+  <el-dialog v-model="rawTagsVisible" title="修改原始标签文本" width="480px" append-to-body>
+    <div class="edit-hint">每行一个分类，行内逗号分隔，行尾逗号可省略</div>
+    <el-input
+      v-model="rawTagsText"
+      type="textarea"
+      :rows="10"
+      placeholder="画师名,&#10;角色名,&#10;作品名,&#10;常规标签1,常规标签2,常规标签3,常规标签4,"
+    />
+    <template #footer>
+      <el-button @click="rawTagsVisible = false">取消</el-button>
+      <el-button type="success" @click="applyRawTags">生效</el-button>
     </template>
   </el-dialog>
   <el-empty v-if="!image" description="图片不存在或已删除" />
@@ -847,6 +1048,91 @@ function fmtBytes(b: number): string {
   display: flex;
   gap: 16px;
   height: 100%;
+}
+/* 增强2：左侧标签栏；BUG3：宽度过渡（动画生效、无瞬时偏移；内容 min-width 防挤压） */
+.tag-panel-wrap {
+  width: 300px;
+  flex: none;
+  overflow: hidden;
+  transition: width 0.22s ease;
+}
+.tag-panel-wrap.collapsed {
+  width: 0;
+}
+.tag-panel {
+  width: 300px;
+  min-width: 300px;
+  height: 100%;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+.tag-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.tag-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.tag-panel-actions {
+  display: flex;
+  gap: 6px;
+}
+.tag-panel-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.tag-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+.tag-sec {
+  margin-bottom: 12px;
+}
+.tag-sec-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 4px;
+}
+.tag-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 1.5;
+  font-size: 13px;
+  user-select: none;
+  flex-wrap: wrap;
+}
+.tag-line:hover {
+  background: var(--el-fill-color-light);
+}
+.tag-line-name {
+  color: var(--el-color-primary);
+  word-break: break-all;
+}
+.tag-line-cn {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+.tag-line-freq {
+  color: var(--el-text-color-placeholder);
+  font-size: 12px;
+  margin-left: auto;
 }
 .viewer {
   flex: 1;
@@ -917,6 +1203,24 @@ function fmtBytes(b: number): string {
 }
 .nav-close:hover {
   background: rgba(0, 0, 0, 0.7);
+}
+/* 增强2：上下文位置指示 */
+.nav-pos {
+  position: absolute;
+  top: 18px;
+  left: 16px;
+  z-index: 10;
+  padding: 4px 12px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: none;
+}
+.nav-pos-label {
+  margin-left: 6px;
+  opacity: 0.75;
 }
 .nav-arrow {
   position: absolute;
@@ -1036,10 +1340,47 @@ function fmtBytes(b: number): string {
 .fs-leave-to {
   opacity: 0;
 }
-.panel {
+.panel-wrap {
   width: 400px;
   flex: none;
+  overflow: hidden;
+  transition: width 0.22s ease;
+}
+.panel-wrap.collapsed {
+  width: 0;
+}
+.panel {
+  width: 400px;
+  min-width: 400px;
+  height: 100%;
   overflow-y: auto;
+}
+/* 增强1：右栏收起条/展开条 */
+.panel-collapse-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.panel-expand-bar {
+  width: 24px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--el-text-color-secondary);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  user-select: none;
+}
+.panel-expand-bar.left {
+  height: 100%;
+  align-self: stretch;
+}
+.panel-expand-bar:hover {
+  color: var(--el-color-primary);
+  background: var(--el-fill-color-light);
 }
 .panel-block {
   margin-top: 16px;
@@ -1201,6 +1542,11 @@ function fmtBytes(b: number): string {
   min-height: 240px;
   background: var(--el-fill-color-light);
   border-radius: 6px;
+}
+.compare-img-native {
+  width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
 .compare-img :deep(.el-image__inner) {
   max-width: 100%;

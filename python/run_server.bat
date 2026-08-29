@@ -1,44 +1,45 @@
 @echo off
-chcp 65001 >nul
-rem 推理服务启动脚本
-rem Python 优先级：1) 本项目 python/.venv（推荐，setup.bat 创建） 2) 系统 python（py -3 / python）
-rem 不再依赖任何外部固定路径（如 cl_tagger/.venv），避免「依赖强绑定本机」
+rem BeiWay-MoeVault inference server launcher.
+rem Python priority: 1) ./.venv  2) %%LOCALAPPDATA%%\BeiWay-MoeVault\python\.venv (app-managed)
+rem                  3) py -3    4) python on PATH
+rem NOTE: keep this file ASCII-only. cmd.exe mis-parses UTF-8 batch files
+rem       (chcp 65001 re-read splits lines mid-byte -> comment fragments run as commands).
 setlocal
 cd /d "%~dp0"
 
 set "PY="
-if exist ".venv\Scripts\python.exe" (
-    set "PY=%CD%\.venv\Scripts\python.exe"
-) else (
-    where py >nul 2>nul && set "PY=py -3"
-)
-if not defined PY (
-    where python >nul 2>nul && set "PY=python"
-)
+if exist ".venv\Scripts\python.exe" set "PY=%CD%\.venv\Scripts\python.exe"
+if not defined PY if exist "%LOCALAPPDATA%\BeiWay-MoeVault\python\.venv\Scripts\python.exe" set "PY=%LOCALAPPDATA%\BeiWay-MoeVault\python\.venv\Scripts\python.exe"
+if not defined PY where py >nul 2>nul && set "PY=py -3"
+if not defined PY where python >nul 2>nul && set "PY=python"
 
 if not defined PY (
-    echo [错误] 未找到 Python。请安装 Python 3.10+，或运行 setup.bat 自动创建 .venv。
+    echo [ERROR] Python not found. Install Python 3.10+ and add to PATH, or run setup.bat first.
     pause
     exit /b 1
 )
 
-echo [信息] 使用 Python: %PY%
-echo [信息] 检查依赖（fastapi/uvicorn）...
-%PY% -c "import fastapi, uvicorn" 2>nul
+echo [INFO] Python: %PY%
+echo [INFO] Checking deps (fastapi/uvicorn)...
+%PY% -c "import fastapi, uvicorn" >nul 2>nul
 if errorlevel 1 (
-    echo [信息] 依赖缺失，尝试自动安装（首次运行，可能耗时）...
-    %PY% -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo [INFO] Deps missing. Installing via Tsinghua mirror, may take minutes...
+    %PY% -m pip install --disable-pip-version-check -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     if errorlevel 1 (
-        echo [错误] 依赖安装失败。建议运行 setup.bat 创建独立 .venv。
-        pause
-        exit /b 1
+        echo [INFO] Mirror failed, falling back to official PyPI...
+        %PY% -m pip install --disable-pip-version-check -r requirements.txt
+        if errorlevel 1 (
+            echo [ERROR] Dep install failed. Check network, or run setup.bat to create a standalone .venv.
+            pause
+            exit /b 1
+        )
     )
 )
 
 echo.
-echo [信息] 启动推理服务: http://127.0.0.1:8001
-echo [信息] 健康检查:     curl http://127.0.0.1:8001/health
-echo [信息] Ctrl+C 停止
+echo [INFO] Starting inference server: http://127.0.0.1:8001
+echo [INFO] Health check:  curl http://127.0.0.1:8001/health
+echo [INFO] Press Ctrl+C to stop.
 echo.
 %PY% -m uvicorn server.main:app --host 127.0.0.1 --port 8001
 pause

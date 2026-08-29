@@ -9,6 +9,8 @@ import { get } from '@/api/client'
 export interface InferModelState {
   state: 'ok' | 'failed' | 'not_loaded'
   error: string | null
+  /** 打标模型种类：cl_tagger / wd14（美学模型无此字段） */
+  kind?: string
 }
 
 export interface InferHealth {
@@ -19,6 +21,7 @@ export interface InferHealth {
   }
   paths: {
     tagger_model_dir: string
+    tagger_model_kind: string
     aesthetic_model: string
   }
 }
@@ -63,4 +66,25 @@ export async function inferStop(): Promise<void> {
   const invoke = tauriInvoke()
   if (!invoke) throw new Error('仅桌面版支持停止推理服务')
   await invoke('infer_stop')
+}
+
+/** 请求桌面壳为推理服务安装缺失依赖（fastapi/uvicorn/transformers 等 CPU 包）。 */
+export async function inferInstallDeps(): Promise<string> {
+  const invoke = tauriInvoke()
+  if (!invoke) throw new Error('仅桌面版支持安装推理服务依赖')
+  return (await invoke('infer_install_deps')) as string
+}
+
+/** 桌面壳推理服务命令状态（依赖缺失等启动前诊断信息）。 */
+export interface InferShellStatus {
+  running: boolean
+  owned: boolean
+  deps_missing: string[]
+}
+
+/** 查询桌面壳对推理服务的诊断状态（服务未运行时含依赖缺失列表）。 */
+export async function inferShellStatus(): Promise<InferShellStatus | null> {
+  const invoke = tauriInvoke()
+  if (!invoke) return null // 浏览器环境无壳诊断
+  return (await invoke('infer_status')) as InferShellStatus
 }

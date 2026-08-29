@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
-import { Delete, CaretRight, VideoPause, Refresh } from '@element-plus/icons-vue'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
+import { Delete, CaretRight, VideoPause, Refresh, Download } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post, del, put } from '@/api/client'
 import { useSettingsStore, type SauceKeyConfig } from '@/stores/settings'
 import { reportLog } from '@/api/log'
 import {
   fetchInferHealth,
+  inferInstallDeps,
+  inferShellStatus,
   inferStart,
   inferStop,
   isTauri,
@@ -33,12 +35,28 @@ const keys = ref<SauceKeyConfig[] & Array<Record<string, unknown>>>([])
 const manageVisible = ref(false)
 const saving = ref(false)
 
-// ---- 打标模型：自动探测（推荐）/ 自定义目录 ----
+// ---- 打标模型：模型种类 + 自动探测（推荐）/ 自定义目录 ----
+// 模型种类：auto=按目录内容自动判定；cl_tagger=SIGLIP2 ONNX；wd14=wd14 tagger ONNX
+const taggerKindOptions = [
+  { value: 'auto', label: '自动探测（推荐）' },
+  { value: 'cl_tagger', label: 'cl-tagger (SIGLIP2 ONNX)' },
+  { value: 'wd14', label: 'WD14 Tagger (ONNX)' },
+]
+
+const kindLabel = (k?: string) =>
+  taggerKindOptions.find((o) => o.value === (k || 'auto'))?.label ?? '自动探测'
+
 // 自动探测顺序：项目内 models/tagger → 旧位置 D:/Game/AI/cl_tagger/models → 自定义目录
 const taggerModelOptions = [
   { name: '自动探测（推荐）', dir: '' },
   { name: '自定义目录', dir: '__custom__' },
 ]
+
+function onKindSelect(value: string) {
+  settings.settings.tagger_model_kind = value
+  settings.settings.tagger_model_name = kindLabel(value)
+  ElMessage.info(`模型种类已切换为「${kindLabel(value)}」，保存设置后重跑打标任务生效`)
+}
 
 // ---- 推理服务状态卡片 ----
 const inferHealth = ref<InferHealth | null>(null)
@@ -110,6 +128,35 @@ const modelStateText = (m?: InferModelState) =>
       : m.state === 'failed'
         ? `加载失败：${m.error ?? ''}`
         : '未加载（首次调用时加载）'
+
+// ---- 桌面壳诊断：依赖缺失检测 + 一键安装（仅桌面版） ----
+const shellDepsMissing = ref<string[]>([])
+const installingDeps = ref(false)
+
+async function loadShellDiagnostics() {
+  if (!isTauri()) return
+  try {
+    const s = await inferShellStatus()
+    shellDepsMissing.value = s?.deps_missing ?? []
+  } catch {
+    shellDepsMissing.value = []
+  }
+}
+
+async function onInstallDeps() {
+  installingDeps.value = true
+  try {
+    const msg = await inferInstallDeps()
+    ElMessage.success(msg)
+    shellDepsMissing.value = []
+    // 安装完成后自动尝试启动
+    await onInferStart()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    installingDeps.value = false
+  }
+}
 
 async function loadKeys() {
   try {
@@ -196,12 +243,75 @@ async function saveSettings() {
   saving.value = true
   try {
     await settings.save()
+    settingsDirty.value = false
     reportLog('用户修改并保存了设置')
     ElMessage.success('设置已保存')
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
     saving.value = false
+  }
+}
+
+// ---- 增强2：未保存设置离开提醒 ----
+const settingsDirty = ref(false)
+/** 追踪设置快照，检测是否有未保存修改。 */
+let settingsSnapshot = ''
+function snapshotSettings(): string {
+  return JSON.stringify(settings.settings)
+}
+watch(
+  () => settings.settings,
+  () => {
+    if (settingsSnapshot === '') settingsSnapshot = snapshotSettings()
+    else settingsDirty.value = snapshotSettings() !== settingsSnapshot
+  },
+  { deep: true },
+)
+/** 保存后重置快照。 */
+watch(
+  () => settingsDirty.value,
+  (d) => {
+    if (!d && settingsSnapshot !== '') settingsSnapshot = snapshotSettings()
+  },
+)
+
+/** 离开设置页确认：未保存时三选（保存/放弃/取消）。 */
+onBeforeRouteLeave(async () => {
+  if (!settingsDirty.value) return true
+  const action = await ElMessageBox.confirm(
+    '设置尚未保存，离开将丢失修改。',
+    '未保存的设置',
+    {
+      confirmButtonText: '保存并离开',
+      cancelButtonText: '放弃修改',
+      distinguishCancelAndClose: true,
+      type: 'warning',
+    },
+  )
+    .then(() => 'save' as const)
+    .catch((action: string | 'cancel' | 'close') => (action === 'cancel' ? ('discard' as const) : ('stay' as const)))
+  if (action === 'save') {
+    await saveSettings()
+    return true
+  }
+  if (action === 'discard') return true
+  return false
+})
+
+/** 增强1：导入中文字典（下载 ffdfkj tag.sqlite → 回填 name_cn，仅填空缺）。 */
+const dictImporting = ref(false)
+async function importCnDict() {
+  dictImporting.value = true
+  try {
+    const r = await post<{ matched: number; updated: number; missing: number }>('/dict/import')
+    ElMessage.success(
+      `中文字典导入完成：匹配 ${r.matched} 条，更新 ${r.updated} 个标签${r.missing > 0 ? `（${r.missing} 个标签未入库）` : ''}`,
+    )
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    dictImporting.value = false
   }
 }
 
@@ -290,6 +400,25 @@ async function loadLogs() {
     ElMessage.error((e as Error).message)
   } finally {
     logLoading.value = false
+  }
+}
+
+// 增强1：BUG追踪器——追踪开关（localStorage）+ 后端转储
+const bugTrackerEnabled = ref(localStorage.getItem('moevault-bug-tracker') === '1')
+watch(bugTrackerEnabled, (v) => {
+  localStorage.setItem('moevault-bug-tracker', v ? '1' : '0')
+  reportLog(v ? 'BUG追踪器已开启' : 'BUG追踪器已关闭')
+})
+const dumpLoading = ref(false)
+async function dumpLogsBackend() {
+  dumpLoading.value = true
+  try {
+    const r = await get<{ path: string; count: number }>('/logs/export')
+    ElMessage.success(`已转储 ${r.count} 条日志：${r.path}`)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    dumpLoading.value = false
   }
 }
 
@@ -414,6 +543,7 @@ onMounted(async () => {
   await loadDevices()
   loadLogSettings()
   loadInferHealth()
+  loadShellDiagnostics()
 })
 </script>
 
@@ -446,15 +576,7 @@ onMounted(async () => {
           </el-form-item>
           <el-form-item label="分页模式">
             <el-switch v-model="settings.settings.pagination_enabled" active-text="开启" inactive-text="关闭" />
-            <span class="hint">开启后图库按每页固定条数分页（适合低配置 PC），关闭则一次加载全部</span>
-          </el-form-item>
-          <el-form-item v-if="settings.settings.pagination_enabled" label="每页条数">
-            <el-select v-model="settings.settings.page_size" style="width: 120px">
-              <el-option :value="25" label="25" />
-              <el-option :value="50" label="50" />
-              <el-option :value="75" label="75" />
-              <el-option :value="100" label="100" />
-            </el-select>
+            <span class="hint">开启后图库按每页固定条数分页（每页条数在图库页右下角设置），关闭则一次加载全部</span>
           </el-form-item>
           <el-form-item label="预加载图片张数">
             <el-input-number v-model="settings.settings.preload_count" :min="0" :max="5" />
@@ -501,7 +623,33 @@ onMounted(async () => {
             </template>
             <span v-else class="hint">浏览器模式仅展示状态；启动请运行 python/run_server.bat</span>
           </div>
+          <!-- 依赖缺失：显示原因 + 一键安装（仅桌面版） -->
+          <el-alert
+            v-if="isTauri() && shellDepsMissing.length > 0"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="inf-alert"
+          >
+            <template #title>
+              推理服务依赖缺失：{{ shellDepsMissing.join('、') }}
+              <el-button
+                size="small"
+                type="warning"
+                :icon="Download"
+                :loading="installingDeps"
+                style="margin-left: 8px"
+                @click="onInstallDeps"
+              >
+                一键安装依赖
+              </el-button>
+            </template>
+            <span>将安装 fastapi / uvicorn / transformers（纯 CPU 包），完成后自动尝试启动服务</span>
+          </el-alert>
           <el-descriptions :column="1" size="small" border class="infer-desc">
+            <el-descriptions-item label="打标模型种类">
+              <span>{{ inferHealth?.models?.tagger?.kind ? kindLabel(inferHealth.models.tagger.kind) : '（服务未启动）' }}</span>
+            </el-descriptions-item>
             <el-descriptions-item label="打标模型目录">
               <span class="mono">{{ inferHealth?.paths?.tagger_model_dir || '（服务未启动）' }}</span>
               <span v-if="inferHealth && !settings.settings.tagger_model_dir" class="hint">自动探测</span>
@@ -517,6 +665,16 @@ onMounted(async () => {
 
         <el-card header="打标" shadow="never" class="inf-card">
           <el-form label-width="160px" style="max-width: 720px">
+            <el-form-item label="模型种类">
+              <el-select
+                :model-value="settings.settings.tagger_model_kind || 'auto'"
+                style="width: 260px"
+                @change="onKindSelect"
+              >
+                <el-option v-for="o in taggerKindOptions" :key="o.value" :label="o.label" :value="o.value" />
+              </el-select>
+              <span class="hint">auto=按模型目录自动判定；cl-tagger 用 model_vocabulary.json，wd14 用 selected_tags.csv</span>
+            </el-form-item>
             <el-form-item label="打标模型来源">
               <el-select
                 :model-value="settings.settings.tagger_model_dir ? '自定义目录' : '自动探测（推荐）'"
@@ -555,14 +713,15 @@ onMounted(async () => {
             </el-form-item>
           </el-form>
         </el-card>
-      </el-tab-pane>
-
-      <el-tab-pane label="查重" name="dedup">
-        <el-form label-width="160px" style="max-width: 720px">
-          <el-form-item label="pHash 汉明距离阈值">
-            <el-slider v-model="settings.settings.dedup_hamming" :min="0" :max="64" show-input style="width: 260px" />
-          </el-form-item>
-        </el-form>
+        <!-- 改进2：查重设置（本地推理页末尾独立卡片） -->
+        <el-card header="查重" shadow="never" class="inf-card">
+          <el-form label-width="160px" style="max-width: 720px">
+            <el-form-item label="pHash 汉明距离">
+              <el-slider v-model="settings.settings.dedup_hamming" :min="0" :max="64" show-input style="width: 260px" />
+              <span class="hint">查重分组阈值（默认 8）</span>
+            </el-form-item>
+          </el-form>
+        </el-card>
       </el-tab-pane>
 
       <el-tab-pane label="回收站 / sidecar" name="misc">
@@ -574,24 +733,42 @@ onMounted(async () => {
           <el-form-item label="sidecar .txt">
             <el-switch v-model="settings.settings.sidecar_enabled" active-text="开启" inactive-text="关闭" />
           </el-form-item>
+        </el-form>
+      </el-tab-pane>
+
+      <!-- 改进1：标签设置页（字典相关设置从回收站页移出） -->
+      <el-tab-pane label="标签" name="tags">
+        <el-form label-width="160px" style="max-width: 720px">
           <el-form-item label="中文字典">
             <el-switch v-model="settings.settings.cn_dict_enabled" active-text="开启" inactive-text="关闭" />
+            <span class="hint">打标/显示时使用中英文对照</span>
+          </el-form-item>
+          <el-form-item label="优先中文标签">
+            <el-switch v-model="settings.settings.tag_show_cn_first" active-text="开启" inactive-text="关闭" />
+            <span class="hint">开启后显示为 女孩(1girl)，关闭为 1girl(女孩)</span>
+          </el-form-item>
+          <el-form-item label="中文字典导入">
+            <el-button :loading="dictImporting" @click="importCnDict">导入中文字典</el-button>
+            <span class="hint">从 ffdfkj 的 Danbooru 中英对照表（tag.sqlite，317K+ 条）回填中文别名，仅填空缺</span>
           </el-form-item>
         </el-form>
       </el-tab-pane>
 
-      <!-- 日志面板（日志追踪器）：任务/溯源/打标/前端操作记录，排查问题用 -->
-      <el-tab-pane label="日志" name="logs">
+      <!-- 增强1：BUG追踪器（原日志面板） -->
+      <el-tab-pane label="BUG追踪器" name="logs">
         <div class="log-panel">
           <div class="log-toolbar">
+            <el-switch v-model="bugTrackerEnabled" active-text="追踪已开启" inactive-text="追踪关闭" />
+            <span class="hint">开启后详细记录操作与报错；应用退出时自动转储为 txt 文件</span>
+          </div>
+          <div class="log-toolbar" style="margin-top: 6px">
             <el-button size="small" @click="loadLogs">刷新</el-button>
-            <el-button size="small" type="primary" plain @click="exportLogs">导出 txt</el-button>
+            <el-button size="small" type="primary" plain @click="exportLogs">导出 txt（前端）</el-button>
+            <el-button size="small" type="warning" plain :loading="dumpLoading" @click="dumpLogsBackend">转储（后端）</el-button>
             <el-button size="small" type="danger" plain @click="clearLogs">清空日志</el-button>
-            <span class="hint">记录任务生命周期、溯源/打标结果、前端操作，排查打标/溯源失败用</span>
           </div>
           <div class="log-toolbar" style="margin-top: 6px; flex-wrap: wrap">
             <el-switch v-model="settings.settings.log_clear_on_start" active-text="启动时清空旧日志" inactive-text="保留旧日志" />
-            <span class="hint">开启后每次启动服务自动清空旧日志并写入一条「服务已启动」记录（默认开启）</span>
           </div>
           <div class="log-toolbar" style="margin-top: 6px; flex-wrap: wrap">
             <span class="hint">自动刷新：</span>
@@ -600,7 +777,6 @@ onMounted(async () => {
             </el-select>
             <span class="hint">自动滚动：</span>
             <el-switch v-model="logAutoScroll" size="small" active-text="开" inactive-text="关" />
-            <span class="hint">打开本页立即刷新；自动滚动仅在已滚到底部时跟随最新日志</span>
           </div>
           <div v-loading="logLoading" ref="logListRef" class="log-list">
             <el-empty v-if="logs.length === 0 && !logLoading" description="暂无日志" :image-size="50" />
@@ -689,6 +865,9 @@ onMounted(async () => {
 }
 .infer-desc {
   margin-top: 4px;
+}
+.inf-alert {
+  margin-bottom: 12px;
 }
 .mono {
   font-family: monospace;

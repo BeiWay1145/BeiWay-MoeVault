@@ -32,6 +32,25 @@ async function load() {
   }
 }
 
+/** 原因显示中文化。 */
+function reasonLabel(reason: string): string {
+  switch (reason) {
+    case 'manual':
+      return '手动删除'
+    case 'duplicate':
+      return '查重冗余'
+    case 'test-cleanup':
+      return '测试清理'
+    default:
+      return reason
+  }
+}
+
+/** 原路径显示归一化（混合分隔符 → 统一反斜杠）。 */
+function normPath(p: string): string {
+  return p.replace(/\//g, '\\')
+}
+
 function fmtDate(ts: number) {
   return new Date(ts * 1000).toLocaleString()
 }
@@ -120,11 +139,15 @@ onMounted(load)
             </el-image>
           </template>
         </el-table-column>
-        <el-table-column label="原路径" prop="original_rel" />
+        <el-table-column label="原路径">
+          <template #default="{ row }">
+            <span class="num-mono">{{ normPath(row.original_rel) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="原因" width="130">
           <template #default="{ row }">
             <el-tag :type="row.reason === 'duplicate' ? 'warning' : 'info'" size="small">
-              {{ row.reason === 'duplicate' ? '查重冗余' : row.reason }}
+              {{ reasonLabel(row.reason) }}
             </el-tag>
           </template>
         </el-table-column>

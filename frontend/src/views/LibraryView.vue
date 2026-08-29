@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Grid, List, Close, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -10,6 +10,7 @@ import { post } from '@/api/client'
 import { reportLog } from '@/api/log'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
+import SearchFilter from '@/components/SearchFilter.vue'
 
 // keep-alive 缓存名（与路由 name 一致）
 defineOptions({ name: 'library' })
@@ -23,11 +24,17 @@ const library = useLibraryStore()
 const taskStore = useTaskStore()
 const settingsStore = useSettingsStore()
 
-// E6: 分页模式（通用设置开启时生效）
+// E6: 分页模式（图库每页数独立 localStorage，增强4）
 const page = ref(1)
 const pageCursors = ref<Record<number, string>>({})
 const paginationOn = computed(() => settingsStore.settings.pagination_enabled)
-const pageSize = computed(() => settingsStore.settings.page_size || 50)
+const pageSize = ref(Number(localStorage.getItem('moevault-library-page-size') || '50'))
+
+/** 增强4：图库每页数修改立即生效持久化（BUG2：接收 size 参数并更新 ref，watch 负责重置+刷新）。 */
+function onLibraryPageSizeChange(s: number) {
+  pageSize.value = s
+  localStorage.setItem('moevault-library-page-size', String(s))
+}
 
 /** 按当前分页状态拉取（分页开启→cursor 翻页；关闭→一次拉取）。 */
 async function fetchPage() {
@@ -63,6 +70,8 @@ onMounted(async () => {
   // 增强1：从详情返回/重启后还原上次浏览位置
   await nextTick()
   restorePos()
+  // 增强1：导入批次完成（WS 广播派发的窗口事件）→ 自动刷新当前列表
+  window.addEventListener('moevault:import-done', onImportDone)
 })
 
 // keep-alive 激活（从其他板块切回 / 从详情页返回）：重新拉取数据
@@ -76,6 +85,15 @@ onActivated(async () => {
     const scroller = document.querySelector('.app-main')
     if (scroller) scroller.scrollTop = 0
   }
+})
+
+/** 增强1：导入完成 → 按当前筛选/排序重新拉取（保留浏览状态）。 */
+function onImportDone() {
+  fetchPage().catch(() => {})
+}
+
+onUnmounted(() => {
+  window.removeEventListener('moevault:import-done', onImportDone)
 })
 
 /** 恢复滚动位置：定位到上次查看详情的图片附近。返回是否成功恢复。 */
@@ -117,12 +135,18 @@ function openPreview(img: ImageItem) {
   previewVisible.value = true
 }
 
-/** 点击卡片：多选模式→切换选择；否则进入详情（记录位置）。 */
+/** 点击卡片：多选模式→切换选择；否则进入详情（记录位置）。
+ *  增强2：把当前筛选/排序下的列表 id 设为浏览上下文（详情上/下一张在本列表内切换）。 */
 function onCardClick(img: ImageItem) {
   if (library.multiSelect) {
     library.toggleSelect(img.id)
     return
   }
+  const tags = library.filter.tags
+  library.setViewerContext(
+    library.images.map((i) => i.id),
+    tags && tags.length > 0 ? `标签：${tags.join(' + ')}` : '图库',
+  )
   library.saveDetailPos('library', img.id)
   router.push(`/library/${img.id}`)
 }
@@ -214,6 +238,109 @@ async function onBatchSauce() {
 /** 批量溯源是否强制重试不可溯源图。 */
 const forceSauce = ref(false)
 
+// ---- 增强3：下拉框多选批量执行（与主目录一致）+ 全选 + 选中集随筛选自动收缩 ----
+const batchActions = ref<string[]>([])
+const execArmed = ref(false)
+let execTimer: number | undefined
+/** 全选当前显示的图。 */
+const selectAllCurrent = ref(false)
+const selectingAll = ref(false)
+
+/** 全选/取消全选当前筛选结果（library.images 即当前显示的图）。
+ *  BUG2 修复：全选时自动进入多选模式。 */
+async function toggleSelectAll(on: boolean) {
+  selectingAll.value = true
+  try {
+    if (on) {
+      library.multiSelect = true
+      const s = new Set<number>()
+      for (const img of library.images) s.add(img.id)
+      selectAllCurrent.value = true
+      library.selected = s
+    } else {
+      selectAllCurrent.value = false
+      library.selected = new Set()
+    }
+  } finally {
+    selectingAll.value = false
+  }
+}
+
+/** 选中集随筛选自动收缩：library.images 变化时，selected 只保留仍在当前显示里的图。 */
+watch(
+  () => library.images.map((i) => i.id).join(','),
+  () => {
+    const cur = new Set(library.images.map((i) => i.id))
+    const shrunk = new Set([...library.selected].filter((id) => cur.has(id)))
+    // 全选状态：当前显示的图是否全被选中
+    selectAllCurrent.value = library.images.length > 0 && library.images.every((i) => shrunk.has(i.id))
+    if (shrunk.size !== library.selected.size) {
+      library.selected = shrunk
+    }
+  },
+)
+
+/** BUG1：关闭多选模式时同步重置全选状态（勾选图标回到未选）。 */
+watch(
+  () => library.multiSelect,
+  (on) => {
+    if (!on) {
+      selectAllCurrent.value = false
+    }
+  },
+)
+
+/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学。 */
+async function onExecuteBatch() {
+  const ids = [...library.selected]
+  if (ids.length === 0) {
+    ElMessage.warning('没有可执行的图片（请先多选或全选）')
+    return
+  }
+  const order = ['ai-detect', 'sauce', 'tag', 'aesthetic']
+  for (const act of order) {
+    if (!batchActions.value.includes(act)) continue
+    switch (act) {
+      case 'ai-detect':
+        await onBatchDetectAi()
+        break
+      case 'sauce':
+        await onBatchSauce()
+        break
+      case 'tag':
+        await onBatchTag()
+        break
+      case 'aesthetic':
+        await onBatchAesthetic()
+        break
+    }
+  }
+  if (batchActions.value.length > 0) ElMessage.success('批量任务已全部提交')
+  batchActions.value = []
+}
+
+/** 执行按钮两击确认：第一下变红显示「确认执行」，再点执行；Shift 直接执行。 */
+function onExecClick(e: MouseEvent) {
+  if (batchActions.value.length === 0) {
+    ElMessage.warning('请先选择批量行为')
+    return
+  }
+  if (e.shiftKey) {
+    execArmed.value = false
+    onExecuteBatch()
+    return
+  }
+  if (execArmed.value) {
+    execArmed.value = false
+    if (execTimer !== undefined) window.clearTimeout(execTimer)
+    onExecuteBatch()
+  } else {
+    execArmed.value = true
+    if (execTimer !== undefined) window.clearTimeout(execTimer)
+    execTimer = window.setTimeout(() => (execArmed.value = false), 3000)
+  }
+}
+
 /** 批量检测 AI（逐张读 PNG tEXt；自动跳过已标记 AI 的图）。 */
 async function onBatchDetectAi() {
   const ids = [...library.selected]
@@ -284,11 +411,67 @@ function onToggleAesthetic(val: boolean | string | number) {
       .catch((e: Error) => ElMessage.error(e.message))
   }
 }
+
+// ---- 搜索式筛选（danbooru 风格）：SearchFilter 组件 + chips 即时筛选 ----
+
+/** 已选 chips：`t:<标签名>` 或 `s:<状态key>`。 */
+const searchChips = ref<string[]>([])
+
+/** 从 chips 重建筛选条件并刷新（选择/移除/清空都会触发）。 */
+async function onSearchChange() {
+  const tags: string[] = []
+  let isAi: boolean | undefined
+  let sauceStatus: string | undefined
+  let isRedundant: boolean | undefined
+  let source: string | undefined
+  let tagged: boolean | undefined
+  for (const v of searchChips.value) {
+    if (v.startsWith('t:')) tags.push(v.slice(2))
+    else if (v === 's:is_ai') isAi = true
+    else if (v === 's:not_ai') isAi = false
+    else if (v === 's:sauced') sauceStatus = 'sauced'
+    else if (v === 's:unsauced') sauceStatus = 'unsauced'
+    else if (v === 's:un-sauced') sauceStatus = 'un-sauced'
+    else if (v === 's:redundant') isRedundant = true
+    else if (v === 's:tagged') tagged = true
+    else if (v === 's:untagged') tagged = false
+    else if (v.startsWith('s:source_')) source = v.slice('s:source_'.length)
+  }
+  try {
+    await library.applyFilter({
+      tags: tags.length > 0 ? tags : undefined,
+      isAi,
+      sauceStatus,
+      isRedundant,
+      source,
+      tagged,
+    })
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 外部修改 filter.tags（如详情页点标签跳转）→ 同步到搜索框 chips。
+ *  immediate：直接进详情页跳转时 LibraryView 后挂载，需在挂载时同步已有 filter。 */
+watch(
+  () => library.filter.tags,
+  (tags) => {
+    const next = (tags ?? []).map((t) => `t:${t}`).sort()
+    const cur = [...searchChips.value].sort()
+    if (JSON.stringify(cur) !== JSON.stringify(next)) {
+      searchChips.value = next
+    }
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
   <div class="library">
     <div class="toolbar">
+      <!-- 搜索式筛选（danbooru 风格）：标签/状态联想，选中即筛选 -->
+      <SearchFilter v-model="searchChips" @change="onSearchChange" />
+
       <el-radio-group v-model="library.viewMode" size="default">
         <el-radio-button v-for="v in viewOptions" :key="v.key" :value="v.key">
           <el-icon><component :is="v.icon" /></el-icon>
@@ -344,16 +527,31 @@ function onToggleAesthetic(val: boolean | string | number) {
         多选模式
       </el-checkbox>
 
+      <el-checkbox
+        :model-value="selectAllCurrent"
+        :indeterminate="selectedCount > 0 && !selectAllCurrent"
+        :disabled="library.images.length === 0"
+        @change="(v: boolean) => toggleSelectAll(v)"
+      >
+        全选({{ selectedCount }})
+      </el-checkbox>
+
       <div class="spacer" />
 
-      <template v-if="selectedCount > 0">
+      <!-- 增强3：下拉框多选批量行为 + 两击确认执行（与主目录一致） -->
+      <template v-if="selectedCount > 0 || batchActions.length > 0">
         <el-button type="danger" plain @click="onRecycleSelected">删除所选 ({{ selectedCount }})</el-button>
-        <el-button type="primary" plain @click="onBatchTag">批量打标</el-button>
-        <el-button type="success" plain @click="onBatchAesthetic">批量美学</el-button>
-        <el-button plain @click="onBatchSauce">批量溯源</el-button>
-        <el-checkbox v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
-        <el-button plain @click="onBatchDetectAi">批量检测 AI</el-button>
-        <el-button @click="library.clearSelect()">取消选择</el-button>
+        <el-select v-model="batchActions" multiple collapse-tags placeholder="选择批量行为" style="width: 220px" size="default">
+          <el-option label="美学评分" value="aesthetic" />
+          <el-option label="打标" value="tag" />
+          <el-option label="溯源" value="sauce" />
+          <el-option label="AI 检测" value="ai-detect" />
+        </el-select>
+        <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
+        <el-button :type="execArmed ? 'danger' : 'primary'" plain @click="onExecClick" :title="'Shift+点击直接执行'">
+          {{ execArmed ? '确认执行' : '执行' }}
+        </el-button>
+        <el-button @click="library.clearSelect(); batchActions = []">取消</el-button>
       </template>
       <el-button :icon="Refresh" circle title="刷新" @click="onSortChange" />
     </div>
@@ -380,7 +578,7 @@ function onToggleAesthetic(val: boolean | string | number) {
         :current-page="page"
         :page-sizes="[25, 50, 75, 100]"
         @current-change="onPageChange"
-        @size-change="(s: number) => { settingsStore.settings.page_size = s; settingsStore.save().catch(() => {}) }"
+        @size-change="onLibraryPageSizeChange"
       />
     </div>
 

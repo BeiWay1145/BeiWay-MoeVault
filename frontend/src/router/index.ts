@@ -12,7 +12,6 @@ const router = createRouter({
         { path: 'library', name: 'library', component: () => import('@/views/LibraryView.vue'), meta: { title: '图库', keepAlive: true } },
         { path: 'imports', name: 'imports', component: () => import('@/views/ImportDirectoryView.vue'), meta: { title: '主目录', keepAlive: true } },
         { path: 'library/:id', name: 'image-detail', component: () => import('@/views/ImageDetailView.vue'), meta: { title: '图片详情' } },
-        { path: 'search', name: 'search', component: () => import('@/views/SearchView.vue'), meta: { title: '搜索', keepAlive: true } },
         { path: 'dedup', name: 'dedup', component: () => import('@/views/DedupView.vue'), meta: { title: '查重' } },
         { path: 'trash', name: 'trash', component: () => import('@/views/TrashView.vue'), meta: { title: '回收站' } },
         { path: 'tasks', name: 'tasks', component: () => import('@/views/TaskCenterView.vue'), meta: { title: '任务中心' } },

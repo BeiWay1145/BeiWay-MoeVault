@@ -24,6 +24,21 @@ pub struct ImportProgress {
     pub duplicate: usize,
 }
 
+/// 导入模式。
+/// - Move：移动进库（默认），源文件移入库目录（跨卷退化为复制+删除源）
+/// - Copy：复制进库，源文件保留原位置
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    Move,
+    Copy,
+}
+
+impl Default for ImportMode {
+    fn default() -> Self {
+        Self::Move
+    }
+}
+
 /// 缩略图卡片规格（最长边像素）。
 const THUMB_CARD_PX: u32 = 512;
 
@@ -35,14 +50,16 @@ const INSERT_BATCH: usize = 100;
 /// - `db`：SQLite 连接
 /// - `batch_id`：import_batches 表 id（进度写回）
 /// - `paths`：源路径（文件或目录）
-/// - `library_dir`：库目录（`data/library`），文件移动至此按哈希分片
+/// - `library_dir`：库目录（`data/library`），文件移动/复制至此按哈希分片
 /// - `thumbs_dir`：缩略图目录（`data/thumbs`）
+/// - `mode`：Move 移动进库（默认）/ Copy 复制进库
 pub fn run_import(
     db: &Db,
     batch_id: i64,
     paths: Vec<PathBuf>,
     library_dir: &Path,
     thumbs_dir: &Path,
+    mode: ImportMode,
 ) -> Result<ImportProgress, IngestError> {
     std::fs::create_dir_all(library_dir)?;
     std::fs::create_dir_all(thumbs_dir)?;
@@ -61,7 +78,7 @@ pub fn run_import(
     let now = now_secs();
 
     for (i, src) in files.iter().enumerate() {
-        match process_one(db, src, library_dir, thumbs_dir, now, &mut seen_md5) {
+        match process_one(db, src, library_dir, thumbs_dir, now, &mut seen_md5, mode) {
             Ok(ProcessOutcome::Imported(img)) => {
                 pending.push(*img);
                 progress.done += 1;
@@ -124,27 +141,31 @@ fn process_one(
     thumbs_dir: &Path,
     now: i64,
     seen_md5: &mut std::collections::HashSet<String>,
+    mode: ImportMode,
 ) -> Result<ProcessOutcome, IngestError> {
     let feats = extract_features(src)?;
 
     // 重复检测：批内（内存集合，因批量插入延迟 flush）+ 库内（数据库）
     if seen_md5.contains(&feats.md5) || db.md5_exists(&feats.md5)? {
-        // 库外源文件删除（移动模式语义）；库内（重新扫描）不动
-        if !src.starts_with(library_dir) {
+        // Move 模式：删除库外重复源文件（移动语义，避免残留）；Copy 模式保留源
+        if mode == ImportMode::Move && !src.starts_with(library_dir) {
             let _ = std::fs::remove_file(src);
         }
         return Ok(ProcessOutcome::Duplicate);
     }
     seen_md5.insert(feats.md5.clone());
 
-    // 移动进库：library/{md5前2}/{md5}.{ext}
+    // 进库：library/{md5前2}/{md5}.{ext}
     let ext = crate::features::extension_of(src).unwrap_or_else(|| "unknown".to_string());
     if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
         return Err(IngestError::Invalid(format!("不支持的扩展名: {ext}")));
     }
     let rel = hash_rel_path(&feats.md5, &ext);
     let dst = library_dir.join(&rel);
-    move_file(src, &dst)?;
+    match mode {
+        ImportMode::Move => move_file(src, &dst)?,
+        ImportMode::Copy => copy_file(src, &dst)?,
+    }
 
     // 生成缩略图（WebP）
     let thumb_rel = hash_rel_path(&feats.md5, "webp");
@@ -206,6 +227,18 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), IngestError> {
             Ok(())
         }
     }
+}
+
+/// 复制文件（Copy 模式）：保留源文件，仅将副本写入库目录。
+fn copy_file(src: &Path, dst: &Path) -> Result<(), IngestError> {
+    if src == dst {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
 }
 
 /// 生成 512px WebP 缩略图（best-effort：失败仅告警，不阻塞入库）。
@@ -320,8 +353,15 @@ mod tests {
 
         let library = root.join("library");
         let thumbs = root.join("thumbs");
-        let progress =
-            run_import(&db, batch_id, vec![src_dir.clone()], &library, &thumbs).unwrap();
+        let progress = run_import(
+            &db,
+            batch_id,
+            vec![src_dir.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Move,
+        )
+        .unwrap();
 
         assert_eq!(progress.total, 2);
         assert_eq!(progress.done, 2);
@@ -359,12 +399,28 @@ mod tests {
         let thumbs = root.join("thumbs");
 
         let b1 = db.create_import_batch("src1").unwrap();
-        let pr1 = run_import(&db, b1, vec![src1.clone()], &library, &thumbs).unwrap();
+        let pr1 = run_import(
+            &db,
+            b1,
+            vec![src1.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Move,
+        )
+        .unwrap();
         assert_eq!(pr1.done, 1);
 
         // 第二次导入相同内容 → duplicate
         let b2 = db.create_import_batch("src2").unwrap();
-        let pr2 = run_import(&db, b2, vec![src2.clone()], &library, &thumbs).unwrap();
+        let pr2 = run_import(
+            &db,
+            b2,
+            vec![src2.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Move,
+        )
+        .unwrap();
         assert_eq!(pr2.duplicate, 1);
         assert_eq!(pr2.done, 0);
         assert!(!p2.exists(), "库外重复源文件应被删除");
@@ -388,7 +444,15 @@ mod tests {
         let library = root.join("library");
         let thumbs = root.join("thumbs");
         let b = db.create_import_batch("src").unwrap();
-        let pr = run_import(&db, b, vec![src.clone()], &library, &thumbs).unwrap();
+        let pr = run_import(
+            &db,
+            b,
+            vec![src.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Move,
+        )
+        .unwrap();
 
         assert_eq!(pr.total, 2);
         assert_eq!(pr.done, 1, "批内重复应只入库 1 张");
@@ -409,8 +473,102 @@ mod tests {
         let library = root.join("library");
         let thumbs = root.join("thumbs");
         let b = db.create_import_batch("src").unwrap();
-        let pr = run_import(&db, b, vec![src], &library, &thumbs).unwrap();
+        let pr = run_import(
+            &db,
+            b,
+            vec![src],
+            &library,
+            &thumbs,
+            ImportMode::Move,
+        )
+        .unwrap();
         assert_eq!(pr.total, 0, "不支持的文件应在扫描阶段被过滤");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn import_copy_keeps_source_files() {
+        let root = temp_root("copy");
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let a = make_img(&src_dir, "a.png", [1, 2, 3]);
+        let b = make_img(&src_dir, "b.jpg", [10, 20, 30]);
+
+        let db_path = root.join("app.db");
+        let db = Db::open(&db_path).unwrap();
+        let batch_id = db.create_import_batch(src_dir.to_str().unwrap()).unwrap();
+
+        let library = root.join("library");
+        let thumbs = root.join("thumbs");
+        let progress = run_import(
+            &db,
+            batch_id,
+            vec![src_dir.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Copy,
+        )
+        .unwrap();
+
+        assert_eq!(progress.total, 2);
+        assert_eq!(progress.done, 2);
+        assert_eq!(progress.failed, 0);
+        assert_eq!(progress.duplicate, 0);
+
+        // Copy 模式：源文件保留
+        assert!(a.exists());
+        assert!(b.exists());
+        // 库中已有 2 张
+        assert_eq!(db.count_images("active").unwrap(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn duplicate_in_copy_mode_keeps_source() {
+        let root = temp_root("copy_dup");
+        let src1 = root.join("src1");
+        let src2 = root.join("src2");
+        std::fs::create_dir_all(&src1).unwrap();
+        std::fs::create_dir_all(&src2).unwrap();
+        let p1 = make_img(&src1, "a.png", [7, 7, 7]);
+        let p2 = src2.join("copy.png");
+        std::fs::copy(&p1, &p2).unwrap();
+
+        let db_path = root.join("app.db");
+        let db = Db::open(&db_path).unwrap();
+        let library = root.join("library");
+        let thumbs = root.join("thumbs");
+
+        let b1 = db.create_import_batch("src1").unwrap();
+        let pr1 = run_import(
+            &db,
+            b1,
+            vec![src1.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Copy,
+        )
+        .unwrap();
+        assert_eq!(pr1.done, 1);
+        assert!(p1.exists(), "copy 模式首次导入后源文件应保留");
+
+        // 第二次相同内容 → duplicate；copy 模式不删除源
+        let b2 = db.create_import_batch("src2").unwrap();
+        let pr2 = run_import(
+            &db,
+            b2,
+            vec![src2.clone()],
+            &library,
+            &thumbs,
+            ImportMode::Copy,
+        )
+        .unwrap();
+        assert_eq!(pr2.duplicate, 1);
+        assert_eq!(pr2.done, 0);
+        assert!(p2.exists(), "copy 模式重复源文件不应被删除");
+
+        assert_eq!(db.count_images("active").unwrap(), 1);
         std::fs::remove_dir_all(&root).ok();
     }
 }

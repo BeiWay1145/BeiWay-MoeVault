@@ -14,6 +14,8 @@ export interface SettingsState {
   tag_threshold: number
   tagger_model_dir: string
   tagger_model_name: string
+  /** 打标模型种类：auto / cl_tagger / wd14 */
+  tagger_model_kind: string
   aesthetic_model: string
   /** 推理设备：auto/cuda/cpu（打标与美学各一） */
   tagger_device: string
@@ -25,7 +27,6 @@ export interface SettingsState {
   library_dir: string
   /** E6: 画廊/搜索分页模式（默认关闭） */
   pagination_enabled: boolean
-  page_size: number
   /** 关闭窗口时最小化到托盘（默认关闭=正常退出） */
   close_to_tray: boolean
   /** 瀑布流列数：auto/2/3/4/5/6（auto=传统瀑布流，固定=网格按行） */
@@ -36,6 +37,10 @@ export interface SettingsState {
   sidebar_hover_expand: boolean
   /** 详情页预加载图片张数（前后各 N 张，默认 2，0=关闭） */
   preload_count: number
+  /** 分类浏览标签封面规则：aesthetic / size / newest / random / manual */
+  tag_cover_rule: string
+  /** 优先显示中文标签（中文别名在前，如 女孩(1girl)） */
+  tag_show_cn_first: boolean
 }
 
 const defaults: SettingsState = {
@@ -44,6 +49,7 @@ const defaults: SettingsState = {
   // 空 = 自动探测（推荐）：服务按 项目内 models/tagger → 旧位置 → 自定义 顺序自动定位
   tagger_model_dir: '',
   tagger_model_name: '自动探测',
+  tagger_model_kind: 'auto',
   aesthetic_model: 'trojblue/distill-q-align-aesthetic-siglip2-base',
   tagger_device: 'auto',
   aesthetic_device: 'auto',
@@ -53,12 +59,13 @@ const defaults: SettingsState = {
   recycle_days: 0,
   library_dir: 'data/library',
   pagination_enabled: false,
-  page_size: 50,
   close_to_tray: false,
   waterfall_columns: 'auto',
   log_clear_on_start: true,
   sidebar_hover_expand: true,
   preload_count: 4,
+  tag_cover_rule: 'aesthetic',
+  tag_show_cn_first: false,
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -75,6 +82,7 @@ export const useSettingsStore = defineStore('settings', () => {
         tag_threshold: s.tag_threshold != null ? Number(s.tag_threshold) : defaults.tag_threshold,
         tagger_model_dir: String(s.tagger_model_dir ?? defaults.tagger_model_dir),
         tagger_model_name: String(s.tagger_model_name ?? defaults.tagger_model_name),
+        tagger_model_kind: String(s.tagger_model_kind ?? defaults.tagger_model_kind),
         aesthetic_model: String(s.aesthetic_model ?? defaults.aesthetic_model),
         tagger_device: String(s.tagger_device ?? defaults.tagger_device),
         aesthetic_device: String(s.aesthetic_device ?? defaults.aesthetic_device),
@@ -84,12 +92,13 @@ export const useSettingsStore = defineStore('settings', () => {
         recycle_days: s.recycle_days != null ? Number(s.recycle_days) : defaults.recycle_days,
         library_dir: String(s.library_dir ?? defaults.library_dir),
         pagination_enabled: s.pagination_enabled === true || s.pagination_enabled === 'true',
-        page_size: s.page_size != null ? Number(s.page_size) : defaults.page_size,
         close_to_tray: s.close_to_tray === true || s.close_to_tray === 'true',
         waterfall_columns: String(s.waterfall_columns ?? defaults.waterfall_columns),
         log_clear_on_start: s.log_clear_on_start === true || s.log_clear_on_start !== 'false',
         sidebar_hover_expand: s.sidebar_hover_expand === true || s.sidebar_hover_expand !== 'false',
         preload_count: s.preload_count != null ? Number(s.preload_count) : defaults.preload_count,
+        tag_cover_rule: String(s.tag_cover_rule ?? defaults.tag_cover_rule),
+        tag_show_cn_first: s.tag_show_cn_first === true || s.tag_show_cn_first === 'true',
       }
       loaded.value = true
     } catch {
@@ -103,6 +112,7 @@ export const useSettingsStore = defineStore('settings', () => {
       tag_threshold: String(settings.value.tag_threshold),
       tagger_model_dir: settings.value.tagger_model_dir,
       tagger_model_name: settings.value.tagger_model_name,
+      tagger_model_kind: settings.value.tagger_model_kind,
       aesthetic_model: settings.value.aesthetic_model,
       tagger_device: settings.value.tagger_device,
       aesthetic_device: settings.value.aesthetic_device,
@@ -112,12 +122,13 @@ export const useSettingsStore = defineStore('settings', () => {
       recycle_days: String(settings.value.recycle_days),
       library_dir: settings.value.library_dir,
       pagination_enabled: String(settings.value.pagination_enabled),
-      page_size: String(settings.value.page_size),
       close_to_tray: String(settings.value.close_to_tray),
       waterfall_columns: settings.value.waterfall_columns,
       log_clear_on_start: String(settings.value.log_clear_on_start),
       sidebar_hover_expand: String(settings.value.sidebar_hover_expand),
       preload_count: String(settings.value.preload_count),
+      tag_cover_rule: settings.value.tag_cover_rule,
+      tag_show_cn_first: String(settings.value.tag_show_cn_first),
     })
   }
 

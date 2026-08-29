@@ -4,7 +4,6 @@ import { useRoute } from 'vue-router'
 import {
   DataAnalysis,
   Picture,
-  Search,
   Connection,
   Delete,
   CollectionTag,
@@ -94,7 +93,6 @@ const menus = [
   { path: '/', label: '总览', icon: DataAnalysis },
   { path: '/library', label: '图库', icon: Picture },
   { path: '/imports', label: '主目录', icon: FolderOpened },
-  { path: '/search', label: '搜索', icon: Search },
   { path: '/dedup', label: '查重结果', icon: Connection, badge: 'dedup' },
   { path: '/trash', label: '回收站', icon: Delete },
   { path: '/tags', label: '标签', icon: CollectionTag },
@@ -143,7 +141,8 @@ const menus = [
   display: flex;
   flex-direction: column;
   height: 100%;
-  transition: width 0.25s ease;
+  /* 侧边栏展开/收起动画（保留）；卡顿缓解见 .app-main contain + 表格 fixed 布局 */
+  transition: width 0.22s ease;
   overflow: hidden;
 }
 .logo {

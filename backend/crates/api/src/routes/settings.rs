@@ -26,6 +26,7 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "tag_threshold",
     "tagger_model_dir",
     "tagger_model_name",
+    "tagger_model_kind",
     "aesthetic_model",
     "tagger_device",
     "aesthetic_device",
@@ -41,6 +42,8 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "log_clear_on_start",
     "sidebar_hover_expand",
     "preload_count",
+    "tag_cover_rule",
+    "tag_show_cn_first",
 ];
 
 pub fn router() -> Router<AppState> {

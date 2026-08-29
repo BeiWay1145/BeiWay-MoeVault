@@ -205,7 +205,7 @@ async fn resume_task(
 
     // 读取配置并启动管线（与 run_sauce 相同逻辑，但用已存 ids）
     let db_for_config = state.db.clone();
-    let (api_keys, min_sim, _, _) = tokio::task::spawn_blocking(move || {
+    let (api_keys, min_sim, _, _, _) = tokio::task::spawn_blocking(move || {
         super::tagging::read_tag_config_public(&db_for_config)
     })
     .await

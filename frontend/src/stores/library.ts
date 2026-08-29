@@ -58,6 +58,8 @@ export interface LibraryFilter {
   isAi?: boolean
   /** 溯源状态：sauced / unsauced / un-sauced */
   sauceStatus?: string
+  /** 打标状态：true=已打标 / false=未打标 */
+  tagged?: boolean
 }
 
 export const useLibraryStore = defineStore('library', () => {
@@ -78,6 +80,31 @@ export const useLibraryStore = defineStore('library', () => {
   }
   /** 多选模式（画廊/搜索共用）：开启后点击图片直接切换选择，用于批量操作 */
   const multiSelect = ref(false)
+
+  /**
+   * 详情页浏览上下文（增强2）：来源视图的有序图片 id 列表。
+   * 打开详情前由来源视图设置（主目录来源组 / 图库当前筛选 / 搜索结果），
+   * 详情页的上一张/下一张/预加载/删除后在上下文内导航——
+   * 在二级目录里点 B 切上下张就是同组的 A/C，而不是全局库的其他图。
+   * 之后的筛选/分类视图同样只需 setViewerContext 即可获得一致行为。
+   * 内存态（刷新/直达 URL 丢失 → 详情页回退全局库顺序）。
+   */
+  const viewerContext = ref<{ ids: number[]; label: string } | null>(null)
+  function setViewerContext(ids: number[], label: string) {
+    viewerContext.value = { ids: [...ids], label }
+  }
+  function clearViewerContext() {
+    viewerContext.value = null
+  }
+  /** 删除图片后同步从上下文移除，保持下/上一张导航正确。 */
+  function removeFromViewerContext(id: number) {
+    if (viewerContext.value) {
+      viewerContext.value = {
+        ...viewerContext.value,
+        ids: viewerContext.value.ids.filter((x) => x !== id),
+      }
+    }
+  }
 
   // 视图模式变化 → 持久化
   watch(viewMode, (m) => localStorage.setItem('moevault-view-mode', m))
@@ -115,6 +142,7 @@ export const useLibraryStore = defineStore('library', () => {
       if (f.isRedundant != null) params.set('is_redundant', f.isRedundant ? '1' : '0')
       if (f.isAi != null) params.set('is_ai', f.isAi ? '1' : '0')
       if (f.sauceStatus) params.set('sauce_status', f.sauceStatus)
+      if (f.tagged != null) params.set('tagged', f.tagged ? 'tagged' : 'untagged')
 
       const d = await get<{ items: Array<Record<string, unknown>>; total: number; next_cursor?: string | null }>(
         `/images?${params.toString()}`,
@@ -201,6 +229,10 @@ export const useLibraryStore = defineStore('library', () => {
     filter,
     detailPos,
     multiSelect,
+    viewerContext,
+    setViewerContext,
+    clearViewerContext,
+    removeFromViewerContext,
     images,
     total,
     loading,

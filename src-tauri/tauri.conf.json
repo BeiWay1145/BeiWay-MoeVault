@@ -6,7 +6,11 @@
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm --prefix ../frontend run dev"
+    "beforeDevCommand": "npm --prefix ../frontend run dev",
+    "beforeBuildCommand": {
+      "script": "npm --prefix ../frontend run build && cargo build --release && copy /Y target\\release\\moevault-app.exe target\\release\\moevault-app-x86_64-pc-windows-msvc.exe",
+      "cwd": "../backend"
+    }
   },
   "app": {
     "windows": [
@@ -17,7 +21,8 @@
         "minWidth": 900,
         "minHeight": 600,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "dragDropEnabled": true
       }
     ],
     "security": {
@@ -31,7 +36,11 @@
       "../backend/target/release/moevault-app"
     ],
     "resources": {
-      "../frontend/dist": "frontend"
+      "../frontend/dist": "frontend",
+      "../python/server": "python/server",
+      "../python/requirements.txt": "python/requirements.txt",
+      "../python/setup.bat": "python/setup.bat",
+      "../python/run_server.bat": "python/run_server.bat"
     },
     "icon": [
       "icons/32x32.png",

@@ -2,10 +2,12 @@
 
 pub mod aesthetic;
 pub mod dedup;
+pub mod dict;
 pub mod health;
 pub mod images;
 pub mod import;
 pub mod logs;
+pub mod search;
 pub mod settings;
 pub mod tagging;
 pub mod tasks;

@@ -65,16 +65,26 @@ impl InferClient {
         &self.http
     }
 
-    /// 通知推理服务切换打标模型目录（重载模型）。
-    pub async fn use_tagger_model(&self, model_dir: &str) -> Result<(), TaggerError> {
+    /// 通知推理服务切换打标模型目录/种类（重载模型）。
+    /// kind：cl_tagger / wd14 / auto（None=不指定，由推理服务按目录内容自动判定）
+    pub async fn use_tagger_model(
+        &self,
+        model_dir: &str,
+        model_kind: Option<&str>,
+    ) -> Result<(), TaggerError> {
         #[derive(serde::Serialize)]
         struct Req<'a> {
             model_dir: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            model_kind: Option<&'a str>,
         }
         let resp = self
             .http
             .post(format!("{}/infer/tagger/config", self.base_url))
-            .json(&Req { model_dir })
+            .json(&Req {
+                model_dir,
+                model_kind,
+            })
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -397,8 +407,16 @@ async fn sauce_one(
     }
     let fetched = booru::fetch_tags(infer.http(), &result.ext_urls).await;
     let Some((source, source_url, tags)) = fetched.ok() else {
-        // 命中 booru 但爬取失败：记缓存，不标记不可溯源（下次可重试）
+        // 命中 booru 但爬取失败（如网络不通）：仍写入 source/source_url（按 ext_urls 域名），
+        // 并标记不可溯源避免每次重试同一命中；状态变"已溯源"，用户可手动打开源链接。
+        // BUG1 修复：此前只记缓存不写状态，手动溯源后界面毫无变化。
         db.put_sauce_cache(&img.md5, result.similarity, None, None, None)?;
+        let fallback_source = booru::extract_booru(&result.ext_urls)
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let fallback_url = result.ext_urls.first().cloned().unwrap_or_default();
+        db.set_image_source(image_id, &fallback_source, if fallback_url.is_empty() { None } else { Some(&fallback_url) })?;
+        db.set_no_auto_sauce(image_id, true)?;
         return Ok(None);
     };
 

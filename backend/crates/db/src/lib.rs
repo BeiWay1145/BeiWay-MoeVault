@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 use moevault_core::models::{
     DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageFilter,
-    ImageListItem, ImageTagView, ImportBatch, RecycledItem, SortKey, Stats, TagWithCount,
-    TaggingState,
+    ImageListItem, ImageTagView, ImportBatch, RecycledItem, SortKey, Stats, TagAlias,
+    TagBrowseItem, TagWithCount, TaggingState,
 };
 use moevault_core::{AppError, ErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -1047,7 +1047,8 @@ impl Db {
     pub fn image_tags(&self, image_id: i64) -> Result<Vec<ImageTagView>, DbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT t.id, t.name, t.name_cn, t.category, REPLACE(it.source, 'auto_', ''), it.confidence
+            "SELECT t.id, t.name, t.name_cn, t.category, REPLACE(it.source, 'auto_', ''), it.confidence,
+                    (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id)
              FROM image_tags it JOIN tags t ON t.id = it.tag_id
              WHERE it.image_id = ?1
              ORDER BY it.source, t.name",
@@ -1060,6 +1061,7 @@ impl Db {
                 category: r.get(3)?,
                 source: r.get(4)?,
                 confidence: r.get(5)?,
+                image_count: r.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1428,6 +1430,413 @@ impl Db {
         Ok(out)
     }
 
+    /// 分类浏览标签列表（P3）：category 过滤 + 可配置封面规则 + 总数。
+    ///
+    /// `cover_rule`（settings.tag_cover_rule）：
+    /// - `aesthetic`：美学分最高（NULL 排后，回退最新导入）
+    /// - `size`：文件大小最大
+    /// - `newest`：最新导入
+    /// - `random`：随机一张
+    /// - `manual`：读 tag_covers 表，未设置回退 aesthetic
+    /// 返回 `(items, total)`。
+    pub fn browse_tags(
+        &self,
+        category: Option<&str>,
+        q: Option<&str>,
+        limit: i64,
+        offset: i64,
+        cover_rule: &str,
+    ) -> Result<(Vec<TagBrowseItem>, i64), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+
+        // 封面子查询（规则 → SQL 片段；全部返回 thumb_rel）
+        let cover_sql: &str = match cover_rule {
+            "size" => {
+                "(SELECT i.thumb_rel FROM image_tags it JOIN images i ON i.id = it.image_id
+                  WHERE it.tag_id = t.id ORDER BY i.size_bytes DESC, i.imported_at DESC LIMIT 1)"
+            }
+            "newest" => {
+                "(SELECT i.thumb_rel FROM image_tags it JOIN images i ON i.id = it.image_id
+                  WHERE it.tag_id = t.id ORDER BY i.imported_at DESC LIMIT 1)"
+            }
+            "random" => {
+                "(SELECT i.thumb_rel FROM image_tags it JOIN images i ON i.id = it.image_id
+                  WHERE it.tag_id = t.id ORDER BY RANDOM() LIMIT 1)"
+            }
+            "manual" => {
+                "(SELECT COALESCE(
+                    (SELECT i.thumb_rel FROM tag_covers tc JOIN images i ON i.id = tc.image_id
+                     WHERE tc.tag_id = t.id),
+                    (SELECT i.thumb_rel FROM image_tags it JOIN images i ON i.id = it.image_id
+                     WHERE it.tag_id = t.id ORDER BY i.aesthetic_score DESC, i.imported_at DESC LIMIT 1)))"
+            }
+            _ => {
+                // aesthetic（默认）
+                "(SELECT i.thumb_rel FROM image_tags it JOIN images i ON i.id = it.image_id
+                  WHERE it.tag_id = t.id ORDER BY i.aesthetic_score DESC, i.imported_at DESC LIMIT 1)"
+            }
+        };
+
+        // WHERE（category 与 q 组合）
+        let mut where_sql = String::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(cat) = category {
+            if !cat.trim().is_empty() {
+                params.push(Box::new(cat.trim().to_string()));
+                where_sql = format!(" WHERE t.category = ?{}", params.len());
+            }
+        }
+        if let Some(kw) = q {
+            if !kw.trim().is_empty() {
+                let ph = params.len() + 1;
+                let cond = format!("(t.name LIKE ?{ph} OR t.name_cn LIKE ?{ph})");
+                where_sql = if where_sql.is_empty() {
+                    format!(" WHERE {cond}")
+                } else {
+                    format!("{where_sql} AND {cond}")
+                };
+                params.push(Box::new(format!("%{}%", kw.trim())));
+            }
+        }
+
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM tags t{where_sql}"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )?;
+
+        let mut sql = format!(
+            "SELECT t.id, t.name, t.name_cn, t.category,
+                    (SELECT COUNT(DISTINCT it.image_id) FROM image_tags it WHERE it.tag_id = t.id),
+                    {cover_sql}
+             FROM tags t{where_sql}"
+        );
+        let limit_ph = params.len() + 1;
+        let offset_ph = params.len() + 2;
+        sql.push_str(&format!(
+            " ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC,
+                       t.name COLLATE NOCASE ASC
+             LIMIT ?{limit_ph} OFFSET ?{offset_ph}"
+        ));
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(TagBrowseItem {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                name_cn: row.get(2)?,
+                category: row.get(3)?,
+                image_count: row.get(4)?,
+                cover_thumb: row.get(5)?,
+            });
+        }
+        Ok((out, count))
+    }
+
+    /// 设置/清除标签手动封面（image_id=None 清除；manual 规则读取）。
+    pub fn set_tag_cover(&self, tag_id: i64, image_id: Option<i64>) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        match image_id {
+            Some(img) => {
+                conn.execute(
+                    "INSERT INTO tag_covers (tag_id, image_id) VALUES (?1, ?2)
+                     ON CONFLICT(tag_id) DO UPDATE SET image_id = excluded.image_id",
+                    params![tag_id, img],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM tag_covers WHERE tag_id = ?1", params![tag_id])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 标签总数（与 list_tags_filtered 相同 q 条件），供分页 total 使用。
+    pub fn count_tags_filtered(&self, q: Option<&str>) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from("SELECT COUNT(*) FROM tags t");
+        if let Some(kw) = q {
+            if !kw.trim().is_empty() {
+                sql.push_str(" WHERE t.name LIKE ?1 OR t.name_cn LIKE ?1");
+                let pattern = format!("%{}%", kw.trim());
+                let n: i64 = conn.query_row(&sql, params![pattern], |r| r.get(0))?;
+                return Ok(n);
+            }
+        }
+        let n: i64 = conn.query_row(&sql, [], |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// 标签列表（增强5：支持 category 过滤 + 仅未设中文别名 + q 搜索），返回 (items, total)。
+    pub fn list_tags_advanced(
+        &self,
+        limit: i64,
+        offset: i64,
+        q: Option<&str>,
+        category: Option<&str>,
+        no_cn_only: bool,
+    ) -> Result<(Vec<TagWithCount>, i64), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        let mut conds: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(kw) = q {
+            if !kw.trim().is_empty() {
+                params.push(Box::new(format!("%{}%", kw.trim())));
+                let ph = params.len();
+                conds.push(format!("(t.name LIKE ?{ph} OR t.name_cn LIKE ?{ph})"));
+            }
+        }
+        if let Some(cat) = category {
+            if !cat.trim().is_empty() {
+                params.push(Box::new(cat.trim().to_string()));
+                conds.push(format!("t.category = ?{}", params.len()));
+            }
+        }
+        if no_cn_only {
+            conds.push(
+                "(t.name_cn IS NULL OR t.name_cn = '') AND NOT EXISTS (SELECT 1 FROM tag_aliases ta WHERE ta.tag_id = t.id)".to_string(),
+            );
+        }
+        let where_sql = if conds.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conds.join(" AND "))
+        };
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM tags t{where_sql}"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )?;
+        let mut sql = format!(
+            "SELECT t.id, t.name, t.name_cn, t.category, t.is_custom, t.is_blacklisted,
+                    (SELECT COUNT(DISTINCT it.image_id) FROM image_tags it WHERE it.tag_id = t.id)
+             FROM tags t{where_sql}"
+        );
+        let limit_ph = params.len() + 1;
+        let offset_ph = params.len() + 2;
+        sql.push_str(&format!(
+            " ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC,
+                       t.name COLLATE NOCASE ASC
+             LIMIT ?{limit_ph} OFFSET ?{offset_ph}"
+        ));
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+        let mut stmt = conn.prepare(&sql)?;
+        for (i, v) in params.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
+        }
+        let mut rows = stmt.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(TagWithCount {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                name_cn: row.get(2)?,
+                category: row.get(3)?,
+                is_custom: row.get::<_, i64>(4)? != 0,
+                is_blacklisted: row.get::<_, i64>(5)? != 0,
+                image_count: row.get(6)?,
+            });
+        }
+        Ok((out, count))
+    }
+
+    /// 设置/清除标签中文别名（name_cn；None 清除）。
+    pub fn set_tag_name_cn(&self, tag_id: i64, name_cn: Option<&str>) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let v = name_cn.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        conn.execute(
+            "UPDATE tags SET name_cn = ?2 WHERE id = ?1",
+            params![tag_id, v],
+        )?;
+        Ok(())
+    }
+
+    /// 标签的中文别名列表（增强3）。
+    pub fn list_tag_aliases(&self, tag_id: i64) -> Result<Vec<TagAlias>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, tag_id, alias FROM tag_aliases WHERE tag_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![tag_id], |r| {
+            Ok(TagAlias {
+                id: r.get(0)?,
+                tag_id: r.get(1)?,
+                alias: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 添加标签中文别名（去重；空白忽略）。
+    pub fn add_tag_alias(&self, tag_id: i64, alias: &str) -> Result<i64, DbError> {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tag_aliases WHERE tag_id = ?1 AND alias = ?2)",
+                params![tag_id, alias],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if exists {
+            return Ok(0);
+        }
+        conn.execute(
+            "INSERT INTO tag_aliases (tag_id, alias, created_at) VALUES (?1, ?2, ?3)",
+            params![tag_id, alias, now_secs()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 删除标签中文别名。
+    pub fn remove_tag_alias(&self, alias_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tag_aliases WHERE id = ?1", params![alias_id])?;
+        Ok(())
+    }
+
+    /// 从外部 Danbooru 中文字典 sqlite（ffdkj 仓库 tag.sqlite：name/cn_name/category/post_count）
+    /// 批量回填 tags.name_cn。策略：**仅填空缺**（已有 name_cn 的标签不覆盖），
+    /// 匹配按英文名精确相等。返回 (匹配数, 已更新数, 缺失数)。
+    pub fn import_cn_dict(&self, dict_path: &Path) -> Result<(i64, i64, i64), DbError> {
+        let dict = rusqlite::Connection::open(dict_path)?;
+        // 探测表名（ffdkj 仓库的 tag.sqlite 表名：tag_dict / tags / dict / translation 之一）
+        let tables: Vec<String> = dict
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        let table = tables
+            .iter()
+            .find(|t| matches!(t.as_str(), "tag_dict" | "tags" | "dict" | "translation" | "tag_translation"))
+            .or_else(|| tables.first())
+            .cloned()
+            .ok_or_else(|| DbError::Migration("中文字典 sqlite 无数据表".into()))?;
+
+        // 列名探测：cn_name / cn / chinese / translation
+        let cols: Vec<String> = dict
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        let name_col = cols.iter().find(|c| c.as_str() == "name").cloned().ok_or_else(|| {
+            DbError::Migration(format!("表 {table} 无 name 列"))
+        })?;
+        let cn_col = cols
+            .iter()
+            .find(|c| matches!(c.as_str(), "cn_name" | "cn" | "chinese" | "translation" | "name_cn"))
+            .cloned()
+            .unwrap_or_else(|| cols[cols.len() - 1].clone());
+
+        let sql = format!(
+            "SELECT {name_col}, {cn_col} FROM {table} WHERE {name_col} IS NOT NULL AND {cn_col} IS NOT NULL AND TRIM({cn_col}) != ''"
+        );
+        let mut stmt = dict.prepare(&sql)?;
+        let mut rows = stmt.raw_query();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let cn: String = row.get(1)?;
+            pairs.push((name, cn.trim().to_string()));
+        }
+        drop(rows);
+        drop(stmt);
+
+        let conn = self.conn.lock().unwrap();
+        let matched = pairs.len() as i64;
+        let mut updated = 0i64;
+        let mut missing = 0i64;
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut up = conn.prepare(
+                "UPDATE tags SET name_cn = ?2
+                 WHERE name = ?1 AND (name_cn IS NULL OR name_cn = '')",
+            )?;
+            for (name, cn) in &pairs {
+                let n = up.execute(params![name, cn])?;
+                if n > 0 {
+                    updated += 1;
+                } else {
+                    // 可能：标签不存在，或已有别名（已有别名不算缺失）
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM tags WHERE name = ?1)",
+                            params![name],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(false);
+                    if !exists {
+                        missing += 1;
+                    }
+                }
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+        Ok((matched, updated, missing))
+    }
+
+    /// 搜索联想：按名称/中文名/中文别名前缀匹配标签，按关联图数倒序（danbooru 风格词频）。
+    /// 空格/下划线归一化：输入空格也匹配下划线名。转义 LIKE 通配符。
+    pub fn suggest_tags(&self, q: &str, limit: i64) -> Result<Vec<TagWithCount>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 50);
+        // 归一化：空格 → 下划线（匹配规范名）；也保留原输入（匹配别名/中文名）
+        let norm = q.trim().replace(' ', "_");
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern_norm = format!("{}%", esc(&norm));
+        let pattern_raw = format!("{}%", esc(q.trim()));
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.id, t.name, t.name_cn, t.category, t.is_custom, t.is_blacklisted,
+                        (SELECT COUNT(DISTINCT it.image_id) FROM image_tags it WHERE it.tag_id = t.id)
+                 FROM tags t
+                 WHERE t.name LIKE ?1 ESCAPE '\\'
+                    OR t.name_cn LIKE ?2 ESCAPE '\\'
+                    OR EXISTS (SELECT 1 FROM tag_aliases ta WHERE ta.tag_id = t.id AND ta.alias LIKE ?2 ESCAPE '\\')
+                    OR (REPLACE(t.name, ' ', '_') LIKE ?3 ESCAPE '\\' AND ?4 = 1)
+                 ORDER BY (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id) DESC,
+                          t.name COLLATE NOCASE ASC
+                 LIMIT ?5",
+            )
+            .map_err(DbError::from)?;
+        stmt.raw_bind_parameter(1, &pattern_raw)?;
+        stmt.raw_bind_parameter(2, &pattern_raw)?;
+        stmt.raw_bind_parameter(3, &pattern_norm)?;
+        stmt.raw_bind_parameter(4, if norm != q.trim() { 1i64 } else { 0i64 })?;
+        stmt.raw_bind_parameter(5, limit)?;
+        let mut rows = stmt.raw_query();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(TagWithCount {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                name_cn: row.get(2)?,
+                category: row.get(3)?,
+                is_custom: row.get::<_, i64>(4)? != 0,
+                is_blacklisted: row.get::<_, i64>(5)? != 0,
+                image_count: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
     // ---------- SauceNAO 缓存 ----------
 
     /// 读取溯源缓存。
@@ -1651,12 +2060,12 @@ fn build_filter_conds(
     let mut conds: Vec<String> = vec!["i.status = ?1".to_string()];
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(status.to_string())];
 
-    // 标签筛选（AND 语义：每标签一个 EXISTS）
+    // 标签筛选（AND 语义：每标签一个 EXISTS；空格/下划线归一化匹配）
     for tag in &filter.tags {
         let t = format!("?{}", params.len() + 1);
         conds.push(format!(
             "EXISTS (SELECT 1 FROM image_tags it JOIN tags tg ON tg.id = it.tag_id
-             WHERE it.image_id = i.id AND tg.name = {t})"
+             WHERE it.image_id = i.id AND REPLACE(tg.name, ' ', '_') = {t})"
         ));
         params.push(Box::new(tag.clone()));
     }
@@ -1759,6 +2168,14 @@ fn build_filter_conds(
     if let Some(v) = filter.is_ai {
         let t = format!("?{}", params.len() + 1);
         conds.push(format!("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') = {t}"));
+        params.push(Box::new(v as i64));
+    }
+    // 打标状态（已打标=有任一标签 / 未打标=无标签）
+    if let Some(v) = filter.tagged {
+        let t = format!("?{}", params.len() + 1);
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM image_tags it3 WHERE it3.image_id = i.id) = {t}"
+        ));
         params.push(Box::new(v as i64));
     }
     (conds, params)
@@ -2009,5 +2426,167 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].md5, "md5_2");
+    }
+
+    /// P3 分类浏览：category 过滤 + 总数 + 封面规则（aesthetic/manual）。
+    #[test]
+    fn browse_tags_category_and_cover() {
+        let db = test_db();
+        // 两张图，一个 artist 标签（含 2 图）、一个 general 标签（含 1 图）
+        let imgs: Vec<Image> = (1..=2)
+            .map(|i| Image {
+                id: 0,
+                md5: format!("b_md5_{i}"),
+                phash: i as i64,
+                rel_path: format!("b_p{i}.png"),
+                width: 100,
+                height: 100,
+                format: "png".into(),
+                size_bytes: i * 100,
+                file_mtime: 0,
+                exif_datetime: None,
+                clarity_score: 5.0,
+                aesthetic_score: Some(if i == 1 { 4.5 } else { 2.0 }),
+                dedup_group: None,
+                is_redundant: false,
+                status: STATUS_ACTIVE.into(),
+                source: SOURCE_LOCAL.into(),
+                source_url: None,
+                no_auto_sauce: false,
+                ai_metadata: None,
+                thumb_rel: format!("b_p{i}.webp"),
+                imported_at: i as i64,
+                source_dir: None,
+            })
+            .collect();
+        db.insert_images(&imgs).unwrap();
+        let artist = db.upsert_tag("pixiv_artist", "artist").unwrap();
+        let general = db.upsert_tag("1girl", "general").unwrap();
+        db.insert_image_tags(1, &[(artist, None)], "manual").unwrap();
+        db.insert_image_tags(2, &[(artist, None)], "manual").unwrap();
+        db.insert_image_tags(2, &[(general, None)], "manual").unwrap();
+
+        // category 过滤：artist 只返回 pixiv_artist
+        let (items, total) = db.browse_tags(Some("artist"), None, 100, 0, "aesthetic").unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "pixiv_artist");
+        assert_eq!(items[0].image_count, 2);
+        // aesthetic 规则：封面应是美学分最高（b_p1.webp，4.5 分）
+        assert_eq!(items[0].cover_thumb.as_deref(), Some("b_p1.webp"));
+
+        // manual 规则：未设置 tag_covers 时回退 aesthetic
+        let (items, _) = db.browse_tags(Some("artist"), None, 100, 0, "manual").unwrap();
+        assert_eq!(items[0].cover_thumb.as_deref(), Some("b_p1.webp"));
+        // 设置手动封面 → 覆盖
+        db.set_tag_cover(artist, Some(2)).unwrap();
+        let (items, _) = db.browse_tags(Some("artist"), None, 100, 0, "manual").unwrap();
+        assert_eq!(items[0].cover_thumb.as_deref(), Some("b_p2.webp"));
+        // 清除手动封面 → 回退 aesthetic
+        db.set_tag_cover(artist, None).unwrap();
+        let (items, _) = db.browse_tags(Some("artist"), None, 100, 0, "manual").unwrap();
+        assert_eq!(items[0].cover_thumb.as_deref(), Some("b_p1.webp"));
+
+        // size 规则：文件大小最大（b_p2.webp，200）
+        let (items, _) = db.browse_tags(Some("artist"), None, 100, 0, "size").unwrap();
+        assert_eq!(items[0].cover_thumb.as_deref(), Some("b_p2.webp"));
+
+        // q 搜索
+        let (items, total) = db.browse_tags(None, Some("pixiv"), 100, 0, "aesthetic").unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].name, "pixiv_artist");
+        // 计数 + 分页
+        let (items, total) = db.browse_tags(None, None, 1, 0, "aesthetic").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 2);
+        let _ = general;
+    }
+
+    /// 搜索联想：前缀匹配 + 词频倒序 + LIKE 通配符转义。
+    #[test]
+    fn suggest_tags_prefix_and_escape() {
+        let db = test_db();
+        let img = Image {
+            id: 0,
+            md5: "s_md5_1".into(),
+            phash: 1,
+            rel_path: "s_p1.png".into(),
+            width: 100,
+            height: 100,
+            format: "png".into(),
+            size_bytes: 1,
+            file_mtime: 0,
+            exif_datetime: None,
+            clarity_score: 5.0,
+            aesthetic_score: None,
+            dedup_group: None,
+            is_redundant: false,
+            status: STATUS_ACTIVE.into(),
+            source: SOURCE_LOCAL.into(),
+            source_url: None,
+            no_auto_sauce: false,
+            ai_metadata: None,
+            thumb_rel: "s_p1.webp".into(),
+            imported_at: 1,
+            source_dir: None,
+        };
+        db.insert_images(&[img]).unwrap();
+        let t1 = db.upsert_tag("black_hair", "general").unwrap();
+        let t2 = db.upsert_tag("black_eyes", "general").unwrap();
+        let t3 = db.upsert_tag("1girl", "general").unwrap();
+        // black_hair 关联 1 张；black_eyes、1girl 0 张 → 前缀 "black_" 时 black_hair 在前
+        db.insert_image_tags(1, &[(t1, None)], "manual").unwrap();
+        let r = db.suggest_tags("black_", 10).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].name, "black_hair");
+        assert_eq!(r[0].image_count, 1);
+        // 前缀不匹配（1gir → 不应命中 1girl，因为前缀是 "1gir" 而非 "1g"）
+        let r = db.suggest_tags("1gir", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].name, "1girl");
+        // 通配符转义：输入 "_" 应匹配字面下划线前缀（black_ 类），而非任意字符
+        let r = db.suggest_tags("_", 10).unwrap();
+        assert_eq!(r.len(), 0, "下划线应被转义，不当作通配符");
+        // 输入 "black\\_hair"（字面反斜杠）不应命中
+        let r = db.suggest_tags("black\\_h", 10).unwrap();
+        assert_eq!(r.len(), 0);
+        let _ = (t2, t3);
+    }
+
+    /// 中文字典导入：仅填空缺 + 匹配计数。
+    #[test]
+    fn import_cn_dict_fills_missing_only() {
+        let db = test_db();
+        // 建两个标签：一个已有别名，一个空缺
+        let onegirl_id = db.upsert_tag("1girl", "general").unwrap();
+        db.upsert_tag("black_hair", "general").unwrap();
+        db.set_tag_name_cn(onegirl_id, Some("已有别名")).unwrap();
+
+        // 构造迷你字典 sqlite（表 tag_dict，列 name/cn_name）
+        let dict_path = std::env::temp_dir().join(format!(
+            "moevault_dict_test_{}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let c = rusqlite::Connection::open(&dict_path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE tag_dict (name TEXT, cn_name TEXT);
+                 INSERT INTO tag_dict VALUES ('1girl', '女孩'), ('black_hair', '黑发'), ('unknown_tag', '未知');",
+            )
+            .unwrap();
+        }
+        let (matched, updated, missing) = db.import_cn_dict(&dict_path).unwrap();
+        let _ = std::fs::remove_file(&dict_path);
+        assert_eq!(matched, 3);
+        assert_eq!(updated, 1, "black_hair 空缺被回填；1girl 已有别名不覆盖");
+        assert_eq!(missing, 1, "unknown_tag 不在库中");
+        // 校验：black_hair 有中文别名（按中文可联想），1girl 保持已有别名
+        let bh = db.suggest_tags("黑", 10).unwrap();
+        assert!(bh.iter().any(|t| t.name == "black_hair"), "black_hair 应可经中文联想");
+        let onegirl = db.suggest_tags("已有别", 10).unwrap();
+        assert!(onegirl.iter().any(|t| t.name == "1girl"), "1girl 应保留已有别名");
     }
 }

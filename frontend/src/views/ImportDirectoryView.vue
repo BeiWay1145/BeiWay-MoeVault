@@ -169,12 +169,18 @@ function isDirAllSelected(d: DayGroup, g: DirGroup) {
   return imgs.length > 0 && imgs.every((i) => selected.value.has(i.id))
 }
 
-/** 点击图片：多选模式切换选择，否则进详情。 */
-function onCardClick(img: ImageItem) {
+/** 点击图片：多选模式切换选择，否则进详情。
+ *  增强2：先把当前来源组已加载图片的有序 id 设为浏览上下文，
+ *  详情页上/下一张将在本组内切换（A→B→C），而非全局库其他图片。 */
+function onCardClick(d: DayGroup, g: DirGroup, img: ImageItem) {
   if (library.multiSelect) {
     toggleSelect(img.id)
     return
   }
+  library.setViewerContext(
+    (dirImages.value[dirKey(d, g)] ?? []).map((i) => i.id),
+    `${fmtDate(d.date)} · ${g.name}`,
+  )
   library.saveDetailPos('imports', img.id)
   router.push(`/library/${img.id}`)
 }
@@ -295,9 +301,24 @@ onUnmounted(() => {
   window.removeEventListener('moevault:import-done', onImportDone)
 })
 
-/** 导入完成事件：刷新主目录（保留状态）。 */
-function onImportDone() {
-  loadTree(true)
+/** 导入完成事件（增强1）：刷新树（分组计数）+ 重新加载所有已展开组的图片。
+ *  只刷树不够：dirImages[key] 是展开时一次性加载的缓存，不重载的话
+ *  组计数变了但可见网格仍是旧图——新导入的图片不会出现。 */
+async function onImportDone() {
+  await loadTree(true)
+  // 重载已展开组的图片：重置缓存（loadDirImages 是追加语义）再拉取
+  const reloads: Array<Promise<void>> = []
+  for (const d of days.value) {
+    for (const g of d.dirs) {
+      const k = dirKey(d, g)
+      if (expanded.value.has(k)) {
+        dirImages.value[k] = []
+        dirNext.value[k] = null
+        reloads.push(loadDirImages(k, d.date, g.source_dir))
+      }
+    }
+  }
+  await Promise.all(reloads)
 }
 
 /** 手动刷新主目录。 */
@@ -569,7 +590,7 @@ async function onSelectAll() {
               <ImageCard
                 :image="img"
                 :selected="selected.has(img.id)"
-                @click="onCardClick"
+                @click="onCardClick(d, g, img)"
                 @toggle-select="toggleSelect(img.id)"
                 @recycle="() => {}"
               />

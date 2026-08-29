@@ -62,9 +62,9 @@ onMounted(async () => {
 
 const quickLinks = [
   { label: '本月新图', desc: '按导入时间', to: '/library' },
-  { label: '高分佳作 (≥4.5)', desc: '美学分筛选', to: '/search' },
-  { label: '低清晰度', desc: '待人工判断', to: '/search' },
-  { label: 'danbooru 来源', desc: '溯源成功', to: '/search' },
+  { label: '高分佳作 (≥4.5)', desc: '美学分筛选', to: '/library' },
+  { label: '低清晰度', desc: '待人工判断', to: '/library' },
+  { label: 'danbooru 来源', desc: '溯源成功', to: '/library' },
   { label: '冗余候选', desc: '查重管理', to: '/dedup' },
 ]
 </script>
@@ -97,13 +97,13 @@ const quickLinks = [
         </el-card>
       </el-col>
       <el-col :span="4">
-        <el-card shadow="hover" class="stat-card" @click="router.push('/search')">
+        <el-card shadow="hover" class="stat-card" @click="router.push('/library')">
           <div class="stat-num num-mono">{{ untaggedCount }}</div>
           <div class="stat-label">待打标</div>
         </el-card>
       </el-col>
       <el-col :span="4">
-        <el-card shadow="hover" class="stat-card" @click="router.push('/search')">
+        <el-card shadow="hover" class="stat-card" @click="router.push('/library')">
           <div class="stat-num num-mono">{{ avgAesthetic }}</div>
           <div class="stat-label">平均美学分</div>
         </el-card>

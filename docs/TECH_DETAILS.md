@@ -195,7 +195,7 @@ WS 鉴权：本地服务，无鉴权；绑定 127.0.0.1。
 
 | 方法/路径 | 说明 |
 |---|---|
-| `POST /import` | 创建批次 `{paths:["D:/a", "D:/b.png", ...]}` → `{batch_id}`；服务端扫描→移动→索引异步执行 |
+| `POST /import` | 创建批次 `{paths:["D:/a", "D:/b.png", ...], mode?: "move"|"copy"}` → `{batch_id}`；服务端扫描→移动或复制→索引异步执行（mode 缺省 move；copy 保留源文件） |
 | `GET /import/batches` | 批次列表 |
 | `GET /import/batches/:id` | 批次详情（total/done/failed/duplicate/state） |
 | `POST /import/batches/:id/cancel` | 取消（已入队的 job 标记 cancelled） |
@@ -288,6 +288,13 @@ WS 鉴权：本地服务，无鉴权；绑定 127.0.0.1。
 - 打标与美学共用 GPU：服务内单队列串行执行（默认），并发上限可配置。
 - 加载模型失败时 `/health` 返回对应 `models.*=false`，主服务据此降级（溯源/打标任务标记 failed 并提示）。
 
+### 4.1 桌面壳托管启动与依赖自举（Windows）
+
+- 桌面壳（`src-tauri`）在**后台线程**拉起推理服务：runtime 目录为 `%LOCALAPPDATA%\BeiWay-MoeVault\python`（server 代码首次从安装目录资源复制；日志、venv 一律落此处，安装目录保持只读）。
+- 依赖预检（fastapi/uvicorn/transformers）缺失时**自动**创建 `python/.venv`（`py -3 -m venv --system-site-packages`，复用系统已装的 torch/onnxruntime/PIL/numpy，只需补装小包）；pip 按顺序尝试清华镜像 → 官方 PyPI（与 `python/setup.bat` 约定一致——默认 pypi.org 在部分大陆网络下 TLS 直连失败）。
+- 安装与启动全过程写入 `<runtime>/infer.log`；失败时错误回传设置页。设置页「一键安装依赖」按钮走同一 `ensure_infer_venv` 逻辑（幂等）。
+- 「依赖准备 + spawn」全程持有互斥锁：避免开机自动启动与手动「启动服务」并发执行导致同一 venv 被并发 pip 写入。
+
 ---
 
 ## 5. Rust workspace 模块边界
@@ -297,7 +304,7 @@ backend/
 ├── crates/
 │   ├── core/      # 领域类型、配置、错误（纯数据，零依赖外部服务）
 │   ├── db/        # 连接池(单连接+WAL 或 r2d2)、refinery 迁移、仓储 trait 与实现
-│   ├── ingest/    # 扫描、移动进库、缩略图、MD5/pHash/清晰度、EXIF 提取
+│   ├── ingest/    # 扫描、移动/复制进库、缩略图、MD5/pHash/清晰度、EXIF 提取
 │   ├── dedup/     # pHash 聚类、簇维护、冗余判定
 │   ├── pipeline/  # JobQueue（SQLite 持久化）、PipelineStep trait、调度器、令牌桶限流
 │   ├── tagger/    # SauceNaoClient、DanbooruClient、GelbooruClient、InferenceClient(HTTP→Python)
@@ -360,7 +367,7 @@ pub struct Filter { /* tags: Vec<String>, and: bool, date_range, aesthetic, ... 
 5. **推理降级**：推理服务不可用时打标/评分任务标记 failed（不阻塞导入/查重）；健康恢复后重试。
 6. **FTS 维护**：image_tags 变更后由 db 层在同一事务内更新 `image_tags_fts`（删除旧行+插入新行）。
 7. **缩略图**：导入时生成 `thumb`（256px）/`card`（512px）两级 WebP，路径 `data/thumbs/<md5 前2位>/<md5>.webp`。
-8. **移动进库**：先读文件计算 md5 → 目标路径 `data/library/<md5 前2位>/<md5 前32位>.<ext>` → 若目标已存在（重复）则删源文件并记 duplicate → 否则 move，失败回滚并记 failed。
+8. **进库（move/copy）**：先读文件计算 md5 → 目标路径 `data/library/<md5 前2位>/<md5 前32位>.<ext>` → 若目标已存在（重复）则记 duplicate（move 模式删库外源文件，copy 模式保留源）→ 否则 move（跨卷退化为复制+删源）或 copy，失败记 failed。copy 模式全程保留源文件。
 9. **EXIF**：读取 EXIF DateTimeOriginal；失败回退 `file_mtime` 写入 `exif_datetime`（NULL）与 `file_mtime` 区分。
 10. **优雅退出**：收到 Ctrl+C/SIGTERM → 停止调度 → 等待 running job 落盘 → 关库。
 

@@ -16,13 +16,15 @@ interface TagItem {
 
 const tags = ref<TagItem[]>([])
 const loading = ref(false)
-const cnDict = ref(false)
 const newName = ref('')
 const keyword = ref('')
-// 分页
+// 分页（增强4：每页数独立 localStorage，与图库无关）
 const page = ref(1)
-const pageSize = ref(50)
+const pageSize = ref(Number(localStorage.getItem('moevault-tags-page-size') || '100'))
 const total = ref(0)
+// 增强5：筛选（分类 + 未设中文别名）
+const filterCategory = ref('')
+const filterNoCn = ref(false)
 // 批量选择
 const selected = ref<Set<number>>(new Set())
 
@@ -37,15 +39,81 @@ async function loadTags() {
   loading.value = true
   try {
     const offset = (page.value - 1) * pageSize.value
-    const d = await get<{ items: TagItem[]; total: number }>(
-      `/tags?offset=${offset}&limit=${pageSize.value}${keyword.value.trim() ? `&q=${encodeURIComponent(keyword.value.trim())}` : ''}`,
-    )
+    const params = new URLSearchParams()
+    params.set('offset', String(offset))
+    params.set('limit', String(pageSize.value))
+    if (keyword.value.trim()) params.set('q', keyword.value.trim())
+    if (filterCategory.value) params.set('category', filterCategory.value)
+    if (filterNoCn.value) params.set('no_cn', '1')
+    const d = await get<{ items: TagItem[]; total: number }>(`/tags?${params.toString()}`)
     tags.value = d.items
     total.value = d.total
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
     loading.value = false
+  }
+}
+
+/** 增强4：每页条数修改立即生效并持久化（BUG2：接收 size 参数更新 ref）。 */
+function onPageSizeChange(s: number) {
+  pageSize.value = s
+  localStorage.setItem('moevault-tags-page-size', String(s))
+  page.value = 1
+  loadTags()
+}
+
+/** 增强5：筛选变化回到第一页刷新。 */
+function onFilterChange() {
+  page.value = 1
+  loadTags()
+}
+
+// ---- 增强3：中文别名管理（一个 tag 多条别名）----
+interface TagAlias {
+  id: number
+  alias: string
+}
+const aliasDialogVisible = ref(false)
+const aliasTarget = ref<TagItem | null>(null)
+const aliasList = ref<TagAlias[]>([])
+const newAlias = ref('')
+
+async function openAliasDialog(t: TagItem) {
+  aliasTarget.value = t
+  newAlias.value = ''
+  aliasDialogVisible.value = true
+  await loadAliases()
+}
+
+async function loadAliases() {
+  if (!aliasTarget.value) return
+  try {
+    const d = await get<{ aliases: TagAlias[] }>(`/tags/${aliasTarget.value.id}/aliases`)
+    aliasList.value = d.aliases
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+async function addAlias() {
+  if (!aliasTarget.value || !newAlias.value.trim()) return
+  try {
+    await post(`/tags/${aliasTarget.value.id}/aliases`, { alias: newAlias.value.trim() })
+    newAlias.value = ''
+    await loadAliases()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+async function removeAlias(a: TagAlias) {
+  if (!aliasTarget.value) return
+  try {
+    await del(`/tags/${aliasTarget.value.id}/aliases/${a.id}`)
+    await loadAliases()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
   }
 }
 
@@ -80,6 +148,26 @@ async function removeTag(t: TagItem) {
     await del(`/tags/${t.id}`)
     ElMessage.success('已删除')
     await loadTags()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 设置/清除中文别名（增强2：别名参与搜索联想；留空=清除）。 */
+async function editNameCn(t: TagItem) {
+  const { value } = await ElMessageBox.prompt(
+    '输入中文别名（用于搜索联想与显示；留空清除）',
+    `中文别名 · ${t.name}`,
+    {
+      inputValue: t.name_cn ?? '',
+      inputPlaceholder: '如：女孩 / 黑发',
+    },
+  ).catch(() => ({ value: null as string | null }))
+  if (value === null) return
+  try {
+    await put(`/tags/${t.id}/name-cn`, { name_cn: value || null })
+    t.name_cn = value.trim() || null
+    ElMessage.success(value.trim() ? `已设置中文别名「${value.trim()}」` : '已清除中文别名')
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -152,25 +240,42 @@ onMounted(loadTags)
       <el-input
         v-model="keyword"
         placeholder="搜索标签（名称/中文）"
-        style="width: 220px"
+        style="width: 200px"
         :prefix-icon="Search"
         clearable
         @input="onSearchInput"
-        @clear="loadTags"
+        @clear="onFilterChange"
       />
+      <!-- 增强5：筛选（分类 + 未设中文别名） -->
+      <el-select v-model="filterCategory" style="width: 130px" @change="onFilterChange">
+        <el-option label="全部分类" value="" />
+        <el-option v-for="o in categoryOptions" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
+      <el-checkbox v-model="filterNoCn" @change="onFilterChange">未设中文别名</el-checkbox>
       <template v-if="selected.size > 0">
         <el-button type="danger" plain @click="batchDelete">批量删除 ({{ selected.size }})</el-button>
         <el-button plain @click="batchBlacklist">批量拉黑 ({{ selected.size }})</el-button>
       </template>
       <div class="spacer" />
-      <el-switch v-model="cnDict" active-text="中文字典" inactive-text="英文" />
     </div>
 
     <div v-loading="loading">
-      <el-table v-if="tags.length > 0" :data="tags" @selection-change="(rows: TagItem[]) => { selected = new Set(rows.map(r => r.id)) }">
+      <el-table
+        v-if="tags.length > 0"
+        :data="tags"
+        class="tag-table-fixed"
+        @selection-change="(rows: TagItem[]) => { selected = new Set(rows.map(r => r.id)) }"
+      >
         <el-table-column type="selection" width="45" />
         <el-table-column prop="name" label="名称(EN)" />
-        <el-table-column prop="name_cn" label="中文" width="120" />
+        <el-table-column label="中文别名" width="220">
+          <template #default="{ row }">
+            <span v-if="row.name_cn" class="num-mono">{{ row.name_cn }}</span>
+            <span v-else class="muted">未设置</span>
+            <el-button size="small" text type="primary" @click="editNameCn(row)">主别名</el-button>
+            <el-button size="small" text type="success" @click="openAliasDialog(row)">多别名</el-button>
+          </template>
+        </el-table-column>
         <el-table-column label="分类" width="140">
           <template #default="{ row }">
             <el-select
@@ -209,13 +314,30 @@ onMounted(loadTags)
 
     <div class="pager">
       <el-pagination
-        layout="total, prev, pager, next"
+        layout="total, sizes, prev, pager, next"
         :total="total"
         :page-size="pageSize"
         :current-page="page"
+        :page-sizes="[50, 100, 200, 500]"
         @current-change="(p: number) => { page = p; loadTags() }"
+        @size-change="onPageSizeChange"
       />
     </div>
+
+    <!-- 增强3：多中文别名管理弹窗 -->
+    <el-dialog v-model="aliasDialogVisible" :title="`中文别名 · ${aliasTarget?.name ?? ''}`" width="460px" append-to-body>
+      <div class="alias-list">
+        <div v-for="a in aliasList" :key="a.id" class="alias-row">
+          <span class="alias-text">{{ a.alias }}</span>
+          <el-button size="small" text type="danger" @click="removeAlias(a)">删除</el-button>
+        </div>
+        <el-empty v-if="aliasList.length === 0" description="暂无别名" :image-size="40" />
+      </div>
+      <div class="alias-add">
+        <el-input v-model="newAlias" placeholder="输入新别名，如：黑色头发" @keyup.enter="addAlias" />
+        <el-button type="primary" @click="addAlias">添加</el-button>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -236,5 +358,29 @@ onMounted(loadTags)
 .pager {
   display: flex;
   justify-content: center;
+}
+.alias-list {
+  max-height: 260px;
+  overflow: auto;
+  margin-bottom: 10px;
+}
+.alias-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.alias-text {
+  font-size: 13px;
+}
+.alias-add {
+  display: flex;
+  gap: 8px;
+}
+/* 侧边栏动画期间减少重排：表格 fixed 布局（列宽由表头决定，行内容不触发重算） */
+.tag-table-fixed :deep(table) {
+  table-layout: fixed;
+  width: 100%;
 }
 </style>
