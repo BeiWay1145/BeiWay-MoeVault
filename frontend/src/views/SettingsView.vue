@@ -403,11 +403,16 @@ async function loadLogs() {
   }
 }
 
-// 增强1：BUG追踪器——追踪开关（localStorage）+ 后端转储
-const bugTrackerEnabled = ref(localStorage.getItem('moevault-bug-tracker') === '1')
-watch(bugTrackerEnabled, (v) => {
-  localStorage.setItem('moevault-bug-tracker', v ? '1' : '0')
-  reportLog(v ? 'BUG追踪器已开启' : 'BUG追踪器已关闭')
+// 增强1：BUG追踪器——三态（关闭/本会话开启/开启，开关+仅本次会话勾选）+ 后端转储
+import { getTrackerState, setTrackerState, isTracking, type TrackerState } from '@/api/tracking'
+const trackerState = ref<TrackerState>(getTrackerState())
+const trackerSessionOnly = ref(trackerState.value === 'session')
+const trackerOn = ref(trackerState.value !== 'off')
+watch([trackerOn, trackerSessionOnly], () => {
+  const next: TrackerState = trackerOn.value ? (trackerSessionOnly.value ? 'session' : 'on') : 'off'
+  setTrackerState(next)
+  trackerState.value = next
+  reportLog(`BUG追踪器状态：${next === 'on' ? '开启' : next === 'session' ? '本会话开启' : '关闭'}`)
 })
 const dumpLoading = ref(false)
 async function dumpLogsBackend() {
@@ -478,7 +483,7 @@ function exportLogs() {
 const logLevelType = (l: string) =>
   ({ info: 'info', warn: 'warning', error: 'danger' })[l] as 'info' | 'warning' | 'danger'
 const logCategoryLabel = (c: string) =>
-  ({ task: '任务', sauce: '溯源', tag: '打标', aesthetic: '美学', frontend: '前端', import: '导入', system: '系统' })[c] ?? c
+  ({ task: '任务', sauce: '溯源', tag: '打标', aesthetic: '美学', frontend: '前端', import: '导入', system: '系统', track: '追踪' })[c] ?? c
 
 function onModelSelect(name: string) {
   const opt = taggerModelOptions.find((o) => o.name === name)
@@ -758,8 +763,14 @@ onMounted(async () => {
       <el-tab-pane label="BUG追踪器" name="logs">
         <div class="log-panel">
           <div class="log-toolbar">
-            <el-switch v-model="bugTrackerEnabled" active-text="追踪已开启" inactive-text="追踪关闭" />
-            <span class="hint">开启后详细记录操作与报错；应用退出时自动转储为 txt 文件</span>
+            <el-switch v-model="trackerOn" active-text="追踪开启" inactive-text="追踪关闭" />
+            <el-checkbox v-model="trackerSessionOnly" :disabled="!trackerOn">仅本次会话</el-checkbox>
+            <span class="hint">
+              {{ trackerState === 'on' ? '状态：开启（持久，重启仍生效）' : trackerState === 'session' ? '状态：本会话开启（重启后关闭）' : '状态：关闭（不记录）' }}
+            </span>
+          </div>
+          <div class="log-toolbar" style="margin-top: 4px">
+            <span class="hint">开启后全量记录：API 请求（脱敏）+ 前端错误堆栈 + 关键操作；应用退出时自动转储为 txt</span>
           </div>
           <div class="log-toolbar" style="margin-top: 6px">
             <el-button size="small" @click="loadLogs">刷新</el-button>

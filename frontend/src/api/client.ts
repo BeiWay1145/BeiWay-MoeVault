@@ -5,6 +5,8 @@
  */
 const BASE = '/api/v1'
 
+import { trackApi } from '@/api/tracking'
+
 export class ApiError extends Error {
   code: string
   status: number
@@ -16,22 +18,36 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  })
+  const started = performance.now()
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const full = `${BASE}${path}`
+  let res: Response
+  try {
+    res = await fetch(full, {
+      headers: { 'Content-Type': 'application/json' },
+      ...init,
+    })
+  } catch (e) {
+    trackApi(method, path, null, performance.now() - started, String(e))
+    throw e
+  }
+  const ms = performance.now() - started
   if (!res.ok) {
     let code = 'unknown'
     let message = res.statusText
+    let errBody: string | undefined
     try {
       const body = (await res.json()) as { error?: { code?: string; message?: string } }
       code = body.error?.code ?? code
       message = body.error?.message ?? message
+      errBody = JSON.stringify(body)
     } catch {
       /* 非 JSON 响应 */
     }
+    trackApi(method, path, res.status, ms, errBody)
     throw new ApiError(res.status, code, message)
   }
+  trackApi(method, path, res.status, ms)
   return res.json() as Promise<T>
 }
 

@@ -7,6 +7,7 @@ import TopBar from '@/components/TopBar.vue'
 import DragImport from '@/components/DragImport.vue'
 import { useTaskStore } from '@/stores/tasks'
 import { startWsEvents, stopWsEvents } from '@/api/ws'
+import { trackError } from '@/api/tracking'
 
 const taskStore = useTaskStore()
 const route = useRoute()
@@ -49,6 +50,18 @@ onMounted(() => {
   startWsEvents()
   window.addEventListener('moevault:import-done', onImportDone)
   window.addEventListener('moevault:import-failed', onImportFailed)
+  // BUG 追踪器：全局错误捕获（window.onerror / unhandledrejection）
+  window.addEventListener('error', (e) => {
+    trackError('window.onerror', e.message, e.error?.stack)
+  })
+  window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason as { message?: string; stack?: string } | string | undefined
+    trackError(
+      'unhandledrejection',
+      typeof r === 'string' ? r : (r?.message ?? 'Promise 拒绝'),
+      typeof r === 'string' ? undefined : r?.stack,
+    )
+  })
 })
 onUnmounted(() => {
   stopWsEvents()
