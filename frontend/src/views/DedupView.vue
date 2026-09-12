@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { get, post, del } from '@/api/client'
 import { useDedupStore, thumbUrl, type DedupGroup, type GroupMember } from '@/stores/dedup'
 
 const dedup = useDedupStore()
@@ -9,8 +10,68 @@ const membersCache = ref<Record<number, GroupMember[]>>({})
 const scanning = ref(false)
 const resolving = ref<number | null>(null)
 
+// ---- 增强3：待确认替换（智能替换严格查重未通过的候选） ----
+interface PendingItem {
+  id: number
+  image_id: number
+  temp_path: string
+  net_size: number
+  local_size: number
+  net_width: number | null
+  net_height: number | null
+  source_url: string | null
+  created_at: number
+  rel_path: string
+}
+const pendingItems = ref<PendingItem[]>([])
+const pendingLoading = ref(false)
+const confirming = ref<number | null>(null)
+
+async function loadPending() {
+  pendingLoading.value = true
+  try {
+    const d = await get<{ items: PendingItem[] }>('/replace-pending')
+    pendingItems.value = d.items
+  } catch {
+    /* 静默 */
+  } finally {
+    pendingLoading.value = false
+  }
+}
+
+function fmtSize(b: number): string {
+  if (b >= 1 << 20) return `${(b / (1 << 20)).toFixed(1)} MB`
+  if (b >= 1 << 10) return `${(b / (1 << 10)).toFixed(0)} KB`
+  return `${b} B`
+}
+
+/** 确认替换（网络图内容替换库内文件，旧文件移入回收站）。 */
+async function confirmReplace(p: PendingItem) {
+  confirming.value = p.id
+  try {
+    await post(`/replace-pending/${p.id}/confirm`)
+    ElMessage.success(`图片 #${p.image_id} 已替换为网络原图`)
+    await loadPending()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    confirming.value = null
+  }
+}
+
+/** 忽略候选（删除记录 + 临时文件）。 */
+async function ignorePending(p: PendingItem) {
+  try {
+    await del(`/replace-pending/${p.id}`)
+    await loadPending()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 onMounted(() => {
   dedup.fetchGroups().catch((e: Error) => ElMessage.error(e.message))
+  loadPending()
 })
 
 async function toggleExpand(g: DedupGroup) {
@@ -73,6 +134,26 @@ async function resolveBest(g: DedupGroup) {
       </el-statistic>
       <span class="hint">从主目录发起范围查重后，结果在这里处理</span>
     </div>
+
+    <!-- 增强3：待确认替换（溯源网络图与本地图差异过大的候选） -->
+    <el-card v-if="pendingItems.length > 0 || pendingLoading" shadow="never" class="pending-card">
+      <template #header>
+        <span>待确认替换（{{ pendingItems.length }}）</span>
+        <el-button size="small" text type="primary" style="margin-left: 8px" @click="loadPending">刷新</el-button>
+      </template>
+      <div v-loading="pendingLoading" class="pending-list">
+        <div v-for="p in pendingItems" :key="p.id" class="pending-row">
+          <span class="pending-id">#{{ p.image_id }}</span>
+          <span class="pending-name">{{ p.rel_path.split(/[\\/]/).pop() }}</span>
+          <span class="pending-size">本地 {{ fmtSize(p.local_size) }} → 网络 {{ fmtSize(p.net_size) }}<template v-if="p.net_width">（{{ p.net_width }}×{{ p.net_height }}）</template></span>
+          <div class="pending-actions">
+            <el-button size="small" type="primary" :loading="confirming === p.id" @click="confirmReplace(p)">替换</el-button>
+            <el-button size="small" @click="ignorePending(p)">忽略</el-button>
+          </div>
+        </div>
+        <el-empty v-if="pendingItems.length === 0 && !pendingLoading" description="暂无待确认项" :image-size="40" />
+      </div>
+    </el-card>
 
     <div v-loading="dedup.loading" class="group-list">
       <el-empty v-if="!dedup.loading && dedup.groups.length === 0" description="暂无重复组" />
@@ -161,6 +242,43 @@ async function resolveBest(g: DedupGroup) {
   padding: 12px 16px;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
+}
+.pending-card {
+  margin-bottom: 4px;
+}
+.pending-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.pending-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.pending-id {
+  color: var(--el-text-color-secondary);
+  font-family: monospace;
+  flex: none;
+}
+.pending-name {
+  flex: 1;
+  font-size: 13px;
+  word-break: break-all;
+}
+.pending-size {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  flex: none;
+}
+.pending-actions {
+  flex: none;
+  display: flex;
+  gap: 4px;
 }
 .group-card {
   margin-bottom: 4px;

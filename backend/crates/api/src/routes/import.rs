@@ -92,8 +92,9 @@ async fn create_import(
         let db = st.db.clone();
         let library = st.library_dir();
         let thumbs = st.thumbs_dir();
+        let recycle = st.recycle_dir();
         let result = tokio::task::spawn_blocking(move || {
-            moevault_ingest::run_import(&db, batch_id, path_bufs, &library, &thumbs, mode)
+            moevault_ingest::run_import(&db, batch_id, path_bufs, &library, &thumbs, &recycle, mode)
         })
         .await;
 
@@ -105,6 +106,7 @@ async fn create_import(
                     "done": progress.done,
                     "failed": progress.failed,
                     "duplicate": progress.duplicate,
+                    "duplicates_recycled": progress.duplicates_recycled,
                 },
             }),
             Ok(Err(e)) => json!({

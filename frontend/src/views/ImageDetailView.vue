@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { ArrowDown, ArrowRight, ArrowLeft } from '@element-plus/icons-vue'
 import { displayTagName, searchTagKey } from '@/utils/tagNormalize'
 import { useLibraryStore, originalUrl } from '@/stores/library'
@@ -295,22 +295,119 @@ async function rescoreAesthetic() {
   }
 }
 
-// 增强5：尝试溯源（SauceNAO 任务）
+// 增强5：尝试溯源（SauceNAO 任务）；增强3：完成后比对网络原图大小 → 弹一键替换提示
 async function trySauce() {
   if (!image.value) return
+  const id = image.value.id
+  const localSize = image.value.sizeBytes
   try {
-    await taskStore.enqueueSauce([image.value.id])
+    await taskStore.enqueueSauce([id], false, false, async () => {
+      await checkSauceReplace(id, localSize)
+    })
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
 }
 
-function exportImage() {
+/** 增强3（单张溯源）：溯源完成后比对网络原图与本地图大小；差异 ≥2 倍 → 右上角弹一键替换提示。 */
+async function checkSauceReplace(id: number, localSize: number) {
+  try {
+    const r = await get<{
+      ok: boolean
+      page_url: string
+      info: { width: number | null; height: number | null; size_bytes: number | null; file_url: string | null }
+    }>(`/images/${id}/source-info`)
+    const netSize = r.info.size_bytes ?? 0
+    if (!r.info.file_url || netSize < 2 * localSize) return // 差异不足 → 不提示
+    // 刷新详情（溯源已更新来源链接）
+    await loadDetail()
+    ElNotification({
+      title: '发现更清晰的原图',
+      message: h('div', null, [
+        h('p', null, `网络原图 ${fmtBytes(netSize)} ≈ ${localSize > 0 ? (netSize / localSize).toFixed(1) : '?'} 倍于本地图（${fmtBytes(localSize)}）`),
+        h(
+          'button',
+          {
+            style:
+              'margin-top:6px;padding:4px 12px;background:var(--el-color-primary);color:#fff;border:none;border-radius:4px;cursor:pointer',
+            onClick: () => doReplaceFromNet(id),
+          },
+          '一键替换原图',
+        ),
+      ]),
+      type: 'warning',
+      duration: 0,
+      onClick: () => doReplaceFromNet(id),
+    })
+  } catch {
+    /* 静默：比对失败不影响溯源结果 */
+  }
+}
+
+/** 增强3：执行替换（下载网络原图替换库内文件，旧文件移入回收站）。 */
+async function doReplaceFromNet(id: number) {
+  try {
+    const r = await get<{ ok: boolean; page_url: string; info: { file_url: string | null } }>(`/images/${id}/source-info`)
+    if (!r.info.file_url) {
+      ElMessage.error('无法获取网络图直链')
+      return
+    }
+    await post(`/images/${id}/replace-from-url`, { url: r.info.file_url })
+    ElMessage.success('已替换为网络原图（旧文件已移入回收站）')
+    await loadDetail()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+/** 手动导出：复制原图到导出默认目录（或下载目录）；设置开启时自动打开资源管理器。 */
+async function exportImage() {
   if (!image.value) return
-  const a = document.createElement('a')
-  a.href = originalSrc.value ?? ''
-  a.download = image.value.name
-  a.click()
+  try {
+    const s = settingsStore
+    let dir = s.settings.export_default_dir?.trim() ?? ''
+    if (!dir) {
+      const dl = await get<{ dir: string }>('/system/downloads-dir')
+      dir = dl.dir
+    }
+    const r = await post<{ ok: boolean; count: number; target: string }>('/images/export', {
+      ids: [image.value.id],
+      target_dir: dir,
+      bundle_name: null,
+      pack: false,
+      pack_format: 'zip',
+      pack_level: 2,
+      with_tags: false,
+      recycle_after: false,
+    })
+    const target = r.target
+    ElNotification({
+      title: '导出完成',
+      message: `${image.value.name} → ${target}（点击跳转目录）`,
+      type: 'success',
+      duration: 6000,
+      onClick: () => openExplorer(target),
+    })
+    if (s.settings.export_open_explorer_manual) {
+      openExplorer(target)
+    }
+  } catch (e) {
+    // 回退：浏览器直接下载
+    const a = document.createElement('a')
+    a.href = originalSrc.value ?? ''
+    a.download = image.value.name
+    a.click()
+    ElMessage.success('已通过浏览器下载')
+  }
+}
+
+/** 在资源管理器中打开路径（手动导出跳转）。 */
+async function openExplorer(path: string) {
+  try {
+    await post('/system/open-explorer', { path })
+  } catch {
+    /* 静默 */
+  }
 }
 
 /** E2: 手动编辑溯源来源链接。 */

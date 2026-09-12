@@ -293,6 +293,8 @@ pub struct RunTaggingRequest {
     pub force_ids: Option<Vec<i64>>,
     /// 溯源时是否忽略不可溯源标记（强制重试）。
     pub force_sauce: Option<bool>,
+    /// 增强3：溯源完成后自动执行原图智能替换（大小比对 + 严格查重）。
+    pub auto_replace: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,11 +545,27 @@ async fn run_sauce(
     let infer = InferClient::new(st.infer_base_url.clone());
     let library_dir = st.library_dir();
     let force_sauce = req.force_sauce.unwrap_or(false);
+    let auto_replace = req.auto_replace.unwrap_or(false);
+
+    // 增强3：auto_replace 时快照候选 ids（pipeline 同源查询；sauce 失败的图会被替换检查自然跳过）
+    let candidate_ids: Vec<i64> = if auto_replace {
+        match &force_ids {
+            Some(ids) => ids.clone(),
+            None => {
+                let db2 = state.db.clone();
+                tokio::task::spawn_blocking(move || db2.untagged_active_images(10000).unwrap_or_default())
+                    .await
+                    .unwrap_or_default()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
-        let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id} 启动（{} 张{}）", force_ids.as_ref().map_or(0, |v| v.len()), if force_sauce { "，强制重试不可溯源图" } else { "" }));
+        let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id} 启动（{} 张{}{}）", force_ids.as_ref().map_or(0, |v| v.len()), if force_sauce { "，强制重试不可溯源图" } else { "" }, if auto_replace { "，启用智能替换" } else { "" }));
         let result = moevault_tagger::run_sauce_pipeline(
             &db,
             &sauce,
@@ -572,6 +590,19 @@ async fn run_sauce(
                 status
             };
         let _ = db.update_job(job_id, final_status, done, failed, error.as_deref());
+        // 增强3：溯源成功 → 智能替换检查（大小比对 + 严格查重）
+        if final_status == "done" && auto_replace && !candidate_ids.is_empty() {
+            let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id}：开始智能替换检查（{} 张候选）", candidate_ids.len()));
+            let stats = super::replace::run_auto_replace_for_images(&st, candidate_ids).await;
+            let _ = db.add_log(
+                "info",
+                "sauce",
+                &format!(
+                    "智能替换完成：替换 {}，待人工确认 {}，跳过 {}，失败 {}",
+                    stats.replaced, stats.pending, stats.skipped, stats.failed
+                ),
+            );
+        }
         let _ = db.add_log(
             if final_status == "done" { "info" } else if final_status == "cancelled" { "warn" } else { "error" },
             "task",

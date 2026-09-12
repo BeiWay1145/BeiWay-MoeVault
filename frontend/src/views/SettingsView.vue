@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { Delete, CaretRight, VideoPause, Refresh, Download } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -9,6 +9,8 @@ import { reportLog } from '@/api/log'
 import {
   fetchInferHealth,
   inferInstallDeps,
+  inferInstallGpu,
+  inferGpuStatus,
   inferShellStatus,
   inferStart,
   inferStop,
@@ -75,6 +77,96 @@ async function loadInferHealth() {
     inferOverall.value = 'stopped'
   } finally {
     inferLoading.value = false
+  }
+}
+
+// ---- 增强1：GPU 推理环境部署 ----
+const gpuInstalling = ref(false)
+const gpuCudaReady = ref(false)
+const gpuInstallBusy = ref(false)
+let gpuPollTimer: number | undefined
+/** 手动安装教程对话框。 */
+const gpuTutorialVisible = ref(false)
+/** 手动安装教程内容（本机 venv 路径）。 */
+const gpuTutorialText = [
+  '【手动安装 GPU 推理环境教程】',
+  '',
+  '自动部署失败通常是本机网络无法直连 PyTorch 官方源（pip TLS 被阻断）。按以下步骤手动安装（约 2.9GB）：',
+  '',
+  '第 1 步：用浏览器下载两个文件（浏览器网络可直连官方源）',
+  '  · https://download.pytorch.org/whl/cu128/torch/',
+  '  · 下载 torch-2.11.0+cu128-cp310-cp310-win_amd64.whl',
+  '  · 下载 torchvision-0.26.0+cu128-cp310-cp310-win_amd64.whl',
+  '',
+  '第 2 步：把两个 .whl 文件放到以下目录',
+  '  · %LOCALAPPDATA%\\BeiWay-MoeVault\\python\\',
+  '',
+  '第 3 步：打开命令提示符（Win+R → cmd），执行',
+  '  · cd %LOCALAPPDATA%\\BeiWay-MoeVault\\python',
+  '  · .venv\\Scripts\\python.exe -m pip install torch-2.11.0+cu128-cp310-cp310-win_amd64.whl torchvision-0.26.0+cu128-cp310-cp310-win_amd64.whl --index-url https://pypi.tuna.tsinghua.edu.cn/simple',
+  '',
+  '第 4 步：等待安装完成，重启应用',
+  '  · 回到本设置页，GPU 推理环境应显示「CUDA 已就绪」',
+  '  · 推理设备下拉会出现「CUDA GPU1（显卡型号）」选项',
+  '',
+  '提示：若浏览器也下载不动，可尝试其他镜像（百度网盘/迅雷搜索 torch 2.11.0 cu128 或使用代理加速）。',
+].join('\n')
+
+function showGpuTutorial() {
+  gpuTutorialVisible.value = true
+}
+
+/** 复制教程文本到剪贴板。 */
+async function copyGpuTutorial() {
+  try {
+    await navigator.clipboard.writeText(gpuTutorialText)
+    ElMessage.success('教程已复制到剪贴板')
+  } catch {
+    ElMessage.error('复制失败，请手动选择文本复制')
+  }
+}
+
+async function refreshGpuStatus() {
+  try {
+    const s = await inferGpuStatus()
+    if (s) {
+      gpuInstalling.value = s.installing
+      gpuCudaReady.value = s.cuda_ready
+    }
+  } catch {
+    /* 静默 */
+  }
+}
+
+async function installGpuEnv() {
+  try {
+    await ElMessageBox.confirm(
+      '将下载并安装 CUDA 12.8 版 PyTorch（约 3GB，支持 RTX 50 系及旧卡），安装期间可正常使用应用但不可重复点击。继续？',
+      '安装 GPU 推理环境',
+      { type: 'warning', confirmButtonText: '开始安装' },
+    )
+  } catch {
+    return
+  }
+  gpuInstallBusy.value = true
+  try {
+    const r = await inferInstallGpu()
+    ElMessage.success(r.message)
+    gpuInstalling.value = true
+    // 轮询安装状态（10s 间隔）
+    if (gpuPollTimer !== undefined) window.clearInterval(gpuPollTimer)
+    gpuPollTimer = window.setInterval(async () => {
+      await refreshGpuStatus()
+      if (!gpuInstalling.value && gpuPollTimer !== undefined) {
+        window.clearInterval(gpuPollTimer)
+        gpuPollTimer = undefined
+        ElMessage.success(gpuCudaReady.value ? 'GPU 推理环境已就绪（CUDA 可用）' : 'GPU 环境安装流程结束（详见 python/infer.log）')
+      }
+    }, 10000)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    gpuInstallBusy.value = false
   }
 }
 
@@ -158,13 +250,25 @@ async function onInstallDeps() {
   }
 }
 
+/** 全局 IP 池窗口状态（免费账号 4 次 / 30 秒，跨 key 共享）。 */
+interface RateWindow {
+  used: number
+  limit: number
+  cooling_secs: number
+  window_secs: number
+}
+const rateWindow = ref<RateWindow | null>(null)
+
 async function loadKeys() {
   try {
-    // 现在 list_keys 返回实时配额（short/long/cooldown/status）
-    const d = await get<{ keys: SauceKeyConfig[] & Array<Record<string, unknown>>; count: number }>(
-      '/settings/saucenao-keys',
-    )
+    // list_keys 返回实时配额（short/long/cooldown/status）+ 全局窗口
+    const d = await get<{
+      keys: SauceKeyConfig[] & Array<Record<string, unknown>>
+      count: number
+      rate_window?: RateWindow | null
+    }>('/settings/saucenao-keys')
     keys.value = d.keys
+    rateWindow.value = d.rate_window ?? null
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -331,6 +435,8 @@ const logListRef = ref<HTMLElement | null>(null)
 const LOG_SETTINGS_KEY = 'moevault-log-settings'
 const logAutoRefresh = ref(5)
 const logAutoScroll = ref(true)
+/** 显示条数（服务端一次拉取量，默认 200，最大 5000）。 */
+const logLimit = ref(200)
 const logRefreshOptions = [
   { value: 0, label: '关闭' },
   { value: 5, label: '5 秒' },
@@ -338,17 +444,29 @@ const logRefreshOptions = [
   { value: 30, label: '30 秒' },
   { value: 60, label: '60 秒' },
 ]
+const logLimitOptions = [
+  { value: 200, label: '200 条' },
+  { value: 500, label: '500 条' },
+  { value: 1000, label: '1000 条' },
+  { value: 2000, label: '2000 条' },
+  { value: 5000, label: '5000 条（最全）' },
+]
+/** 服务端本次返回的条数（用于提示"是否被截断"）。 */
+const logLoadedCount = ref(0)
 let logTimer: number | undefined
 
 function loadLogSettings() {
   try {
     const raw = localStorage.getItem(LOG_SETTINGS_KEY)
     if (!raw) return
-    const s = JSON.parse(raw) as { refresh?: number; scroll?: boolean }
+    const s = JSON.parse(raw) as { refresh?: number; scroll?: boolean; limit?: number }
     if (typeof s.refresh === 'number' && logRefreshOptions.some((o) => o.value === s.refresh)) {
       logAutoRefresh.value = s.refresh
     }
     if (typeof s.scroll === 'boolean') logAutoScroll.value = s.scroll
+    if (typeof s.limit === 'number' && logLimitOptions.some((o) => o.value === s.limit)) {
+      logLimit.value = s.limit
+    }
   } catch {
     /* 解析失败用默认值 */
   }
@@ -357,7 +475,11 @@ function saveLogSettings() {
   try {
     localStorage.setItem(
       LOG_SETTINGS_KEY,
-      JSON.stringify({ refresh: logAutoRefresh.value, scroll: logAutoScroll.value }),
+      JSON.stringify({
+        refresh: logAutoRefresh.value,
+        scroll: logAutoScroll.value,
+        limit: logLimit.value,
+      }),
     )
   } catch {
     /* 忽略 */
@@ -388,9 +510,14 @@ async function loadLogs() {
   const wasAtBottom = el ? isAtBottom(el) : false
   logLoading.value = true
   try {
-    const d = await get<{ items: LogEntry[] }>('/logs?limit=200')
+    // 级别过滤交给服务端：否则海量 info 会把 error 挤出返回窗口（BUG 追踪器核心诉求）
+    const qs = new URLSearchParams({ limit: String(logLimit.value) })
+    const levels = activeLevels.value.join(',')
+    if (levels) qs.set('levels', levels)
+    const d = await get<{ items: LogEntry[] }>('/logs?' + qs.toString())
     // 最新在下（后端返回倒序，反转显示）
     logs.value = [...d.items].reverse()
+    logLoadedCount.value = d.items.length
     await nextTick()
     // 自动滚动：仅在用户本就在底部时跟随到最新日志
     if (logAutoScroll.value && wasAtBottom && logListRef.value) {
@@ -440,7 +567,52 @@ watch(activeTab, (tab) => {
     stopLogTimer()
   }
 })
-onBeforeUnmount(stopLogTimer)
+onBeforeUnmount(() => {
+  stopLogTimer()
+  if (gpuPollTimer !== undefined) window.clearInterval(gpuPollTimer)
+})
+
+// ---- 增强2：当前生效模型名称与来源 ----
+const taggerEffectiveName = computed(() => {
+  const dir = inferHealth.value?.paths?.tagger_model_dir
+  if (!dir) return '（服务未启动）'
+  const parts = dir.replace(/[\\/]+$/, '').split(/[\\/]/)
+  const base = parts[parts.length - 1] || dir
+  return base
+})
+const taggerEffectiveSource = computed(() => {
+  const dir = inferHealth.value?.paths?.tagger_model_dir
+  if (!dir) return '未知'
+  if (dir.toLowerCase().includes('models') && dir.includes('image')) return `本地目录 ${dir}`
+  return dir
+})
+
+// ---- 增强2：美学模型预设选择 ----
+const AESTHETIC_PRESETS = [
+  'trojblue/distill-q-align-aesthetic-siglip2-base',
+  'Disty0/aesthetic-shadow-v2',
+]
+const aestheticModelPreset = computed(() => {
+  const m = settings.settings.aesthetic_model
+  if (AESTHETIC_PRESETS.includes(m)) return m
+  return '__custom__'
+})
+function onAestheticModelSelect(v: string) {
+  if (v === '__custom__') {
+    settings.settings.aesthetic_model = ''
+    ElMessage.info('请输入自定义 HF 仓库名或本地目录')
+  } else {
+    settings.settings.aesthetic_model = v
+    ElMessage.info('模型已切换，保存设置并重跑美学任务生效')
+  }
+}
+const aestheticEffectiveSource = computed(() => {
+  const dir = inferHealth.value?.paths?.aesthetic_model
+  if (!dir) return '未知'
+  // 含盘符/反斜杠 → 本地目录；否则 HF 仓库
+  if (/^[A-Za-z]:[\\/]/.test(dir) || dir.includes('\\')) return `本地目录（首次无需下载）`
+  return 'HF 仓库（首次使用自动下载）'
+})
 
 async function clearLogs() {
   try {
@@ -484,6 +656,80 @@ const logLevelType = (l: string) =>
   ({ info: 'info', warn: 'warning', error: 'danger' })[l] as 'info' | 'warning' | 'danger'
 const logCategoryLabel = (c: string) =>
   ({ task: '任务', sauce: '溯源', tag: '打标', aesthetic: '美学', frontend: '前端', import: '导入', system: '系统', track: '追踪' })[c] ?? c
+
+// ---- 议题6：BUG追踪器易读性（格式化 + 级别筛选 + 文本搜索）----
+/** 追踪日志格式化：JSON 行 → 易读文本（[API] POST /logs → 200 (2ms) / [错误] msg）。 */
+function formatLogMsg(category: string, message: string): string {
+  if (category !== 'track') return message
+  const lines = message.split('\n')
+  const out: string[] = []
+  for (const line of lines) {
+    try {
+      const o = JSON.parse(line)
+      if (o.t === 'api') {
+        out.push(`[API] ${o.m} ${o.p} → ${o.s ?? '网络错误'} (${o.ms ?? '?'}ms)${o.e ? ` ✗ ${o.e}` : ''}`)
+      } else if (o.t === 'err') {
+        out.push(`[错误·${o.src}] ${o.msg}${o.stack ? `\n    ${String(o.stack).slice(0, 300)}` : ''}`)
+      } else if (o.t === 'act') {
+        out.push(`[操作] ${o.a}`)
+      } else {
+        out.push(line)
+      }
+    } catch {
+      out.push(line)
+    }
+  }
+  return out.join('\n')
+}
+/** 级别筛选（默认全开）——同时下发服务端做 SQL 过滤。 */
+const filterInfo = ref(true)
+const filterWarn = ref(true)
+const filterError = ref(true)
+/** 已勾选的级别列表（服务端查询参数）。 */
+const activeLevels = computed(() => {
+  const out: string[] = []
+  if (filterInfo.value) out.push('info')
+  if (filterWarn.value) out.push('warn')
+  if (filterError.value) out.push('error')
+  return out
+})
+/** 只看错误：一键过滤掉 info/warning，error 不再被顶掉。 */
+function onlyErrors() {
+  filterInfo.value = false
+  filterWarn.value = false
+  filterError.value = true
+}
+/** 恢复全级别。 */
+function allLevels() {
+  filterInfo.value = true
+  filterWarn.value = true
+  filterError.value = true
+}
+/** 级别勾选变化 → 按新级别重新拉取（服务端过滤）。 */
+watch([filterInfo, filterWarn, filterError], () => {
+  if (activeTab.value === 'logs') loadLogs()
+})
+/** 显示条数变化 → 持久化 + 重新拉取。 */
+watch(logLimit, () => {
+  saveLogSettings()
+  if (activeTab.value === 'logs') loadLogs()
+})
+/** 文本搜索。 */
+const logSearch = ref('')
+/** 过滤后的日志列表（级别已由服务端过滤，这里做文本搜索兜底）。 */
+const filteredLogs = computed(() => {
+  const kw = logSearch.value.trim().toLowerCase()
+  return logs.value.filter((l) => {
+    if (l.level === 'info' && !filterInfo.value) return false
+    if (l.level === 'warn' && !filterWarn.value) return false
+    if (l.level === 'error' && !filterError.value) return false
+    if (kw) {
+      const fmt = formatLogMsg(l.category, l.message).toLowerCase()
+      if (!fmt.includes(kw) && !l.category.includes(kw)) return false
+    }
+    return true
+  })
+})
 
 function onModelSelect(name: string) {
   const opt = taggerModelOptions.find((o) => o.name === name)
@@ -549,6 +795,7 @@ onMounted(async () => {
   loadLogSettings()
   loadInferHealth()
   loadShellDiagnostics()
+  refreshGpuStatus()
 })
 </script>
 
@@ -582,6 +829,23 @@ onMounted(async () => {
           <el-form-item label="分页模式">
             <el-switch v-model="settings.settings.pagination_enabled" active-text="开启" inactive-text="关闭" />
             <span class="hint">开启后图库按每页固定条数分页（每页条数在图库页右下角设置），关闭则一次加载全部</span>
+          </el-form-item>
+          <el-form-item label="默认导入方式">
+            <el-radio-group v-model="settings.settings.import_default_mode">
+              <el-radio value="move">移动进库</el-radio>
+              <el-radio value="copy">复制进库</el-radio>
+            </el-radio-group>
+            <span class="hint">拖入导入/手动导入时的默认模式（确认框内仍可临时切换）</span>
+          </el-form-item>
+          <el-form-item label="导出后打开目录">
+            <el-checkbox v-model="settings.settings.export_open_explorer_batch">批量导出后自动打开资源管理器</el-checkbox>
+            <br />
+            <el-checkbox v-model="settings.settings.export_open_explorer_manual">手动导出后自动打开资源管理器</el-checkbox>
+            <span class="hint">导出完成后自动打开资源管理器到目标目录（默认关闭；也可点击成功提示跳转）</span>
+          </el-form-item>
+          <el-form-item label="导出默认目录">
+            <el-input v-model="settings.settings.export_default_dir" placeholder="留空 = 自动探测下载目录" style="width: 420px" />
+            <span class="hint">批量导出弹窗的目标目录默认值（如 D:\Downloads）</span>
           </el-form-item>
           <el-form-item label="预加载图片张数">
             <el-input-number v-model="settings.settings.preload_count" :min="0" :max="5" />
@@ -665,6 +929,28 @@ onMounted(async () => {
               <span class="mono">{{ inferHealth?.paths?.aesthetic_model || '（服务未启动）' }}</span>
             </el-descriptions-item>
             <el-descriptions-item label="美学模型状态">{{ modelStateText(inferHealth?.models?.aesthetic) }}</el-descriptions-item>
+            <el-descriptions-item label="GPU 推理环境">
+              <template v-if="isTauri()">
+                <el-tag v-if="gpuCudaReady" type="success" size="small">CUDA 已就绪</el-tag>
+                <el-tag v-else-if="gpuInstalling" type="warning" size="small">安装中…（进度见 python/infer.log）</el-tag>
+                <el-tag v-else type="info" size="small">未安装（CPU 模式）</el-tag>
+                <el-button
+                  size="small"
+                  type="primary"
+                  plain
+                  style="margin-left: 8px"
+                  :disabled="gpuInstalling || gpuCudaReady"
+                  :loading="gpuInstallBusy"
+                  @click="installGpuEnv"
+                >
+                  {{ gpuCudaReady ? '已就绪' : gpuInstalling ? '安装中…' : '一键部署 GPU 环境' }}
+                </el-button>
+                <el-button size="small" text type="primary" style="margin-left: 6px" @click="showGpuTutorial">
+                  手动安装教程
+                </el-button>
+              </template>
+              <span v-else class="hint">仅桌面版支持部署</span>
+            </el-descriptions-item>
           </el-descriptions>
         </el-card>
 
@@ -690,6 +976,10 @@ onMounted(async () => {
               </el-select>
               <span class="hint">推荐自动探测：项目内 models/tagger → 旧位置 → 自定义</span>
             </el-form-item>
+            <el-form-item label="当前生效模型">
+              <span class="mono">{{ taggerEffectiveName }}</span>
+              <span class="hint">来源：{{ taggerEffectiveSource }}</span>
+            </el-form-item>
             <el-form-item label="自定义目录">
               <el-input v-model="settings.settings.tagger_model_dir" placeholder="留空 = 自动探测（推荐）" style="width: 400px" />
               <span class="hint">留空自动探测；填写后保存设置并重跑打标任务生效</span>
@@ -707,8 +997,31 @@ onMounted(async () => {
         </el-card>
         <el-card header="美学评分" shadow="never" class="inf-card">
           <el-form label-width="160px" style="max-width: 720px">
-            <el-form-item label="模型">
-              <el-input v-model="settings.settings.aesthetic_model" />
+            <el-form-item label="模型种类">
+              <el-radio-group v-model="settings.settings.aesthetic_kind">
+                <el-radio value="qalign">Q-Align（偏真人摄影）</el-radio>
+                <el-radio value="anime">Aesthetic Shadow V2（二次元特化）</el-radio>
+              </el-radio-group>
+              <span class="hint">二次元图建议用 anime 模型；首次使用自动下载（约 2.2GB）；下次评分任务生效</span>
+            </el-form-item>
+            <el-form-item label="模型来源">
+              <el-select
+                :model-value="aestheticModelPreset"
+                style="width: 380px"
+                @change="(v: string) => onAestheticModelSelect(v)"
+              >
+                <el-option label="Q-Align：trojblue/distill-q-align-aesthetic-siglip2-base（HF 仓库）" value="trojblue/distill-q-align-aesthetic-siglip2-base" />
+                <el-option label="Aesthetic Shadow V2：Disty0/aesthetic-shadow-v2（HF 仓库，二次元）" value="Disty0/aesthetic-shadow-v2" />
+                <el-option label="自定义（本地目录 / HF 仓库名）" value="__custom__" />
+              </el-select>
+              <span class="hint">HF 仓库模型首次使用自动下载；本地目录需含 config.json</span>
+            </el-form-item>
+            <el-form-item v-if="aestheticModelPreset === '__custom__'" label="自定义模型">
+              <el-input v-model="settings.settings.aesthetic_model" placeholder="HF 仓库名或本地目录路径" />
+            </el-form-item>
+            <el-form-item label="当前生效模型">
+              <span class="mono">{{ inferHealth?.paths?.aesthetic_model || '（服务未启动）' }}</span>
+              <span class="hint">{{ aestheticEffectiveSource }}</span>
             </el-form-item>
             <el-form-item label="推理设备">
               <el-select v-model="settings.settings.aesthetic_device" style="width: 260px">
@@ -727,6 +1040,15 @@ onMounted(async () => {
             </el-form-item>
           </el-form>
         </el-card>
+
+        <!-- 增强1：GPU 手动安装教程对话框 -->
+        <el-dialog v-model="gpuTutorialVisible" title="GPU 推理环境 · 手动安装教程" width="640px" append-to-body>
+          <pre class="gpu-tutorial">{{ gpuTutorialText }}</pre>
+          <template #footer>
+            <el-button @click="gpuTutorialVisible = false">关闭</el-button>
+            <el-button type="primary" plain @click="copyGpuTutorial">复制教程</el-button>
+          </template>
+        </el-dialog>
       </el-tab-pane>
 
       <el-tab-pane label="回收站 / sidecar" name="misc">
@@ -789,13 +1111,35 @@ onMounted(async () => {
             <span class="hint">自动滚动：</span>
             <el-switch v-model="logAutoScroll" size="small" active-text="开" inactive-text="关" />
           </div>
+          <div class="log-toolbar" style="margin-top: 6px; flex-wrap: wrap">
+            <span class="hint">级别筛选（服务端）：</span>
+            <el-checkbox v-model="filterInfo" size="small">info</el-checkbox>
+            <el-checkbox v-model="filterWarn" size="small">warning</el-checkbox>
+            <el-checkbox v-model="filterError" size="small">error</el-checkbox>
+            <el-button size="small" text type="primary" @click="onlyErrors">只看错误</el-button>
+            <el-button size="small" text @click="allLevels">全级别</el-button>
+            <span class="hint" style="margin-left: 8px">显示条数：</span>
+            <el-select v-model="logLimit" size="small" style="width: 140px">
+              <el-option v-for="o in logLimitOptions" :key="o.value" :value="o.value" :label="o.label" />
+            </el-select>
+            <el-input
+              v-model="logSearch"
+              size="small"
+              placeholder="搜索日志内容…"
+              clearable
+              style="width: 180px; margin-left: 8px"
+            />
+            <span class="hint" style="margin-left: 8px">
+              已加载 {{ logLoadedCount }} 条{{ logLoadedCount >= logLimit ? '（已达上限，可增大显示条数）' : '' }}
+            </span>
+          </div>
           <div v-loading="logLoading" ref="logListRef" class="log-list">
-            <el-empty v-if="logs.length === 0 && !logLoading" description="暂无日志" :image-size="50" />
-            <div v-for="l in logs" :key="l.id" class="log-line">
+            <el-empty v-if="filteredLogs.length === 0 && !logLoading" description="暂无日志（或筛选后为空）" :image-size="50" />
+            <div v-for="l in filteredLogs" :key="l.id" class="log-line" :class="{ 'log-line-err': l.level === 'error' }">
               <span class="log-time">{{ new Date(l.created_at * 1000).toLocaleString() }}</span>
               <el-tag :type="logLevelType(l.level)" size="small">{{ l.level }}</el-tag>
               <el-tag size="small" type="info">{{ logCategoryLabel(l.category) }}</el-tag>
-              <span class="log-msg">{{ l.message }}</span>
+              <span class="log-msg">{{ formatLogMsg(l.category, l.message) }}</span>
             </div>
           </div>
         </div>
@@ -808,7 +1152,24 @@ onMounted(async () => {
     </div>
 
     <!-- 管理密钥弹窗（E7）：实时额度 + 编辑 + 状态 + 红垃圾桶删除 -->
-    <el-dialog v-model="manageVisible" title="管理密钥" width="640px">
+    <el-dialog v-model="manageVisible" title="管理密钥" width="680px">
+      <el-alert
+        v-if="rateWindow"
+        class="rate-window-alert"
+        type="info"
+        :closable="false"
+        show-icon
+      >
+        <template #title>
+          IP 池窗口：{{ rateWindow.used }} / {{ rateWindow.limit }} 次（每 {{ rateWindow.window_secs }} 秒）
+          <span v-if="rateWindow.cooling_secs > 0" class="rate-cooling">
+            · 限流冷却中，剩余 {{ rateWindow.cooling_secs }} 秒
+          </span>
+        </template>
+        <div class="hint">
+          免费账号共享同一 IP 池，超出会被 SauceNAO 限流（-2）；调度器已按窗口自动排队，无需手动干预。
+        </div>
+      </el-alert>
       <el-table :data="keys" size="small">
         <el-table-column prop="name" label="名称" width="100" />
         <el-table-column label="等级" width="70">
@@ -867,6 +1228,19 @@ onMounted(async () => {
 .inf-card {
   margin-bottom: 12px;
 }
+.gpu-tutorial {
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--el-fill-color-lighter);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0;
+}
 .infer-status-row {
   display: flex;
   align-items: center;
@@ -907,6 +1281,12 @@ onMounted(async () => {
   padding: 8px;
   background: var(--el-fill-color-lighter);
 }
+.rate-window-alert {
+  margin-bottom: 10px;
+}
+.rate-cooling {
+  color: var(--el-color-warning);
+}
 .log-line {
   display: flex;
   align-items: center;
@@ -914,6 +1294,12 @@ onMounted(async () => {
   padding: 3px 4px;
   font-size: 12px;
   border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.log-line-err {
+  background: var(--el-color-danger-light-9);
+}
+.log-line-err .log-msg {
+  color: var(--el-color-danger);
 }
 .log-time {
   color: var(--el-text-color-secondary);

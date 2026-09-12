@@ -304,6 +304,21 @@ pub struct TagAlias {
     pub alias: String,
 }
 
+/// 待确认替换项（增强3：溯源网络图与本地图严格查重未通过的候选）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplacePendingItem {
+    pub id: i64,
+    pub image_id: i64,
+    pub temp_path: String,
+    pub net_size: i64,
+    pub local_size: i64,
+    pub net_width: Option<i64>,
+    pub net_height: Option<i64>,
+    pub source_url: Option<String>,
+    pub created_at: i64,
+    pub rel_path: String,
+}
+
 /// 单图打标状态。
 #[derive(Debug, Clone, Serialize)]
 pub struct TaggingState {

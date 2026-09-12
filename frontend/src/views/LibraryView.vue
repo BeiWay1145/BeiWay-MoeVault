@@ -11,6 +11,7 @@ import { reportLog } from '@/api/log'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 import SearchFilter from '@/components/SearchFilter.vue'
+import ExportDialog from '@/components/ExportDialog.vue'
 
 // keep-alive 缓存名（与路由 name 一致）
 defineOptions({ name: 'library' })
@@ -218,7 +219,7 @@ async function onBatchAesthetic() {
   }
 }
 
-/** 批量 SauceNAO 溯源（自动跳过 AI 生成图）。 */
+/** 批量 SauceNAO 溯源（自动跳过 AI 生成图；可选智能替换）。 */
 async function onBatchSauce() {
   const ids = [...library.selected]
   if (ids.length === 0) return
@@ -228,7 +229,7 @@ async function onBatchSauce() {
   }).length
   if (skip > 0) ElMessage.info(`其中 ${skip} 张 AI 生成图将自动跳过溯源`)
   try {
-    await taskStore.enqueueSauce(ids, forceSauce.value)
+    await taskStore.enqueueSauce(ids, forceSauce.value, autoReplaceSauce.value)
     library.clearSelect()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -237,6 +238,8 @@ async function onBatchSauce() {
 
 /** 批量溯源是否强制重试不可溯源图。 */
 const forceSauce = ref(false)
+/** 增强3：溯源后自动替换更清晰的原图（大小比对 + 严格查重）。 */
+const autoReplaceSauce = ref(false)
 
 // ---- 增强3：下拉框多选批量执行（与主目录一致）+ 全选 + 选中集随筛选自动收缩 ----
 const batchActions = ref<string[]>([])
@@ -290,11 +293,16 @@ watch(
   },
 )
 
-/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学。 */
+/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学；导出走独立弹窗。 */
 async function onExecuteBatch() {
   const ids = [...library.selected]
   if (ids.length === 0) {
     ElMessage.warning('没有可执行的图片（请先多选或全选）')
+    return
+  }
+  // 导出：打开导出弹窗（不提交任务）
+  if (batchActions.value.includes('export')) {
+    openExportDialog(ids)
     return
   }
   const order = ['ai-detect', 'sauce', 'tag', 'aesthetic']
@@ -317,6 +325,31 @@ async function onExecuteBatch() {
   }
   if (batchActions.value.length > 0) ElMessage.success('批量任务已全部提交')
   batchActions.value = []
+}
+
+// ---- 功能增强1：批量导出（共用 ExportDialog 组件）----
+const exportDialogVisible = ref(false)
+const exportIds = ref<number[]>([])
+const exportImages = ref<Array<{ id: number; name: string; thumb: string }>>([])
+
+/** 打开导出弹窗：从选中集取图片信息（缩略图/名称）。 */
+function openExportDialog(ids: number[]) {
+  exportIds.value = ids
+  const cur = new Set(ids)
+  exportImages.value = library.images.filter((i) => cur.has(i.id)).map((i) => ({
+    id: i.id,
+    name: i.name,
+    thumb: i.thumbRel ? `/thumbs/${i.thumbRel.replace(/\\/g, '/')}` : '',
+  }))
+  exportDialogVisible.value = true
+}
+
+/** 导出完成回调：回收则清空选择并刷新。 */
+function onExportDone(info: { count: number; recycled: number }) {
+  if (info.recycled > 0) {
+    library.clearSelect()
+    fetchPage().catch(() => {})
+  }
 }
 
 /** 执行按钮两击确认：第一下变红显示「确认执行」，再点执行；Shift 直接执行。 */
@@ -541,13 +574,15 @@ watch(
       <!-- 增强3：下拉框多选批量行为 + 两击确认执行（与主目录一致） -->
       <template v-if="selectedCount > 0 || batchActions.length > 0">
         <el-button type="danger" plain @click="onRecycleSelected">删除所选 ({{ selectedCount }})</el-button>
-        <el-select v-model="batchActions" multiple collapse-tags placeholder="选择批量行为" style="width: 220px" size="default">
-          <el-option label="美学评分" value="aesthetic" />
-          <el-option label="打标" value="tag" />
-          <el-option label="溯源" value="sauce" />
-          <el-option label="AI 检测" value="ai-detect" />
+        <el-select v-model="batchActions" multiple collapse-tags placeholder="选择批量行为" style="width: 220px" size="default" class="batch-action-select">
+          <el-option label="美学评分" value="aesthetic" :disabled="batchActions.includes('export')" />
+          <el-option label="打标" value="tag" :disabled="batchActions.includes('export')" />
+          <el-option label="溯源" value="sauce" :disabled="batchActions.includes('export')" />
+          <el-option label="AI 检测" value="ai-detect" :disabled="batchActions.includes('export')" />
+          <el-option label="导出" value="export" :disabled="batchActions.length > 0 && !batchActions.includes('export')" />
         </el-select>
         <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
+        <el-checkbox v-if="batchActions.includes('sauce')" v-model="autoReplaceSauce" size="small">原图替换</el-checkbox>
         <el-button :type="execArmed ? 'danger' : 'primary'" plain @click="onExecClick" :title="'Shift+点击直接执行'">
           {{ execArmed ? '确认执行' : '执行' }}
         </el-button>
@@ -584,6 +619,14 @@ watch(
 
     <!-- 大图预览 -->
     <ImagePreview v-model="previewVisible" :image="previewImage" />
+
+    <!-- 功能增强1：批量导出二级界面（共用组件） -->
+    <ExportDialog
+      v-model="exportDialogVisible"
+      :ids="exportIds"
+      :images="exportImages"
+      @exported="onExportDone"
+    />
   </div>
 </template>
 

@@ -46,6 +46,7 @@ function handleMessage(raw: MessageEvent) {
       done?: number
       failed?: number
       duplicate?: number
+      duplicates_recycled?: number
       error?: string
     }
     const name = msg.type === 'batch.done' ? 'moevault:import-done' : 'moevault:import-failed'

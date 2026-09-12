@@ -27,6 +27,24 @@ pub struct LogQuery {
     pub limit: Option<i64>,
     /// 游标：返回 id 小于此值的更早日志。
     pub before_id: Option<i64>,
+    /// 级别过滤（逗号分隔，如 "warn,error"）；空 = 全部。
+    pub levels: Option<String>,
+    /// 分类过滤（逗号分隔，如 "sauce,task"）；空 = 全部。
+    pub categories: Option<String>,
+}
+
+/// 逗号分隔参数 → 去空白、去重的列表。
+fn split_csv(raw: &Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(s) = raw {
+        for part in s.split(',') {
+            let v = part.trim();
+            if !v.is_empty() && !out.iter().any(|x| x == v) {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
 }
 
 async fn list_logs(
@@ -34,11 +52,16 @@ async fn list_logs(
     Query(q): Query<LogQuery>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let db = state.db.clone();
-    let limit = q.limit.unwrap_or(200).clamp(1, 500);
-    let logs = tokio::task::spawn_blocking(move || db.list_logs(limit, q.before_id))
-        .await
-        .map_err(|e| error_response(moevault_core::ErrorKind::Internal, format!("任务失败: {e}")))?
-        .map_err(db_error_response)?;
+    // 上限 5000：BUG 追踪器可配置显示条数，且过滤在 SQL 层完成
+    let limit = q.limit.unwrap_or(200).clamp(1, 5000);
+    let levels = split_csv(&q.levels);
+    let categories = split_csv(&q.categories);
+    let logs = tokio::task::spawn_blocking(move || {
+        db.list_logs_filtered(limit, q.before_id, &levels, &categories)
+    })
+    .await
+    .map_err(|e| error_response(moevault_core::ErrorKind::Internal, format!("任务失败: {e}")))?
+    .map_err(db_error_response)?;
     let items: Vec<Value> = logs
         .iter()
         .map(|l| {
@@ -99,10 +122,26 @@ async fn export_logs(
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let db = state.db.clone();
     let data_dir = state.data_dir.clone();
-    let logs = tokio::task::spawn_blocking(move || db.list_logs(100000, None))
-        .await
-        .map_err(|e| error_response(moevault_core::ErrorKind::Internal, format!("任务失败: {e}")))?
-        .map_err(db_error_response)?;
+    // 分页拉取全量（单页上限 5000，最多 4 页 = 20000 条，与 DB 保留量一致）
+    let logs = tokio::task::spawn_blocking(move || {
+        let mut all = Vec::new();
+        let mut before: Option<i64> = None;
+        for _ in 0..4 {
+            let page = db.list_logs_filtered(5000, before, &[], &[])?;
+            if page.is_empty() {
+                break;
+            }
+            before = page.last().map(|l| l.id);
+            all.extend(page);
+            if all.len() >= 20000 {
+                break;
+            }
+        }
+        Ok::<_, moevault_db::DbError>(all)
+    })
+    .await
+    .map_err(|e| error_response(moevault_core::ErrorKind::Internal, format!("任务失败: {e}")))?
+    .map_err(db_error_response)?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

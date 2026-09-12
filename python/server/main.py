@@ -9,6 +9,15 @@ import threading
 import time
 from pathlib import Path
 
+# torch 在 uvicorn 多线程 worker 里首次加载模型可能死锁（OpenMP/内部线程池竞争）。
+# 强制单线程推理可避免；打标用 onnxruntime 不受影响。
+try:
+    import torch
+
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -17,6 +26,20 @@ from .models.aesthetic_model import AestheticModel, time_ms
 from .models.tagger_model import TaggerModel
 
 app = FastAPI(title="Image Manager Inference Server", version="0.1.0")
+
+
+@app.middleware("http")
+async def close_connection(request, call_next):
+    """修复：reqwest/keep-alive 客户端调用 /infer/aesthetic 时 uvicorn 挂起（模型加载线程与
+    keep-alive 连接交互死锁）。强制响应 Connection: close，避免连接复用触发问题。"""
+    import time as _t
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        raise
+    response.headers["Connection"] = "close"
+    return response
 
 # 全局单例 + 串行锁（GPU 显存安全）
 _tagger = TaggerModel()
@@ -72,31 +95,71 @@ def health():
     }
 
 
+def _friendly_cpu_name() -> str:
+    """Windows 下从注册表读 CPU 友好名（如 Intel(R) Core(TM) Ultra 9 285H）。"""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        ) as k:
+            name, _ = winreg.QueryValueEx(k, "ProcessorNameString")
+            return str(name).strip()
+    except Exception:
+        try:
+            import platform
+
+            return platform.processor() or "CPU"
+        except Exception:
+            return "CPU"
+
+
 @app.get("/devices")
 def devices():
-    """列出可用的推理设备（供设置页下拉选择）。"""
+    """列出可用的推理设备（供设置页下拉选择；增强1：GPU 编号+全名、CPU 友好名）。"""
     result = []
-    # 打标：onnxruntime 可用 providers
-    try:
-        import onnxruntime as ort
-        for p in ort.get_available_providers():
-            if "CUDA" in p:
-                result.append({"id": "cuda", "name": f"GPU ({p})", "kind": "tagger"})
-            elif "CPU" in p:
-                result.append({"id": "cpu", "name": "CPU", "kind": "tagger"})
-    except Exception:
-        pass
-    # 美学：torch cuda
+    # 物理 GPU 列表（torch 为准；打标 onnxruntime 与美学 torch 共用同一批 GPU）
+    gpus: list[tuple[int, str]] = []
+    torch_cuda = False
     try:
         import torch
-        if torch.cuda.is_available():
+
+        torch_cuda = torch.cuda.is_available()
+        if torch_cuda:
             for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                result.append({"id": f"cuda:{i}", "name": f"GPU ({name})", "kind": "aesthetic"})
-        else:
-            result.append({"id": "cpu", "name": "CPU", "kind": "aesthetic"})
+                gpus.append((i, torch.cuda.get_device_name(i)))
     except Exception:
         pass
+
+    cpu_name = _friendly_cpu_name()
+
+    # 打标：onnxruntime 可用 providers（CUDA provider 存在即 GPU 可用）
+    ort_cuda = False
+    try:
+        import onnxruntime as ort
+
+        for p in ort.get_available_providers():
+            if "CUDA" in p:
+                ort_cuda = True
+    except Exception:
+        pass
+
+    # 打标设备：GPU 存在（onnxruntime CUDA 或 torch CUDA）→ 逐卡列出；否则 CPU
+    if ort_cuda or torch_cuda:
+        if gpus:
+            for i, name in gpus:
+                result.append({"id": f"cuda:{i}", "name": f"CUDA GPU{i + 1}（{name}）", "kind": "tagger"})
+        else:
+            result.append({"id": "cuda", "name": "CUDA GPU", "kind": "tagger"})
+    result.append({"id": "cpu", "name": f"CPU（{cpu_name}）", "kind": "tagger"})
+
+    # 美学设备：torch cuda 逐卡；否则 CPU
+    if torch_cuda:
+        for i, name in gpus:
+            result.append({"id": f"cuda:{i}", "name": f"CUDA GPU{i + 1}（{name}）", "kind": "aesthetic"})
+    else:
+        result.append({"id": "cpu", "name": f"CPU（{cpu_name}）", "kind": "aesthetic"})
     return {"devices": result}
 
 
@@ -125,6 +188,17 @@ def tagger_config(req: TaggerConfigRequest):
         }
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"模型切换失败: {e}") from e
+
+
+class AestheticConfigRequest(BaseModel):
+    kind: str  # qalign / anime（议题4：二次元美学模型切换）
+
+
+@app.post("/infer/aesthetic/config")
+def aesthetic_config(req: AestheticConfigRequest):
+    """切换美学模型种类（qalign/anime，下次评分生效）。"""
+    _aesthetic.set_kind(req.kind)
+    return {"ok": True, "kind": _aesthetic.kind}
 
 
 @app.post("/infer/tags")

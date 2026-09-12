@@ -16,6 +16,12 @@ pub const DAILY_QUOTA_WARN: i64 = 10;
 pub const COOLDOWN_GRACE_SECS: u64 = 2;
 /// 默认 30s 窗口请求上限（免费账号经验值，由响应头校准）。
 pub const DEFAULT_SHORT_LIMIT: u32 = 6;
+/// 全局窗口请求上限：SauceNAO 免费账号共享 IP 池 = 4 次 / 30 秒（跨 key 生效）。
+pub const DEFAULT_GLOBAL_LIMIT: usize = 4;
+/// 全局窗口长度（秒）。
+pub const GLOBAL_WINDOW_SECS: u64 = 30;
+/// 普通失败（网络抖动等）的短冷却：避免烧掉整个窗口，也避免立刻重试。
+pub const FAILURE_COOLDOWN_SECS: u64 = 3;
 
 /// 单个 key 的状态。
 /// 时间字段用 epoch 秒存储（可序列化），运行时转 Instant。
@@ -124,6 +130,12 @@ struct PoolInner {
     cursor: usize,
     /// 持久化路径（None = 不持久化）。
     persist: Option<std::path::PathBuf>,
+    /// 全局请求时间戳窗口（epoch 秒）——免费账号共享 IP 池，必须跨 key 全局限流。
+    recent: std::collections::VecDeque<u64>,
+    /// 全局限流上限（默认 4 次 / 30 秒）。
+    global_limit: usize,
+    /// 全局冷却到期时刻：触发 SauceNAO 限流后整个池一起等待。
+    global_cooldown_until: u64,
 }
 
 /// 持久化快照格式（磁盘 JSON）。
@@ -146,7 +158,14 @@ impl ApiKeyPool {
             })
             .collect();
         Self {
-            inner: std::sync::Arc::new(Mutex::new(PoolInner { keys, cursor: 0, persist: None })),
+            inner: std::sync::Arc::new(Mutex::new(PoolInner {
+                keys,
+                cursor: 0,
+                persist: None,
+                recent: std::collections::VecDeque::new(),
+                global_limit: DEFAULT_GLOBAL_LIMIT,
+                global_cooldown_until: 0,
+            })),
         }
     }
 
@@ -163,7 +182,14 @@ impl ApiKeyPool {
             })
             .collect();
         Self {
-            inner: std::sync::Arc::new(Mutex::new(PoolInner { keys, cursor: 0, persist: None })),
+            inner: std::sync::Arc::new(Mutex::new(PoolInner {
+                keys,
+                cursor: 0,
+                persist: None,
+                recent: std::collections::VecDeque::new(),
+                global_limit: DEFAULT_GLOBAL_LIMIT,
+                global_cooldown_until: 0,
+            })),
         }
     }
 
@@ -199,6 +225,9 @@ impl ApiKeyPool {
                 keys: snap.keys,
                 cursor: snap.cursor,
                 persist: Some(path.to_path_buf()),
+                recent: std::collections::VecDeque::new(),
+                global_limit: DEFAULT_GLOBAL_LIMIT,
+                global_cooldown_until: 0,
             })),
         })
     }
@@ -240,11 +269,13 @@ impl ApiKeyPool {
         self.inner.lock().await.keys.len()
     }
 
-    /// 等待并返回一个可用 key（阻塞直到有 key 冷却结束）。
+    /// 等待并返回一个可用 key（阻塞直到有 key 冷却结束且全局窗口有余量）。
     ///
-    /// 轮转策略：从游标开始扫描，找第一个 available 的 key；若全不可用，
-    /// 等待最短冷却 + 容错延时后重试。
-    /// 返回 (key 状态克隆, 释放守卫所需的 index)。
+    /// 三层约束（缺一不可，否则免费账号必然触碰 SauceNAO 限流）：
+    /// 1. **全局窗口**：跨 key 共享 IP 池，最多 global_limit 次 / GLOBAL_WINDOW_SECS 秒
+    /// 2. **全局冷却**：触发限流后整个池一起等待 retry_in
+    /// 3. **单 key 冷却/日配额**：轮转扫描第一个 available 的 key
+    /// 返回 (api_key, key index)。
     pub async fn acquire(&self) -> (String, usize) {
         loop {
             let mut inner = self.inner.lock().await;
@@ -263,7 +294,37 @@ impl ApiKeyPool {
                 continue;
             }
 
-            // 从游标找可用 key（轮转）
+            let now = now_secs();
+
+            // 1) 全局冷却（SauceNAO 限流后整池等待）
+            if now < inner.global_cooldown_until {
+                let wait = inner.global_cooldown_until - now + COOLDOWN_GRACE_SECS;
+                drop(inner);
+                tracing::debug!(wait_secs = wait, "溯源：全局限流冷却中，等待后重试");
+                tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
+                continue;
+            }
+
+            // 2) 清理过期窗口记录，判断窗口是否已满
+            while let Some(front) = inner.recent.front().copied() {
+                if now.saturating_sub(front) >= GLOBAL_WINDOW_SECS {
+                    inner.recent.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if inner.recent.len() >= inner.global_limit {
+                let oldest = inner.recent.front().copied().unwrap_or(now);
+                let wait = GLOBAL_WINDOW_SECS
+                    .saturating_sub(now.saturating_sub(oldest))
+                    + COOLDOWN_GRACE_SECS;
+                drop(inner);
+                tracing::debug!(wait_secs = wait, "溯源：已达 IP 池窗口上限，等待窗口释放");
+                tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
+                continue;
+            }
+
+            // 3) 从游标找可用 key（轮转）
             let n = inner.keys.len();
             let mut found: Option<usize> = None;
             for offset in 0..n {
@@ -277,6 +338,7 @@ impl ApiKeyPool {
             if let Some(idx) = found {
                 inner.cursor = (idx + 1) % n; // 下次从下一个开始轮转
                 inner.keys[idx].mark_used();
+                inner.recent.push_back(now); // 占用一个全局窗口名额
                 let key = inner.keys[idx].api_key.clone();
                 drop(inner);
                 self.save().await;
@@ -333,16 +395,51 @@ impl ApiKeyPool {
         self.save().await;
     }
 
-    /// 请求失败时标记：短窗口剩余可能已耗光，设置保守冷却。
+    /// 请求失败（非限流，如网络抖动/临时故障）：短冷却避免立刻重试，但不烧掉整个窗口。
     pub async fn on_failure(&self, idx: usize) {
         let mut inner = self.inner.lock().await;
         if let Some(k) = inner.keys.get_mut(idx) {
-            // 保守：剩余清零 + 长冷却（30s 窗口重置）
-            k.short_remaining = 0;
-            k.set_cooldown(30);
+            k.set_cooldown(FAILURE_COOLDOWN_SECS);
         }
         drop(inner);
         self.save().await;
+    }
+
+    /// SauceNAO 返回限流（-2 / 3）：整个 IP 池一起冷却，并清空窗口计数（重新计时）。
+    pub async fn note_rate_limited(&self, idx: usize, seconds: u64) {
+        let secs = seconds.clamp(1, 600);
+        let mut inner = self.inner.lock().await;
+        let until = now_secs() + secs;
+        if until > inner.global_cooldown_until {
+            inner.global_cooldown_until = until;
+        }
+        if let Some(k) = inner.keys.get_mut(idx) {
+            k.short_remaining = 0;
+            k.set_cooldown(secs);
+        }
+        inner.recent.clear();
+        drop(inner);
+        tracing::warn!(retry_secs = secs, "SauceNAO 限流：全局限流冷却已生效");
+        self.save().await;
+    }
+
+    /// 设置全局窗口上限（付费账号或测试可放宽）。
+    pub async fn set_global_limit(&self, limit: usize) {
+        let mut inner = self.inner.lock().await;
+        inner.global_limit = limit.max(1);
+    }
+
+    /// 全局窗口状态：(本窗口已用次数, 上限, 剩余冷却秒数)。
+    pub async fn global_window(&self) -> (usize, usize, u64) {
+        let inner = self.inner.lock().await;
+        let now = now_secs();
+        let used = inner
+            .recent
+            .iter()
+            .filter(|t| now.saturating_sub(**t) < GLOBAL_WINDOW_SECS)
+            .count();
+        let cooling = inner.global_cooldown_until.saturating_sub(now);
+        (used, inner.global_limit, cooling)
     }
 
     /// 全部 key 状态快照（供调试/UI）。
@@ -478,12 +575,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failure_sets_conservative_cooldown() {
+    async fn failure_sets_short_cooldown() {
         let pool = ApiKeyPool::new(vec!["k1".into()]);
         pool.on_failure(0).await;
         let snap = pool.snapshot().await;
-        assert_eq!(snap[0].short_remaining, 0);
+        // 普通失败只做短冷却（不烧掉整个 30s 窗口），但当下确实不可用
         assert!(!snap[0].available());
+        assert!(snap[0].cooldown_secs() <= FAILURE_COOLDOWN_SECS);
+    }
+
+    /// 全局窗口：达到上限后 acquire 不应立刻返回（跨 key 共享 IP 池限流）。
+    #[tokio::test]
+    async fn global_window_blocks_after_limit() {
+        let pool = ApiKeyPool::new(vec!["k1".into(), "k2".into(), "k3".into(), "k4".into(), "k5".into()]);
+        pool.set_global_limit(2).await;
+        let _ = pool.acquire().await;
+        let _ = pool.acquire().await;
+        let (used, limit, cooling) = pool.global_window().await;
+        assert_eq!(used, 2);
+        assert_eq!(limit, 2);
+        assert_eq!(cooling, 0);
+        // 第 3 次 acquire 会等到窗口释放：用超时验证它确实在等待
+        let third = tokio::time::timeout(std::time::Duration::from_millis(300), pool.acquire()).await;
+        assert!(third.is_err(), "窗口已满时应阻塞等待，而不是立刻放行");
+    }
+
+    /// 限流：整池进入全局冷却，窗口计数清零。
+    #[tokio::test]
+    async fn rate_limit_sets_global_cooldown() {
+        let pool = ApiKeyPool::new(vec!["k1".into(), "k2".into()]);
+        let _ = pool.acquire().await;
+        pool.note_rate_limited(0, 30).await;
+        let (used, _limit, cooling) = pool.global_window().await;
+        assert_eq!(used, 0, "限流后窗口计数应清零重新计时");
+        assert!(cooling > 0, "应进入全局冷却");
+        let snap = pool.snapshot().await;
+        assert!(!snap[0].available(), "被限流的 key 应冷却");
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(300), pool.acquire()).await;
+        assert!(blocked.is_err(), "全局冷却期间不应放行任何请求");
     }
 
     /// 额外需求：验证多线程/多并发下按配额与冷却灵活调度（不重复分配、冷却生效）。
@@ -491,6 +620,7 @@ mod tests {
     async fn concurrent_acquire_respects_cooldown_and_quota() {
         // 3 个 key：k1 可用、k2 冷却 3600s、k3 当日停用
         let pool = ApiKeyPool::new(vec!["k1".into(), "k2".into(), "k3".into()]);
+        pool.set_global_limit(100).await; // 本测试只验证 key 维度调度，放开全局窗口
         pool.start_cooldown(1, 3600).await;
         pool.update(2, Some(3), Some(5)).await; // k3 long=5 <10 → daily_paused
         let snap = pool.snapshot().await;
@@ -519,6 +649,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_acquire_rotates_all_available() {
         let pool = ApiKeyPool::new(vec!["k1".into(), "k2".into(), "k3".into()]);
+        pool.set_global_limit(100).await; // 放开全局窗口，专注验证轮转
         let mut handles = Vec::new();
         for _ in 0..6 {
             let pool = pool.clone();

@@ -7,6 +7,7 @@ import { useLibraryStore, type ImageItem } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
 import { get, post } from '@/api/client'
 import ImageCard from '@/components/ImageCard.vue'
+import ExportDialog from '@/components/ExportDialog.vue'
 
 // keep-alive 缓存名（与路由 name 一致，保证跨板块状态保存）
 defineOptions({ name: 'imports' })
@@ -45,6 +46,8 @@ const dirLoading = ref<Record<string, boolean>>({})
 const selected = ref<Set<number>>(new Set())
 const selectedCount = computed(() => selected.value.size)
 const forceSauce = ref(false)
+/** 增强3：溯源后自动替换更清晰的原图（大小比对 + 严格查重）。 */
+const autoReplaceSauce = ref(false)
 
 /** 组唯一键：date + source_dir。 */
 function dirKey(d: DayGroup, g: DirGroup) {
@@ -244,7 +247,7 @@ async function onBatchSauce(ids?: number[]) {
   const list = ids ?? [...selected.value]
   if (list.length === 0) return
   try {
-    await taskStore.enqueueSauce(list, forceSauce.value)
+    await taskStore.enqueueSauce(list, forceSauce.value, autoReplaceSauce.value)
     if (!ids) selected.value = new Set()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -397,11 +400,16 @@ function getBatchIds(): number[] {
   return [...new Set(all.map((i) => i.id))]
 }
 
-/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学。 */
+/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学；导出走独立弹窗。 */
 async function onExecuteBatch() {
   const ids = getBatchIds()
   if (ids.length === 0) {
     ElMessage.warning('没有可执行的图片（请先多选或展开加载）')
+    return
+  }
+  // 导出：打开导出弹窗
+  if (batchActions.value.includes('export')) {
+    openExportDialog(ids)
     return
   }
   const order = ['ai-detect', 'sauce', 'tag', 'aesthetic']
@@ -424,6 +432,31 @@ async function onExecuteBatch() {
   }
   if (batchActions.value.length > 0) ElMessage.success('批量任务已全部提交')
   batchActions.value = []
+}
+
+// ---- 功能增强1：主目录批量导出（共用 ExportDialog）----
+const exportDialogVisible = ref(false)
+const exportIds = ref<number[]>([])
+const exportImages = ref<Array<{ id: number; name: string; thumb: string }>>([])
+
+function openExportDialog(ids: number[]) {
+  exportIds.value = ids
+  const cur = new Set(ids)
+  const all = Object.values(dirImages.value).flat()
+  exportImages.value = all.filter((i) => cur.has(i.id)).map((i) => ({
+    id: i.id,
+    name: i.name,
+    thumb: i.thumbRel ? `/thumbs/${i.thumbRel.replace(/\\/g, '/')}` : '',
+  }))
+  exportDialogVisible.value = true
+}
+
+function onExportDone(info: { count: number; recycled: number }) {
+  if (info.recycled > 0) {
+    selected.value = new Set()
+    // 视图在下次激活时自动刷新目录
+    ElMessage.success(`已回收 ${info.recycled} 张，目录将在下次打开时刷新`)
+  }
 }
 
 /** 执行按钮两击确认：第一下变红显示「确认执行」，再点执行；Shift 直接执行。 */
@@ -532,13 +565,16 @@ async function onSelectAll() {
         placeholder="选择批量行为"
         style="width: 220px"
         size="default"
+        class="batch-action-select"
       >
-        <el-option label="美学评分" value="aesthetic" />
-        <el-option label="打标" value="tag" />
-        <el-option label="溯源" value="sauce" />
-        <el-option label="AI 检测" value="ai-detect" />
+        <el-option label="美学评分" value="aesthetic" :disabled="batchActions.includes('export')" />
+        <el-option label="打标" value="tag" :disabled="batchActions.includes('export')" />
+        <el-option label="溯源" value="sauce" :disabled="batchActions.includes('export')" />
+        <el-option label="AI 检测" value="ai-detect" :disabled="batchActions.includes('export')" />
+        <el-option label="导出" value="export" :disabled="batchActions.length > 0 && !batchActions.includes('export')" />
       </el-select>
       <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制溯源</el-checkbox>
+      <el-checkbox v-if="batchActions.includes('sauce')" v-model="autoReplaceSauce" size="small">原图替换</el-checkbox>
       <el-button
         :type="execArmed ? 'danger' : 'primary'"
         plain
@@ -607,6 +643,14 @@ async function onSelectAll() {
       </div>
     </div>
   </div>
+
+  <!-- 功能增强1：主目录批量导出（共用组件） -->
+  <ExportDialog
+    v-model="exportDialogVisible"
+    :ids="exportIds"
+    :images="exportImages"
+    @exported="onExportDone"
+  />
 </template>
 
 <style scoped>

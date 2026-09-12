@@ -75,6 +75,25 @@ export async function inferInstallDeps(): Promise<string> {
   return (await invoke('infer_install_deps')) as string
 }
 
+/** 增强1：请求桌面壳安装 GPU 推理环境（CUDA torch，后台进行）。 */
+export async function inferInstallGpu(): Promise<{ started: boolean; message: string }> {
+  const invoke = tauriInvoke()
+  if (!invoke) throw new Error('仅桌面版支持安装 GPU 推理环境')
+  return (await invoke('infer_install_gpu')) as { started: boolean; message: string }
+}
+
+/** 增强1：GPU 环境状态（安装中 + CUDA 是否就绪）。 */
+export interface GpuStatus {
+  installing: boolean
+  cuda_ready: boolean
+}
+
+export async function inferGpuStatus(): Promise<GpuStatus | null> {
+  const invoke = tauriInvoke()
+  if (!invoke) return null
+  return (await invoke('infer_gpu_status')) as GpuStatus
+}
+
 /** 桌面壳推理服务命令状态（依赖缺失等启动前诊断信息）。 */
 export interface InferShellStatus {
   running: boolean

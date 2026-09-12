@@ -20,3 +20,5 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 md-5 = { workspace = true }
 image = { workspace = true }
+zip = { workspace = true }
+flate2 = { workspace = true }

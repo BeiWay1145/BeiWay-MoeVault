@@ -42,7 +42,9 @@ pub fn run() {
       infer_start,
       infer_stop,
       infer_status,
-      infer_install_deps
+      infer_install_deps,
+      infer_install_gpu,
+      infer_gpu_status
     ])
     .on_window_event(|window, event| {
       // 关闭窗口：根据后端设置 close_to_tray 决定 最小化到托盘 or 正常退出
@@ -404,6 +406,69 @@ fn infer_healthy() -> bool {
   }
 }
 
+/// 8001 端口是否被占用（任何进程）。
+fn infer_port_occupied() -> bool {
+  infer_port_owner_pid().is_some()
+}
+
+/// 8001 端口占用进程 PID。
+fn infer_port_owner_pid() -> Option<u32> {
+  #[cfg(target_os = "windows")]
+  {
+    let out = std::process::Command::new("netstat")
+      .args(["-ano"])
+      .output()
+      .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+      // TCP    127.0.0.1:8001    0.0.0.0:0    LISTENING    12345
+      let parts: Vec<&str> = line.split_whitespace().collect();
+      if parts.len() >= 5 && parts[0] == "TCP" && parts[1].ends_with(&format!(":{INFER_PORT}")) && parts[3] == "LISTENING" {
+        return parts[4].parse::<u32>().ok();
+      }
+    }
+  }
+  None
+}
+
+/// 8001 占用进程是否使用系统 Python（非 venv）。
+fn infer_port_uses_system_python() -> bool {
+  let Some(pid) = infer_port_owner_pid() else {
+    return false;
+  };
+  // 用 PowerShell 拿进程路径（Rust 无 win32 API 依赖，走 powershell 查询）
+  let script = format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path");
+  let out = std::process::Command::new("powershell")
+    .args(["-NoProfile", "-Command", &script])
+    .output()
+    .ok();
+  if let Some(o) = out {
+    let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if path.is_empty() {
+      return false; // 拿不到路径，不冒险杀
+    }
+    // venv python 路径含 .venv；系统 python 在 AppData\Local\Programs\Python 或 C:\Python*
+    let lower = path.to_lowercase();
+    if lower.contains(".venv") || lower.contains("venv") {
+      return false;
+    }
+    if lower.contains("python") {
+      return true;
+    }
+  }
+  false
+}
+
+/// 杀掉 8001 占用进程。
+fn kill_infer_port_owner() {
+  if let Some(pid) = infer_port_owner_pid() {
+    let _ = std::process::Command::new("taskkill")
+      .args(["/PID", &pid.to_string(), "/F"])
+      .output();
+    eprintln!("[MoeVault] 已终止非 venv 推理实例 (PID {pid})");
+  }
+}
+
 /// 定位推理服务 python 目录（server 包所在目录）。
 /// - debug：workspace 根 python/
 /// - release：%LOCALAPPDATA%\BeiWay-MoeVault\python（可写）；每次启动从安装目录资源同步
@@ -514,7 +579,7 @@ fn deps_missing_in(exe: &str, prefix: &[String]) -> Vec<String> {
   cmd.args(prefix);
   cmd.args([
     "-c",
-    "import importlib.util as u; missing=[m for m in ['fastapi','uvicorn','transformers'] if u.find_spec(m) is None]; print(' '.join(missing))",
+    "import importlib.util as u; missing=[m for m in ['fastapi','uvicorn','transformers','onnxruntime','PIL','numpy'] if u.find_spec(m) is None]; print(' '.join(missing))",
   ]);
   let out = match cmd.output() {
     Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
@@ -538,8 +603,8 @@ fn infer_deps_missing() -> Vec<String> {
 }
 
 /// 确保 runtime python/.venv 存在且推理依赖齐全；缺什么装什么（幂等）。
-/// - venv 不存在 → 用系统 Python（py -3 优先）创建，--system-site-packages 复用系统已有的
-///   torch/onnxruntime/PIL/numpy（只补 fastapi/uvicorn/transformers，下载量小）
+/// - venv 不存在 → 用系统 Python（py -3 优先）创建 **纯净 venv**（不带 --system-site-packages）：
+///   避免系统 site-packages 的旧 uvicorn/torch 干扰（GPU 部署后服务必须跑在 venv 环境）
 /// - venv 存在但缺依赖 → 直接往 venv 里 pip 安装
 /// pip 安装按 INFER_PIP_INDEXES 依次尝试（清华镜像优先）；过程写入 <runtime>/infer.log。
 /// 返回 venv 的 python.exe 路径。
@@ -568,9 +633,9 @@ fn ensure_infer_venv() -> Result<PathBuf, String> {
     return Ok(venv_exe);
   }
 
-  // 2) venv 不存在 → 用系统 Python 创建（py -3 优先，--system-site-packages 继承 torch 等）
+  // 2) venv 不存在 → 用系统 Python 创建（py -3 优先；纯净 venv，不继承系统 site-packages）
   if !Path::new(&venv_exe).is_file() {
-    note("未找到 python/.venv，正在创建（--system-site-packages 复用系统 torch/onnxruntime）…");
+    note("未找到 python/.venv，正在创建纯净虚拟环境（依赖将完整装入 venv）…");
     // 基底解释器：候选列表中第一个不在 python 目录内的条目（跳过 venv 自身），兜底 py -3
     let base = infer_python_candidates()
       .into_iter()
@@ -578,12 +643,8 @@ fn ensure_infer_venv() -> Result<PathBuf, String> {
       .unwrap_or_else(|| ("py".into(), vec!["-3".into()]));
     let mut cmd = Command::new(&base.0);
     cmd.args(&base.1);
-    cmd.args([
-      "-m",
-      "venv",
-      "--system-site-packages",
-      &py_dir.join(".venv").to_string_lossy(),
-    ]);
+    // 纯净 venv：不继承系统 site-packages（避免旧 uvicorn/torch 干扰推理环境）
+    cmd.args(["-m", "venv", &py_dir.join(".venv").to_string_lossy()]);
     #[cfg(target_os = "windows")]
     {
       use std::os::windows::process::CommandExt;
@@ -622,7 +683,14 @@ fn ensure_infer_venv() -> Result<PathBuf, String> {
         "-i",
         index,
       ]);
-      cmd.args(["fastapi", "uvicorn", "transformers"]);
+      cmd.args([
+        "fastapi",
+        "uvicorn",
+        "transformers",
+        "onnxruntime",
+        "pillow",
+        "numpy",
+      ]);
       #[cfg(target_os = "windows")]
       {
         use std::os::windows::process::CommandExt;
@@ -670,8 +738,23 @@ fn start_infer() -> std::io::Result<Option<Child>> {
     .lock()
     .unwrap();
   if infer_healthy() {
-    eprintln!("[MoeVault] 推理服务已在运行（外部实例），跳过启动");
-    return Ok(None);
+    // 已有一个实例在 8001：确认它是否用 venv python（GPU torch / 正确依赖）。
+    // 若是系统 Python 的旧实例（如用户手动部署 GPU 前残留），杀掉后用 venv 重启，
+    // 避免"GPU torch 装好但服务仍跑 CPU 旧实例"的失效问题。
+    if infer_port_uses_system_python() {
+      eprintln!("[MoeVault] 8001 被系统 Python 的推理实例占用（非 venv），杀掉并用 venv 重启");
+      kill_infer_port_owner();
+      // 等端口释放
+      for _ in 0..50 {
+        if !infer_port_occupied() {
+          break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+      }
+    } else {
+      eprintln!("[MoeVault] 推理服务已在运行（venv 实例），跳过启动");
+      return Ok(None);
+    }
   }
   // 依赖预检：缺失 → 自动创建/修复 python/.venv（首次可能耗时数分钟；安装日志写 infer.log）
   let mut missing = infer_deps_missing();
@@ -711,6 +794,16 @@ fn start_infer() -> std::io::Result<Option<Child>> {
       .current_dir(&cwd)
       .stdout(Stdio::from(log_file.try_clone()?))
       .stderr(Stdio::from(log_file.try_clone()?));
+    // HF_HOME 指向用户系统缓存：纯净 venv 下 transformers 默认用 venv 内缓存，
+    // 会找不到已下载的 Q-Align / Aesthetic Shadow 模型（网络被墙时重新下载卡死）。
+    // 优先系统缓存（%USERPROFILE%\.cache\huggingface），不存在则用 venv 内 hf_cache。
+    let hf_home = std::env::var("USERPROFILE")
+      .ok()
+      .map(|u| std::path::Path::new(&u).join(".cache").join("huggingface"))
+      .filter(|p| p.is_dir())
+      .unwrap_or_else(|| cwd.join("hf_cache"));
+    cmd.env("HF_HOME", &hf_home);
+    cmd.env("TRANSFORMERS_CACHE", hf_home.join("hub"));
     cmd.args(&prefix);
     cmd.args([
       "-m",
@@ -826,4 +919,140 @@ fn infer_install_deps() -> Result<String, String> {
     .unwrap();
   let venv = ensure_infer_venv()?;
   Ok(format!("推理依赖已就绪（{}），可启动服务", venv.display()))
+}
+
+/// GPU 环境安装进行中标记（增强1：部署按钮防重复点击 + 状态轮询）。
+static GPU_INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 桌面壳命令：安装 GPU 推理环境（CUDA 版 torch/torchvision，替换 CPU 版）。
+/// 立即返回，后台安装（数 GB 下载）；进度写 python/infer.log，用 infer_gpu_status 轮询。
+#[tauri::command]
+fn infer_install_gpu() -> Result<serde_json::Value, String> {
+  use std::sync::atomic::Ordering;
+  if GPU_INSTALLING.swap(true, Ordering::SeqCst) {
+    return Ok(serde_json::json!({ "started": false, "message": "GPU 环境安装已在进行中" }));
+  }
+  // ensure_infer_venv 返回的是 venv python.exe 的完整路径（可直接用于 Command）
+  let venv_exe = ensure_infer_venv()?;
+  let py_dir = infer_python_dir();
+  let log_path = py_dir.join("infer.log");
+
+  std::thread::spawn(move || {
+    let note = |msg: &str| {
+      eprintln!("[MoeVault][gpu] {msg}");
+      if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        use std::io::Write;
+        let _ = writeln!(f, "[gpu-install] {msg}");
+      }
+    };
+    note("开始安装 GPU 推理环境（CUDA 12.8 版 torch 2.11.0 + torchvision 0.26.0，约 3GB，视网速需数分钟到数十分钟）…");
+    // cu128 wheel：支持 RTX 50 系（Blackwell sm_120）及旧卡。
+    // 关键：
+    // 1) --index-url 只给 cu128 源、--extra-index-url 给 PyPI 镜像（torch 依赖 setuptools 等从 PyPI 拿）
+    // 2) 锁定精确版本 +cu128（PEP 440 local version），避免 pip 选到 PyPI 上版本号更高的 CPU torch
+    // 3) --only-binary :all: 防止源码编译
+    // 4) retries 10：本机网络对 pytorch 官方源偶发 TLS 阻断，多次重试可穿透
+    let combos = [
+      ("https://download.pytorch.org/whl/cu128", "https://pypi.tuna.tsinghua.edu.cn/simple"),
+      ("https://download.pytorch.org/whl/cu128", "https://pypi.org/simple"),
+    ];
+    let mut last_err: Option<String> = None;
+    let mut installed = false;
+    for (main, extra) in combos {
+      // pip 输出实时写入 infer.log（进度可见；--progress-bar off 减少控制字符污染日志）
+      let pip_log = log_path.clone();
+      let mut cmd = Command::new(&venv_exe);
+      cmd.args([
+        "-m",
+        "pip",
+        "install",
+        "--progress-bar",
+        "off",
+        "--disable-pip-version-check",
+        "--no-warn-script-location",
+        "--only-binary",
+        ":all:",
+        "--retries",
+        "10",
+        "--timeout",
+        "60",
+        "--force-reinstall",
+        "--index-url",
+        main,
+        "--extra-index-url",
+        extra,
+        "torch==2.11.0+cu128",
+        "torchvision==0.26.0+cu128",
+      ]);
+      #[cfg(target_os = "windows")]
+      {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+      }
+      let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&pip_log);
+      if let Ok(f) = log_file {
+        if let Ok(f2) = f.try_clone() {
+          cmd.stdout(std::process::Stdio::from(f2));
+        }
+        cmd.stderr(std::process::Stdio::from(f));
+      }
+      // stdout/stderr 已重定向到文件 → 用 status() 等待退出码（进度实时进 infer.log）
+      match cmd.status() {
+        Ok(st) if st.success() => {
+          note(&format!("GPU 推理环境安装完成（{main} + {extra}）；请重启推理服务使 CUDA 生效"));
+          installed = true;
+          break;
+        }
+        Ok(st) => {
+          last_err = Some(format!("组合 {main} + {extra} 退出码 {:?}", st.code()));
+          note(&format!("GPU 环境安装失败（退出码 {:?}），尝试下一组合…", st.code()));
+        }
+        Err(e) => {
+          last_err = Some(format!("组合 {main} + {extra} 无法启动: {e}"));
+          note(&format!("GPU 环境安装启动失败: {e}"));
+        }
+      }
+    }
+    if !installed {
+      note(&format!(
+        "GPU 环境安装失败（全部源组合均失败）:\n{}\n\n手动安装指引（网络被墙时的备选）：\n1) 浏览器打开 https://download.pytorch.org/whl/cu128/torch/ 下载 torch-2.11.0+cu128-cp310-cp310-win_amd64.whl\n2) 下载 torchvision-0.26.0+cu128-cp310-cp310-win_amd64.whl（同目录）\n3) 把两个文件放到本目录，运行：\n   .venv\\Scripts\\python.exe -m pip install torch-*.whl torchvision-*.whl --index-url https://pypi.tuna.tsinghua.edu.cn/simple\n4) 重启动应用，设置页查看 GPU 是否就绪",
+        last_err.unwrap_or_else(|| "未知错误".into())
+      ));
+    }
+    GPU_INSTALLING.store(false, Ordering::SeqCst);
+  });
+
+  Ok(serde_json::json!({ "started": true, "message": "GPU 环境安装已开始（后台进行，进度见 python/infer.log）" }))
+}
+
+/// 桌面壳命令：GPU 环境状态（安装中 + 当前 torch 是否可用 CUDA）。
+#[tauri::command]
+fn infer_gpu_status() -> Result<serde_json::Value, String> {
+  use std::sync::atomic::Ordering;
+  let installing = GPU_INSTALLING.load(Ordering::SeqCst);
+  // 快速探测 venv python 的 CUDA 可用性（torch 已装才可能 true；未装 torch 会报错 → false）
+  let py_dir = infer_python_dir();
+  let venv_exe = py_dir.join(".venv").join("Scripts").join("python.exe");
+  let mut cuda_ready = false;
+  if Path::new(&venv_exe).is_file() {
+    let mut cmd = Command::new(&venv_exe);
+    cmd.args([
+      "-c",
+      "import torch;print(1 if torch.cuda.is_available() else 0)",
+    ]);
+    #[cfg(target_os = "windows")]
+    {
+      use std::os::windows::process::CommandExt;
+      const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+      cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(o) = cmd.output() {
+      cuda_ready = String::from_utf8_lossy(&o.stdout).trim() == "1";
+    }
+  }
+  Ok(serde_json::json!({ "installing": installing, "cuda_ready": cuda_ready }))
 }

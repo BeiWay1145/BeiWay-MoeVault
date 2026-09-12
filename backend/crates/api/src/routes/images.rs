@@ -309,7 +309,7 @@ async fn rename_image(
 }
 
 /// 把 danbooru/gelbooru 的 .json API 链接转成页面链接（去掉 .json 后缀）。
-fn strip_json_suffix(url: &str) -> String {
+pub(crate) fn strip_json_suffix(url: &str) -> String {
     let trimmed = url.trim_end();
     if let Some(stripped) = trimmed.strip_suffix(".json") {
         stripped.to_string()
@@ -414,7 +414,7 @@ async fn proxy_image(
 
 /// 解析网络来源信息：danbooru /posts/{id}.json、gelbooru dapi。
 /// danbooru 返回单个 JSON 对象；gelbooru dapi 返回 `{"post": [...]}`。
-async fn parse_remote_source_info(
+pub(crate) async fn parse_remote_source_info(
     client: &reqwest::Client,
     page_url: &str,
 ) -> Value {
@@ -527,7 +527,7 @@ fn extract_moebooru_id(url: &str) -> Option<String> {
 }
 
 /// 从 URL 中提取帖子 id（/posts/6019533 或 ?id=6019533）。
-fn extract_post_id(url: &str) -> Option<String> {
+pub(crate) fn extract_post_id(url: &str) -> Option<String> {
     // /posts/6019533
     if let Some(idx) = url.find("/posts/") {
         let rest = &url[idx + "/posts/".len()..];
@@ -573,6 +573,7 @@ async fn replace_from_url(
     let db = state.db.clone();
     let library_dir = state.library_dir();
     let thumbs_dir = state.thumbs_dir();
+    let recycle_dir = state.recycle_dir();
     let result = tokio::task::spawn_blocking(move || {
         // 1. 取原图记录
         let img = db
@@ -629,11 +630,21 @@ async fn replace_from_url(
         std::fs::write(&new_path, &bytes)
             .map_err(|e| error_response(ErrorKind::Internal, format!("写入新文件失败: {e}")))?;
         tracing::info!(id, new_path = %new_path.display(), "替换网络图：写入成功");
-        // 6. 删旧文件（若非同一路径）
+        // 6. 旧文件移入回收站目录（增强3：可恢复，不直接删除；若非同一路径）
         if new_path != old_path {
-            match std::fs::remove_file(&old_path) {
-                Ok(_) => tracing::info!(id, old = %old_path.display(), "替换网络图：旧文件已删除"),
-                Err(e) => tracing::warn!(id, old = %old_path.display(), error = %e, "替换网络图：旧文件删除失败（忽略）"),
+            let recycle_dst = recycle_dir.join(&img.rel_path);
+            if let Some(parent) = recycle_dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::rename(&old_path, &recycle_dst) {
+                Ok(_) => tracing::info!(id, old = %old_path.display(), to = %recycle_dst.display(), "替换网络图：旧文件已移入回收站"),
+                Err(_) => {
+                    // 跨卷 rename 失败 → copy + remove
+                    match std::fs::copy(&old_path, &recycle_dst).and_then(|_| std::fs::remove_file(&old_path)) {
+                        Ok(_) => tracing::info!(id, old = %old_path.display(), to = %recycle_dst.display(), "替换网络图：旧文件已移入回收站（copy）"),
+                        Err(e) => tracing::warn!(id, old = %old_path.display(), error = %e, "替换网络图：旧文件移入回收站失败（忽略）"),
+                    }
+                }
             }
         }
         // 7. 重新生成缩略图

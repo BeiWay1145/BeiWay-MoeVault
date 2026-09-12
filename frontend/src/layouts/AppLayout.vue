@@ -24,6 +24,7 @@ interface ImportDonePayload {
   done?: number
   failed?: number
   duplicate?: number
+  duplicates_recycled?: number
   error?: string
 }
 function onImportDone(e: Event) {
@@ -31,7 +32,7 @@ function onImportDone(e: Event) {
   ElMessage({
     message: `导入任务 #${d.batch_id ?? '?'} 已完成：成功 ${d.done ?? 0} 张${
       d.failed ? `，失败 ${d.failed} 张` : ''
-    }${d.duplicate ? `，重复跳过 ${d.duplicate} 张` : ''}`,
+    }${d.duplicate ? `，重复 ${d.duplicate} 张${d.duplicates_recycled ? `（已移入回收站 ${d.duplicates_recycled} 张）` : ''}` : ''}`,
     type: 'success',
     duration: 5000,
     showClose: true,

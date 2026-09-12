@@ -118,6 +118,11 @@ AESTHETIC_MODEL = _detect_aesthetic_model()
 # 输出变换：0=直接取 logit 并 clamp 到 [1,5]；1=sigmoid(logit)*4+1（若实测输出接近 [0,1] 再开启）
 AESTHETIC_SIGMOID = int(os.environ.get("AESTHETIC_SIGMOID", "0"))
 AESTHETIC_RANGE = (1.0, 5.0)
+# 美学模型种类（议题4）：qalign = Q-Align SIGLIP2（偏真人）| anime = Aesthetic Shadow V2（二次元特化）
+# env AESTHETIC_KIND 可强制；运行时可经 /infer/aesthetic/config 热切换
+AESTHETIC_KIND = os.environ.get("AESTHETIC_KIND", "qalign")
+# 二次元美学模型（shadowlilac/aesthetic-shadow-v2，本地目录优先）
+ANIME_AESTHETIC_MODEL = "Disty0/aesthetic-shadow-v2"
 
 
 def tagger_paths() -> dict:

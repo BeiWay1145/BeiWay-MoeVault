@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 use moevault_core::models::{
     DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageFilter,
-    ImageListItem, ImageTagView, ImportBatch, RecycledItem, SortKey, Stats, TagAlias,
-    TagBrowseItem, TagWithCount, TaggingState,
+    ImageListItem, ImageTagView, ImportBatch, RecycledItem, ReplacePendingItem, SortKey, Stats,
+    TagAlias, TagBrowseItem, TagWithCount, TaggingState,
 };
 use moevault_core::{AppError, ErrorKind};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -1051,7 +1051,7 @@ impl Db {
                     (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id)
              FROM image_tags it JOIN tags t ON t.id = it.tag_id
              WHERE it.image_id = ?1
-             ORDER BY it.source, t.name",
+             ORDER BY t.category, t.name COLLATE NOCASE",
         )?;
         let rows = stmt.query_map(params![image_id], |r| {
             Ok(ImageTagView {
@@ -1714,6 +1714,71 @@ impl Db {
         Ok(())
     }
 
+    // ---------- 增强3：待确认替换 ----------
+
+    /// 新增待确认替换记录（严格查重未通过的候选），返回记录 id。
+    pub fn add_replace_pending(
+        &self,
+        image_id: i64,
+        temp_path: &str,
+        net_size: i64,
+        local_size: i64,
+        net_width: Option<i64>,
+        net_height: Option<i64>,
+        source_url: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO replace_pending (image_id, temp_path, net_size, local_size, net_width, net_height, source_url, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![image_id, temp_path, net_size, local_size, net_width, net_height, source_url, now_secs()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 待确认替换列表（含本图文件名，倒序）。
+    pub fn list_replace_pending(&self) -> Result<Vec<ReplacePendingItem>, DbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT rp.id, rp.image_id, rp.temp_path, rp.net_size, rp.local_size,
+                    rp.net_width, rp.net_height, rp.source_url, rp.created_at, i.rel_path
+             FROM replace_pending rp JOIN images i ON i.id = rp.image_id
+             ORDER BY rp.id DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ReplacePendingItem {
+                id: r.get(0)?,
+                image_id: r.get(1)?,
+                temp_path: r.get(2)?,
+                net_size: r.get(3)?,
+                local_size: r.get(4)?,
+                net_width: r.get(5)?,
+                net_height: r.get(6)?,
+                source_url: r.get(7)?,
+                created_at: r.get(8)?,
+                rel_path: r.get(9)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 读取单条待确认替换。
+    pub fn get_replace_pending(&self, pending_id: i64) -> Result<Option<ReplacePendingItem>, DbError> {
+        let all = self.list_replace_pending()?;
+        Ok(all.into_iter().find(|p| p.id == pending_id))
+    }
+
+    /// 删除待确认替换记录（确认替换或忽略后调用）。
+    pub fn remove_replace_pending(&self, pending_id: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM replace_pending WHERE id = ?1", params![pending_id])?;
+        Ok(())
+    }
+
     /// 从外部 Danbooru 中文字典 sqlite（ffdkj 仓库 tag.sqlite：name/cn_name/category/post_count）
     /// 批量回填 tags.name_cn。策略：**仅填空缺**（已有 name_cn 的标签不覆盖），
     /// 匹配按英文名精确相等。返回 (匹配数, 已更新数, 缺失数)。
@@ -1985,30 +2050,67 @@ impl Db {
             "INSERT INTO app_logs (level, category, message, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![level, category, message, now_secs()],
         )?;
-        // 限量保留 2000 条
+        // 限量保留 20000 条（BUG 追踪器需要更长历史，避免 info 把 error 顶掉）
         conn.execute(
-            "DELETE FROM app_logs WHERE id NOT IN (SELECT id FROM app_logs ORDER BY id DESC LIMIT 2000)",
+            "DELETE FROM app_logs WHERE id NOT IN (SELECT id FROM app_logs ORDER BY id DESC LIMIT 20000)",
             [],
         )?;
         Ok(())
     }
 
-    /// 查询日志（按时间倒序，分页）。
+    /// 查询日志（按时间倒序，分页）。等价于不带过滤的 list_logs_filtered。
     pub fn list_logs(&self, limit: i64, before_id: Option<i64>) -> Result<Vec<AppLog>, DbError> {
+        self.list_logs_filtered(limit, before_id, &[], &[])
+    }
+
+    /// 查询日志（按时间倒序，分页；可按级别 / 分类过滤）。
+    ///
+    /// levels / categories 为空表示不过滤。**过滤在 SQL 层完成**，
+    /// 这样「只看 error」不会被海量 info 挤出结果窗口（BUG 追踪器核心诉求）。
+    pub fn list_logs_filtered(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+        levels: &[String],
+        categories: &[String],
+    ) -> Result<Vec<AppLog>, DbError> {
         let conn = self.conn.lock().unwrap();
-        let limit = limit.clamp(1, 500);
+        let limit = limit.clamp(1, 5000);
         let mut sql = String::from(
             "SELECT id, level, category, message, created_at FROM app_logs",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut where_parts: Vec<String> = Vec::new();
         if let Some(bid) = before_id {
-            sql.push_str(" WHERE id < ?1");
             params.push(Box::new(bid));
+            where_parts.push(format!("id < ?{}", params.len()));
         }
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
-        let ph = params.len() + 1;
-        sql.push_str(&ph.to_string());
+        if !levels.is_empty() {
+            let phs: Vec<String> = levels
+                .iter()
+                .map(|l| {
+                    params.push(Box::new(l.clone()));
+                    format!("?{}", params.len())
+                })
+                .collect();
+            where_parts.push(format!("level IN ({})", phs.join(",")));
+        }
+        if !categories.is_empty() {
+            let phs: Vec<String> = categories
+                .iter()
+                .map(|c| {
+                    params.push(Box::new(c.clone()));
+                    format!("?{}", params.len())
+                })
+                .collect();
+            where_parts.push(format!("category IN ({})", phs.join(",")));
+        }
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
         params.push(Box::new(limit));
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", params.len()));
         let mut stmt = conn.prepare(&sql)?;
         for (i, v) in params.iter().enumerate() {
             stmt.raw_bind_parameter(i + 1, v.as_ref())?;

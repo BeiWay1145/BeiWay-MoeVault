@@ -30,6 +30,6 @@ pub enum TaggerError {
     Invalid(String),
     #[error("溯源未命中: {0}")]
     NoSource(String),
-    #[error("限流中: 剩余 {0} 次")]
+    #[error("SauceNAO 限流：等待 {0} 秒后重试")]
     RateLimited(i64),
 }

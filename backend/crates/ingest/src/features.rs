@@ -240,8 +240,13 @@ pub fn read_ai_metadata(path: &Path) -> Option<AiMetadata> {
 /// 逗号分隔；忽略 `artist:xxx` 前缀；忽略质量黑名单；忽略生图语法
 /// （`<lora:...>` `<embedding:...>` `<lyco:...>` `<hypernet:...>` 等尖括号块）；
 /// 忽略空段与 `BREAK` 等控制词；去空白。
+/// WebUI 适配（批次3）：
+/// - 多行 prompt 的换行归一为空格（A1111 在逗号后换行分隔多段）
+/// - 过滤纯符号垃圾 token（`//` `.` `/` `\` `-` 等生图占位符）
 pub fn extract_prompt_tags(prompt: &str) -> Vec<String> {
-    prompt
+    // 多行归一：换行 → 空格（逗号分隔保持不变）
+    let normalized = prompt.replace(['\r', '\n'], " ");
+    normalized
         .split(',')
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
@@ -249,8 +254,19 @@ pub fn extract_prompt_tags(prompt: &str) -> Vec<String> {
         .filter(|t| !t.eq_ignore_ascii_case("BREAK")) // ComfyUI/ADetailer 段分隔
         .filter(|t| !t.to_lowercase().starts_with("artist:"))
         .filter(|t| !is_quality_tag(t))
+        .filter(|t| !is_junk_token(t))
         .map(|t| t.to_string())
         .collect()
+}
+
+/// 纯符号/垃圾 token 判定（WebUI 生图占位符：`//`、`.`、`/`、`\`、`-`、`_` 等无字母数字内容）。
+fn is_junk_token(t: &str) -> bool {
+    let norm = t.trim().to_lowercase();
+    if norm.is_empty() {
+        return true;
+    }
+    // 无任何字母/数字 → 垃圾（纯符号）
+    !norm.chars().any(|c| c.is_alphanumeric())
 }
 
 /// 递归收集 ComfyUI workflow JSON 中所有含 `text` 的字符串（按出现顺序）。
@@ -323,6 +339,29 @@ mod tests {
         // "hello world" 的 md5
         assert_eq!(h1, "5eb63bbbe01eeed093cb22bb8f5acdc3");
         std::fs::remove_file(&p).ok();
+    }
+
+    /// WebUI 真实图片元数据读取验证（测试文件）。
+    #[test]
+    fn webui_real_parameters_parsing() {
+        let p = r"D:\Code\Reasonix_Projects\image\test\f5e16ea662d6f62e874d19b8eb5af275.png";
+        let meta = read_ai_metadata(std::path::Path::new(p));
+        let m = meta.expect("应读取到 AI 元数据");
+        assert!(m.is_ai);
+        println!("RAW: {}\n---", m.raw);
+        let prompt = m.prompt.clone().unwrap_or_default();
+        println!("PROMPT: {prompt}");
+        println!("NEGATIVE: {:?}", m.negative_prompt.as_deref().map(|s| s.len()));
+        println!("TAGS: {:?}", m.tags);
+        // 关键断言：负面词不应混入 tags
+        assert!(!m.tags.iter().any(|t| t.to_lowercase().contains("watermark")));
+        // 质量词不应混入
+        assert!(!m.tags.iter().any(|t| t.to_lowercase() == "low quality"));
+        // 垃圾 token（//）应被过滤
+        assert!(!m.tags.iter().any(|t| t == "//" || !t.chars().any(|c| c.is_alphanumeric())));
+        assert!(m.tags.contains(&"1girl".to_string()));
+        // 画师名裸名保留（gomzi/rella 无法可靠判定为画师，保留为常规标签，用户可手动改分类）
+        assert!(m.tags.contains(&"gomzi".to_string()));
     }
 
     #[test]

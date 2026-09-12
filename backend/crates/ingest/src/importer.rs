@@ -22,6 +22,8 @@ pub struct ImportProgress {
     pub done: usize,
     pub failed: usize,
     pub duplicate: usize,
+    /// 问题2：重复源文件移入回收站的张数。
+    pub duplicates_recycled: usize,
 }
 
 /// 导入模式。
@@ -59,6 +61,7 @@ pub fn run_import(
     paths: Vec<PathBuf>,
     library_dir: &Path,
     thumbs_dir: &Path,
+    recycle_dir: &Path,
     mode: ImportMode,
 ) -> Result<ImportProgress, IngestError> {
     std::fs::create_dir_all(library_dir)?;
@@ -78,7 +81,7 @@ pub fn run_import(
     let now = now_secs();
 
     for (i, src) in files.iter().enumerate() {
-        match process_one(db, src, library_dir, thumbs_dir, now, &mut seen_md5, mode) {
+        match process_one(db, src, library_dir, thumbs_dir, recycle_dir, now, &mut seen_md5, mode) {
             Ok(ProcessOutcome::Imported(img)) => {
                 pending.push(*img);
                 progress.done += 1;
@@ -87,8 +90,11 @@ pub fn run_import(
                     pending.clear();
                 }
             }
-            Ok(ProcessOutcome::Duplicate) => {
+            Ok(ProcessOutcome::Duplicate(recycled)) => {
                 progress.duplicate += 1;
+                if recycled {
+                    progress.duplicates_recycled += 1;
+                }
             }
             Err(e) => {
                 warn!(path = %src.display(), error = %e, "导入单张失败");
@@ -131,7 +137,8 @@ pub fn run_import(
 
 enum ProcessOutcome {
     Imported(Box<Image>),
-    Duplicate,
+    /// 重复：源文件是否已移入回收站目录。
+    Duplicate(bool),
 }
 
 fn process_one(
@@ -139,6 +146,7 @@ fn process_one(
     src: &Path,
     library_dir: &Path,
     thumbs_dir: &Path,
+    recycle_dir: &Path,
     now: i64,
     seen_md5: &mut std::collections::HashSet<String>,
     mode: ImportMode,
@@ -147,27 +155,64 @@ fn process_one(
 
     // 重复检测：批内（内存集合，因批量插入延迟 flush）+ 库内（数据库）
     if seen_md5.contains(&feats.md5) || db.md5_exists(&feats.md5)? {
-        // Move 模式：删除库外重复源文件（移动语义，避免残留）；Copy 模式保留源
-        if mode == ImportMode::Move && !src.starts_with(library_dir) {
-            let _ = std::fs::remove_file(src);
+        // 问题2：重复源文件移入回收站目录（可恢复，防误判），保留原名
+        let mut recycled = false;
+        if !src.starts_with(library_dir) {
+            let ext = crate::features::extension_of(src).unwrap_or_else(|| "unknown".to_string());
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{}.{}", &feats.md5[..feats.md5.len().min(8)], ext));
+            let dup_dir = recycle_dir.join("import_duplicate");
+            let _ = std::fs::create_dir_all(&dup_dir);
+            let dst = dup_dir.join(&name);
+            // 目标已存在 → 加短 md5 后缀
+            let dst = if dst.exists() {
+                let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
+                let new_name = format!("{stem}_{}.{ext}", &feats.md5[..feats.md5.len().min(8)]);
+                dup_dir.join(new_name)
+            } else {
+                dst
+            };
+            if std::fs::rename(src, &dst).is_ok() {
+                recycled = true;
+            } else if std::fs::copy(src, &dst).is_ok() {
+                // 跨卷：复制后删源（Move 语义）；Copy 模式复制到回收站不删源
+                if mode == ImportMode::Move {
+                    let _ = std::fs::remove_file(src);
+                }
+                recycled = true;
+            }
         }
-        return Ok(ProcessOutcome::Duplicate);
+        return Ok(ProcessOutcome::Duplicate(recycled));
     }
     seen_md5.insert(feats.md5.clone());
 
-    // 进库：library/{md5前2}/{md5}.{ext}
+    // 进库：library/{md5前2}/{原文件名}.{ext}（保留原名；重名自动加短 md5 后缀）
     let ext = crate::features::extension_of(src).unwrap_or_else(|| "unknown".to_string());
     if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
         return Err(IngestError::Invalid(format!("不支持的扩展名: {ext}")));
     }
-    let rel = hash_rel_path(&feats.md5, &ext);
+    let orig_stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| feats.md5.clone());
+    let base_name = sanitize_filename(&orig_stem);
+    // 文件名冲突检测：同分片目录内已存在同名 → 加短 md5 后缀
+    let prefix_dir = &feats.md5[..feats.md5.len().min(2)];
+    let mut file_stem = base_name.clone();
+    let mut rel = PathBuf::from(prefix_dir).join(format!("{file_stem}.{ext}"));
+    if library_dir.join(&rel).exists() {
+        file_stem = format!("{base_name}_{}", &feats.md5[..feats.md5.len().min(8)]);
+        rel = PathBuf::from(prefix_dir).join(format!("{file_stem}.{ext}"));
+    }
     let dst = library_dir.join(&rel);
     match mode {
         ImportMode::Move => move_file(src, &dst)?,
         ImportMode::Copy => copy_file(src, &dst)?,
     }
 
-    // 生成缩略图（WebP）
+    // 生成缩略图（WebP）：缩略图按 md5 命名（与图同分片前缀，重名无冲突）
     let thumb_rel = hash_rel_path(&feats.md5, "webp");
     let thumb_path = thumbs_dir.join(&thumb_rel);
     generate_thumbnail(&dst, &thumb_path);
@@ -209,6 +254,24 @@ fn process_one(
 fn hash_rel_path(md5: &str, ext: &str) -> PathBuf {
     let prefix = &md5[..md5.len().min(2)];
     PathBuf::from(prefix).join(format!("{md5}.{ext}"))
+}
+
+/// 清理文件名中的 Windows 非法字符（\/:*?"<>| 与控制符）→ `_`；空名回退。
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.').to_string();
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// 移动文件：同卷 rename；跨卷（EXDEV）退化为 copy + remove。
@@ -353,12 +416,14 @@ mod tests {
 
         let library = root.join("library");
         let thumbs = root.join("thumbs");
+        let recycle = root.join("recycle");
         let progress = run_import(
             &db,
             batch_id,
             vec![src_dir.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Move,
         )
         .unwrap();
@@ -397,6 +462,7 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
         let library = root.join("library");
         let thumbs = root.join("thumbs");
+        let recycle = root.join("recycle");
 
         let b1 = db.create_import_batch("src1").unwrap();
         let pr1 = run_import(
@@ -405,6 +471,7 @@ mod tests {
             vec![src1.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Move,
         )
         .unwrap();
@@ -418,12 +485,20 @@ mod tests {
             vec![src2.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Move,
         )
         .unwrap();
         assert_eq!(pr2.duplicate, 1);
         assert_eq!(pr2.done, 0);
-        assert!(!p2.exists(), "库外重复源文件应被删除");
+        assert!(!p2.exists(), "重复源文件应被移出原位");
+        let recycled: Vec<_> = std::fs::read_dir(recycle.join("import_duplicate"))
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        assert!(
+            recycled.iter().any(|n| n.contains("copy")),
+            "重复源文件应进入回收站 import_duplicate/，实际 {recycled:?}"
+        );
 
         assert_eq!(db.count_images("active").unwrap(), 1);
         std::fs::remove_dir_all(&root).ok();
@@ -443,6 +518,7 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
         let library = root.join("library");
         let thumbs = root.join("thumbs");
+        let recycle = root.join("recycle");
         let b = db.create_import_batch("src").unwrap();
         let pr = run_import(
             &db,
@@ -450,6 +526,7 @@ mod tests {
             vec![src.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Move,
         )
         .unwrap();
@@ -472,6 +549,7 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
         let library = root.join("library");
         let thumbs = root.join("thumbs");
+        let recycle = root.join("recycle");
         let b = db.create_import_batch("src").unwrap();
         let pr = run_import(
             &db,
@@ -479,6 +557,7 @@ mod tests {
             vec![src],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Move,
         )
         .unwrap();
@@ -500,12 +579,14 @@ mod tests {
 
         let library = root.join("library");
         let thumbs = root.join("thumbs");
+        let recycle = root.join("recycle");
         let progress = run_import(
             &db,
             batch_id,
             vec![src_dir.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Copy,
         )
         .unwrap();
@@ -524,8 +605,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// 用户明确要求：重复图一律移入回收站（copy 模式也不再原地保留），便于人工复核。
     #[test]
-    fn duplicate_in_copy_mode_keeps_source() {
+    fn duplicate_in_copy_mode_moves_source_to_recycle() {
         let root = temp_root("copy_dup");
         let src1 = root.join("src1");
         let src2 = root.join("src2");
@@ -539,6 +621,7 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
         let library = root.join("library");
         let thumbs = root.join("thumbs");
+        let recycle = root.join("recycle");
 
         let b1 = db.create_import_batch("src1").unwrap();
         let pr1 = run_import(
@@ -547,6 +630,7 @@ mod tests {
             vec![src1.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Copy,
         )
         .unwrap();
@@ -561,12 +645,18 @@ mod tests {
             vec![src2.clone()],
             &library,
             &thumbs,
+            &recycle,
             ImportMode::Copy,
         )
         .unwrap();
         assert_eq!(pr2.duplicate, 1);
         assert_eq!(pr2.done, 0);
-        assert!(p2.exists(), "copy 模式重复源文件不应被删除");
+        assert!(!p2.exists(), "重复源文件应移入回收站（不再原地保留）");
+        assert_eq!(pr2.duplicates_recycled, 1, "应记录移入回收站的数量");
+        assert!(
+            recycle.join("import_duplicate").is_dir(),
+            "回收站 import_duplicate 目录应存在"
+        );
 
         assert_eq!(db.count_images("active").unwrap(), 1);
         std::fs::remove_dir_all(&root).ok();

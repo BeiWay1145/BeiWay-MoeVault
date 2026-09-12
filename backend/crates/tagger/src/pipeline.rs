@@ -54,6 +54,9 @@ impl InferClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
+                // 禁用空闲连接复用：uvicorn 会关闭 keep-alive 连接，reqwest 复用死连接会挂起
+                // （打标偶发成功、美学稳定失败与此相关）。每次请求新建连接最稳。
+                .pool_max_idle_per_host(0)
                 .build()
                 .expect("构建推理客户端失败"),
             base_url,
@@ -330,8 +333,28 @@ async fn tag_one(
     }
 
     // 2. 溯源（SauceNAO + booru 爬标签）；None = 未命中/失败（回退本地打标）
-    let (api_key, key_idx) = pool.acquire().await;
-    let hit = match sauce_one(db, sauce, pool, infer, library_dir, min_sim, image_id, api_key, key_idx).await? {
+    //    限流时等待后重试同一张图（全局窗口+冷却由 pool 接管），避免误判为失败
+    let mut hit: Option<SauceHit> = None;
+    for attempt in 0..=MAX_RATE_RETRIES {
+        let (api_key, key_idx) = pool.acquire().await;
+        match sauce_one(db, sauce, pool, infer, library_dir, min_sim, image_id, api_key, key_idx).await {
+            Ok(h) => {
+                hit = h;
+                break;
+            }
+            Err(TaggerError::RateLimited(secs)) => {
+                if attempt == MAX_RATE_RETRIES {
+                    warn!(image_id, "打标溯源：限流重试次数耗尽，回退本地打标");
+                    break;
+                }
+                let wait = secs.clamp(1, 120) as u64;
+                warn!(image_id, retry_secs = wait, attempt = attempt + 1, "打标溯源限流，等待后重试");
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let hit = match hit {
         Some(h) => h,
         None => {
             return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
@@ -383,21 +406,39 @@ async fn sauce_one(
     let (result, quota) = match sauce.search_file(&file_path, &api_key).await {
         Ok(r) => r,
         Err((e, err_quota)) => {
-            // 失败：先更新配额（若响应带配额），再标记 key 冷却
+            // 先更新配额（若响应带配额头）
             pool.update(key_idx, err_quota.short_remaining, err_quota.long_remaining).await;
-            pool.on_failure(key_idx).await;
-            let is_no_result = matches!(e, TaggerError::NoSource(_));
-            warn!(image_id, error = %e, is_no_result, "溯源失败");
-            db.put_sauce_cache(&img.md5, 0.0, None, None, None)?;
-            if is_no_result {
-                db.set_no_auto_sauce(image_id, true)?;
+            match e {
+                // 限流（-2/3）：整池进入全局冷却，把错误抛给 worker 重试同一张图，
+                // 不再当作"该图失败"——否则一次限流会白扔掉整批图。
+                TaggerError::RateLimited(secs) => {
+                    pool.note_rate_limited(key_idx, secs.max(1) as u64).await;
+                    return Err(TaggerError::RateLimited(secs));
+                }
+                // 调用成功但无匹配：正常消耗配额，不冷却（避免"无结果"白等 30s）
+                TaggerError::NoSource(msg) => {
+                    info!(image_id, "SauceNAO 无匹配结果");
+                    db.put_sauce_cache(&img.md5, 0.0, None, None, None)?;
+                    db.set_no_auto_sauce(image_id, true)?;
+                    let _ = msg;
+                    return Ok(None);
+                }
+                other => {
+                    pool.on_failure(key_idx).await;
+                    warn!(image_id, error = %other, "溯源失败");
+                    db.put_sauce_cache(&img.md5, 0.0, None, None, None)?;
+                    return Ok(None);
+                }
             }
-            return Ok(None);
         }
     };
-    // 成功：更新配额头 + 进入短窗口冷却（30s，SauceNAO 免费账号真实限制）
+    // 成功：更新配额头；仅当短窗口配额耗尽时才冷却，否则继续用（全局窗口限流兜底）
     pool.update(key_idx, quota.short_remaining, quota.long_remaining).await;
-    pool.start_cooldown(key_idx, 30).await;
+    match quota.short_remaining {
+        Some(0) => pool.start_cooldown(key_idx, 30).await,
+        Some(_) => {}
+        None => pool.start_cooldown(key_idx, 5).await, // 无配额头：保守短冷却
+    }
 
     // 有效判定：相似度 ≥ 阈值 且 ext_urls 含 booru 链接
     if result.similarity < min_sim {
@@ -427,6 +468,9 @@ async fn sauce_one(
         similarity: result.similarity,
     }))
 }
+
+/// 单张图遇到 SauceNAO 限流时的最大重试次数（超过则计为失败，避免无限卡住整批）。
+const MAX_RATE_RETRIES: u32 = 5;
 
 /// 溯源专用管线：只做 SauceNAO 溯源 + booru 爬标签（失败不本地打标）。
 /// - `image_ids`：None = 全部未溯源 active 图；Some = 指定图（强制重新溯源）。
@@ -501,6 +545,8 @@ pub async fn run_sauce_pipeline(
         let infer = infer.clone();
         let library_dir = library_dir.to_path_buf();
         handles.push(tokio::spawn(async move {
+            // 限流重试：保存待重试的图片与已重试次数（Some 时优先继续处理该图）
+            let mut current: Option<(i64, u32)> = None;
             loop {
                 // 中断检查：任务被取消则停止（每轮处理前查一次 DB）
                 if let Some(jid) = job_id {
@@ -510,14 +556,22 @@ pub async fn run_sauce_pipeline(
                         }
                     }
                 }
-                // 取下一张图
-                let image_id = {
-                    let mut q = queue.lock().unwrap();
-                    q.pop_front()
+                // 取下一张图（限流重试的图优先）
+                let (image_id, attempt) = match current.take() {
+                    Some(v) => v,
+                    None => {
+                        let next = {
+                            let mut q = queue.lock().unwrap();
+                            q.pop_front()
+                        };
+                        match next {
+                            Some(id) => (id, 0u32),
+                            None => break,
+                        }
+                    }
                 };
-                let Some(image_id) = image_id else { break };
 
-                // acquire 会等待可用 key（含 30s 冷却结束后放行）
+                // acquire 会等待可用 key（含全局窗口 / 冷却结束后放行）
                 let (api_key, key_idx) = pool.acquire().await;
                 match sauce_one(
                     &db,
@@ -551,6 +605,43 @@ pub async fn run_sauce_pipeline(
                     Ok(None) => {
                         info!(image_id, "溯源无命中");
                         let _ = db.add_log("warn", "sauce", &format!("图片 #{image_id} 溯源无命中（AI 图/不可溯源/无匹配）"));
+                        let mut p = progress.lock().unwrap();
+                        p.failed += 1;
+                        let (d, f) = (p.done, p.failed);
+                        drop(p);
+                        if let Some(jid) = job_id {
+                            let _ = db.update_job(jid, "running", d as i64, f as i64, None);
+                        }
+                    }
+                    Err(TaggerError::RateLimited(secs)) => {
+                        // 限流：同一张图等待后重试（全局窗口+冷却已由 pool 接管），
+                        // 不丢弃该图，避免一次限流白扔整批。
+                        if attempt < MAX_RATE_RETRIES {
+                            let wait = secs.clamp(1, 120) as u64;
+                            warn!(
+                                image_id,
+                                retry_secs = wait,
+                                attempt = attempt + 1,
+                                "溯源限流，等待后重试同一张图"
+                            );
+                            let _ = db.add_log(
+                                "warn",
+                                "sauce",
+                                &format!(
+                                    "SauceNAO 限流：{wait} 秒后重试图片 #{image_id}（第 {} 次）",
+                                    attempt + 1
+                                ),
+                            );
+                            current = Some((image_id, attempt + 1));
+                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                        warn!(image_id, "溯源限流重试次数耗尽，计为失败");
+                        let _ = db.add_log(
+                            "error",
+                            "sauce",
+                            &format!("图片 #{image_id} 溯源失败：SauceNAO 限流重试 {MAX_RATE_RETRIES} 次仍未成功"),
+                        );
                         let mut p = progress.lock().unwrap();
                         p.failed += 1;
                         let (d, f) = (p.done, p.failed);

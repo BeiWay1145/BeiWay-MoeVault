@@ -1,0 +1,31 @@
+# 推理服务控制命令授权（infer_start/infer_stop/infer_status/infer_install_deps/infer_install_gpu/infer_gpu_status）。
+# 桌面壳自定义命令需显式 ACL 授权，否则 WebView2（remote origin）调用报 "not allowed by ACL"。
+[[permission]]
+identifier = "allow-infer-start"
+description = "允许调用推理服务启动命令"
+commands = { allow = ["infer_start"] }
+
+[[permission]]
+identifier = "allow-infer-stop"
+description = "允许调用推理服务停止命令"
+commands = { allow = ["infer_stop"] }
+
+[[permission]]
+identifier = "allow-infer-status"
+description = "允许查询推理服务状态"
+commands = { allow = ["infer_status"] }
+
+[[permission]]
+identifier = "allow-infer-install-deps"
+description = "允许安装推理服务依赖"
+commands = { allow = ["infer_install_deps"] }
+
+[[permission]]
+identifier = "allow-infer-install-gpu"
+description = "允许安装 GPU 推理环境"
+commands = { allow = ["infer_install_gpu"] }
+
+[[permission]]
+identifier = "allow-infer-gpu-status"
+description = "允许查询 GPU 环境状态"
+commands = { allow = ["infer_gpu_status"] }

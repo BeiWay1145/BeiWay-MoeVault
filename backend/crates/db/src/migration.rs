@@ -22,6 +22,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("V9__image_tags_ai_source", include_str!("../migrations/V9__image_tags_ai_source.sql")),
     ("V10__tag_covers", include_str!("../migrations/V10__tag_covers.sql")),
     ("V11__tag_aliases", include_str!("../migrations/V11__tag_aliases.sql")),
+    ("V12__replace_pending", include_str!("../migrations/V12__replace_pending.sql")),
 ];
 
 fn now_secs() -> i64 {

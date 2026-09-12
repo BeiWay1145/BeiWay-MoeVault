@@ -44,6 +44,11 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "preload_count",
     "tag_cover_rule",
     "tag_show_cn_first",
+    "import_default_mode",
+    "export_open_explorer_batch",
+    "export_open_explorer_manual",
+    "export_default_dir",
+    "aesthetic_kind",
 ];
 
 pub fn router() -> Router<AppState> {
@@ -233,6 +238,22 @@ async fn list_keys(
             None => None,
         }
     };
+    // 全局 IP 池窗口状态（免费账号 4 次 / 30 秒，跨 key 共享）
+    let rate_window = {
+        let slot = state.sauce_pool.read().await;
+        match slot.as_ref() {
+            Some(pool) => {
+                let (used, limit, cooling) = pool.global_window().await;
+                Some(json!({
+                    "used": used,
+                    "limit": limit,
+                    "cooling_secs": cooling,
+                    "window_secs": moevault_tagger::keypool::GLOBAL_WINDOW_SECS,
+                }))
+            }
+            None => None,
+        }
+    };
     let masked: Vec<Value> = keys
         .iter()
         .map(|k| {
@@ -250,7 +271,11 @@ async fn list_keys(
             })
         })
         .collect();
-    Ok(Json(json!({ "keys": masked, "count": keys.len() })))
+    Ok(Json(json!({
+        "keys": masked,
+        "count": keys.len(),
+        "rate_window": rate_window,
+    })))
 }
 
 /// PUT /api/v1/settings/saucenao-keys/{name}/quota：手动修改当日剩余额度。

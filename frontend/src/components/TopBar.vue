@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useSettingsStore } from '@/stores/settings'
 import { useRouter } from 'vue-router'
 import { Sunny, Moon, List, Plus, FolderOpened, Monitor } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
@@ -21,9 +22,18 @@ function toggleTheme() {
 // ---- 导入（全局入口：路径输入 / 文件夹选择 / 拖拽） ----
 const importVisible = ref(false)
 const importPaths = ref('')
-const importMode = ref<'move' | 'copy'>('move')
+// 功能增强2：默认导入方式取自通用设置（确认框内可临时切换）
+const settingsStore = useSettingsStore()
+const importMode = ref<'move' | 'copy'>(settingsStore.settings.import_default_mode ?? 'move')
 const submitting = ref(false)
 const folderInput = ref<HTMLInputElement | null>(null)
+
+/** 打开导入框时刷新默认导入方式。 */
+watch(importVisible, (v) => {
+  if (v) {
+    importMode.value = settingsStore.settings.import_default_mode ?? 'move'
+  }
+})
 
 /** 选择文件夹（webkitdirectory）填入路径提示（浏览器拿不到绝对路径）。 */
 function onPickFolder(e: Event) {

@@ -15,6 +15,12 @@
     "core:default",
     "opener:default",
     "opener:allow-open-url",
-    "core:webview:allow-internal-toggle-devtools"
+    "core:webview:allow-internal-toggle-devtools",
+    "allow-infer-start",
+    "allow-infer-stop",
+    "allow-infer-status",
+    "allow-infer-install-deps",
+    "allow-infer-install-gpu",
+    "allow-infer-gpu-status"
   ]
 }

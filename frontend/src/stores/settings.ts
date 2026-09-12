@@ -41,6 +41,16 @@ export interface SettingsState {
   tag_cover_rule: string
   /** 优先显示中文标签（中文别名在前，如 女孩(1girl)） */
   tag_show_cn_first: boolean
+  /** 功能增强2：默认导入方式（move 移动进库 / copy 复制进库）。 */
+  import_default_mode: 'move' | 'copy'
+  /** 功能增强4：批量导出后自动打开资源管理器（默认关闭）。 */
+  export_open_explorer_batch: boolean
+  /** 功能增强4：详情页手动导出后自动打开资源管理器（默认关闭）。 */
+  export_open_explorer_manual: boolean
+  /** 导出默认目录（空=自动探测下载目录）。 */
+  export_default_dir: string
+  /** 议题4：美学模型种类（qalign 偏真人 / anime 二次元特化）。 */
+  aesthetic_kind: 'qalign' | 'anime'
 }
 
 const defaults: SettingsState = {
@@ -66,6 +76,11 @@ const defaults: SettingsState = {
   preload_count: 4,
   tag_cover_rule: 'aesthetic',
   tag_show_cn_first: false,
+  import_default_mode: 'move',
+  export_open_explorer_batch: false,
+  export_open_explorer_manual: false,
+  export_default_dir: '',
+  aesthetic_kind: 'qalign',
 }
 
 /** 设置状态：读写 /api/v1/settings，含多 key 管理。 */
@@ -99,6 +114,11 @@ export const useSettingsStore = defineStore('settings', () => {
         preload_count: s.preload_count != null ? Number(s.preload_count) : defaults.preload_count,
         tag_cover_rule: String(s.tag_cover_rule ?? defaults.tag_cover_rule),
         tag_show_cn_first: s.tag_show_cn_first === true || s.tag_show_cn_first === 'true',
+        import_default_mode: (s.import_default_mode === 'copy' ? 'copy' : 'move'),
+        export_open_explorer_batch: s.export_open_explorer_batch === true || s.export_open_explorer_batch === 'true',
+        export_open_explorer_manual: s.export_open_explorer_manual === true || s.export_open_explorer_manual === 'true',
+        export_default_dir: String(s.export_default_dir ?? ''),
+        aesthetic_kind: s.aesthetic_kind === 'anime' ? 'anime' : 'qalign',
       }
       loaded.value = true
     } catch {
@@ -129,6 +149,11 @@ export const useSettingsStore = defineStore('settings', () => {
       preload_count: String(settings.value.preload_count),
       tag_cover_rule: settings.value.tag_cover_rule,
       tag_show_cn_first: String(settings.value.tag_show_cn_first),
+      import_default_mode: settings.value.import_default_mode,
+      export_open_explorer_batch: String(settings.value.export_open_explorer_batch),
+      export_open_explorer_manual: String(settings.value.export_open_explorer_manual),
+      export_default_dir: settings.value.export_default_dir,
+      aesthetic_kind: settings.value.aesthetic_kind,
     })
   }
 

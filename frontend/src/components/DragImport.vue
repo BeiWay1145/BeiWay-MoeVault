@@ -5,7 +5,8 @@
  * - 拖入时显示全屏覆盖提示；松开后弹确认框（路径预览 + 移动/复制选择）→ POST /api/v1/import
  * - 浏览器环境（isTauri()=false）不监听：沿用 TopBar 的手动输入/提示路径
  */
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useSettingsStore } from '@/stores/settings'
 import { useRouter } from 'vue-router'
 import { FolderOpened, Document, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
@@ -28,8 +29,17 @@ const router = useRouter()
 const dragActive = ref(false)
 const dialogVisible = ref(false)
 const paths = ref<string[]>([])
-const mode = ref<'move' | 'copy'>('move')
+// 功能增强2：默认导入方式取自通用设置（确认框内可临时切换）
+const settingsStore = useSettingsStore()
+const mode = ref<'move' | 'copy'>(settingsStore.settings.import_default_mode ?? 'move')
 const submitting = ref(false)
+
+/** 打开确认框时刷新默认导入方式。 */
+watch(dialogVisible, (v) => {
+  if (v) {
+    mode.value = settingsStore.settings.import_default_mode ?? 'move'
+  }
+})
 
 const dirCount = () => paths.value.filter((p) => !p.includes('.')).length
 const fileCount = () => paths.value.length - dirCount()
@@ -128,7 +138,7 @@ async function onConfirm() {
     append-to-body
   >
     <div class="path-summary">
-      共 {{ paths.length }} 项：文件夹 {{ dirCount }} 个，文件 {{ fileCount }} 个
+      共 {{ paths.length }} 项：文件夹 {{ dirCount() }} 个，文件 {{ fileCount() }} 个
     </div>
     <div class="path-list">
       <div v-for="p in paths" :key="p" class="path-row">

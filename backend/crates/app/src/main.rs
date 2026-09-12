@@ -12,7 +12,10 @@ use moevault_core::Config;
 use moevault_db::Db;
 use tower_http::services::{ServeDir, ServeFile};
 
+mod tracing_db;
+
 fn init_tracing(data_dir: &std::path::Path) {
+    use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,moevault=debug"));
@@ -23,19 +26,22 @@ fn init_tracing(data_dir: &std::path::Path) {
         .create(true)
         .append(true)
         .open(log_dir.join("app.log"));
+    // BUG 追踪器层：WARN/ERROR 自动写入 app_logs（数据库就绪后启用）
+    let layer = tracing_db::db_log_layer();
     match file {
         Ok(f) => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(true)
-                .with_writer(std::sync::Mutex::new(f))
+            let _ = tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .with(tracing_subscriber::fmt::layer().with_target(true).with_writer(std::sync::Mutex::new(f)))
                 .try_init();
         }
         Err(e) => {
             eprintln!("[MoeVault] 日志文件打开失败，回退 stdout: {e}");
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(true)
+            let _ = tracing_subscriber::registry()
+                .with(filter)
+                .with(layer)
+                .with(tracing_subscriber::fmt::layer().with_target(true))
                 .try_init();
         }
     }
@@ -60,6 +66,8 @@ async fn main() {
         }
     };
     tracing::info!("数据库就绪: {}", config.db_path.display());
+    // BUG 追踪器：数据库就绪，此后 WARN/ERROR 自动写入 app_logs
+    tracing_db::enable_db_logging(db.clone());
 
     // 启动日志清理（设置 log_clear_on_start，默认开启）：清空旧日志 + 写入启动记录
     let clear_on_start = db

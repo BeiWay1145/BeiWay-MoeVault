@@ -10,6 +10,7 @@ moevault-db = { path = "../db" }
 moevault-ingest = { path = "../ingest" }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }

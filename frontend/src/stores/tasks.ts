@@ -25,6 +25,44 @@ export const taskKindLabel: Record<string, string> = {
   sauce: 'SauceNAO 溯源',
   'ai-detect': 'AI 生成检测',
   import: '导入',
+  dedup: '查重',
+  export: '导出',
+  replace: '原图替换',
+}
+
+/** 后端返回的原始任务（snake_case）。 */
+interface RawTask {
+  id: number
+  type: string
+  type_label?: string
+  status: string
+  total?: number
+  done?: number
+  failed?: number
+  error?: string | null
+  created_at?: number
+  updated_at?: number
+  finished_at?: number | null
+}
+
+/**
+ * 归一化：后端 JSON 是 snake_case，前端统一用 camelCase。
+ * 此前直接按 camelCase 读取导致类型/时间全是 undefined（任务中心"没有有效信息"的主因）。
+ */
+export function normalizeTask(r: RawTask): TaskItem {
+  return {
+    id: r.id,
+    type: r.type,
+    typeLabel: r.type_label || taskKindLabel[r.type] || r.type,
+    status: r.status as TaskItem['status'],
+    total: r.total ?? 0,
+    done: r.done ?? 0,
+    failed: r.failed ?? 0,
+    error: r.error ?? undefined,
+    createdAt: r.created_at ?? 0,
+    updatedAt: r.updated_at ?? 0,
+    finishedAt: r.finished_at ?? null,
+  }
 }
 
 /**
@@ -36,29 +74,37 @@ export const useTaskStore = defineStore('tasks', () => {
   const running = ref(0)
   /** 已通知过完成的任务 id 集合（避免重复弹窗）。 */
   const notified = ref<Set<number>>(new Set())
+  /** 增强3：任务完成回调注册表（job_id → callback），单张溯源比大小用。 */
+  const doneCallbacks = new Map<number, (t: TaskItem) => void>()
   /** 首次加载已完成（初始化集合，不弹历史通知）。 */
   let initialized = false
   let timer: number | undefined
 
   async function load() {
     try {
-      const d = await get<{ items: TaskItem[] }>('/tasks?limit=100')
-      tasks.value = d.items
-      running.value = d.items.filter((t) => t.status === 'running' || t.status === 'pending').length
+      const d = await get<{ items: RawTask[] }>('/tasks?limit=100')
+      const items = (d.items ?? []).map(normalizeTask)
+      tasks.value = items
+      running.value = items.filter((t) => t.status === 'running' || t.status === 'pending').length
       if (!initialized) {
         // 首次加载：把现有完成/失败任务记入已通知集合（历史任务不再重复提示），
         // 之后轮询只提示本会话新出现的完成/失败任务。
-        for (const t of d.items) {
+        for (const t of items) {
           if (t.status === 'done' || t.status === 'failed') notified.value.add(t.id)
         }
         initialized = true
         return
       }
       // 检测新完成的任务 → 顶部通知
-      for (const t of d.items) {
+      for (const t of items) {
         if ((t.status === 'done' || t.status === 'failed') && !notified.value.has(t.id)) {
           notified.value.add(t.id)
           notifyFinished(t)
+          const cb = doneCallbacks.get(t.id)
+          if (cb) {
+            doneCallbacks.delete(t.id)
+            cb(t)
+          }
         }
       }
     } catch {
@@ -129,14 +175,16 @@ export const useTaskStore = defineStore('tasks', () => {
     return r
   }
 
-  /** 提交 SauceNAO 溯源任务（force=true 时忽略不可溯源标记，强制重试）。 */
-  async function enqueueSauce(ids: number[], force = false) {
+  /** 提交 SauceNAO 溯源任务（force=true 时忽略不可溯源标记，强制重试；onDone 任务完成回调）。 */
+  async function enqueueSauce(ids: number[], force = false, autoReplace = false, onDone?: (t: TaskItem) => void) {
     const r = await post<{ started: boolean; job_id: number; kind: string }>('/sauce/run', {
       force_ids: ids,
       force_sauce: force,
+      auto_replace: autoReplace,
     })
     notifyEnqueued(r.kind, r.job_id, ids.length)
-    reportLog(`提交批量溯源任务 #${r.job_id}（${ids.length} 张${force ? '，强制重试' : ''}）`)
+    reportLog(`提交批量溯源任务 #${r.job_id}（${ids.length} 张${force ? '，强制重试' : ''}${autoReplace ? '，智能替换' : ''}）`)
+    if (onDone) doneCallbacks.set(r.job_id, onDone)
     load()
     return r
   }

@@ -47,6 +47,17 @@ pub async fn run_aesthetic_pipeline(
     if ids.is_empty() {
         return Ok(AestheticProgress::default());
     }
+    // 议题4：同步美学模型种类（qalign/anime）到推理服务（设置页可切换）
+    let kind = db
+        .get_setting("aesthetic_kind")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "qalign".to_string());
+    if let Err(e) = infer.set_aesthetic_kind(&kind).await {
+        warn!(kind = %kind, error = %e, "美学模型种类切换失败（用当前模型继续）");
+    } else {
+        info!(kind = %kind, "美学模型种类已同步");
+    }
     info!(count = ids.len(), "美学评分流水线：开始");
 
     let mut progress = AestheticProgress {
@@ -107,6 +118,28 @@ async fn score_one(
 }
 
 impl crate::InferClient {
+    /// 切换推理服务美学模型种类（qalign/anime）。
+    pub async fn set_aesthetic_kind(&self, kind: &str) -> Result<(), TaggerError> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            kind: &'a str,
+        }
+        let resp = self
+            .http()
+            .post(format!("{}/infer/aesthetic/config", self.base_url))
+            .json(&Req { kind })
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TaggerError::Invalid(format!(
+                "切换美学模型种类失败 {status}: {body}"
+            )));
+        }
+        Ok(())
+    }
+
     /// 调用 /infer/aesthetic 获取美学分（1-5）。
     pub async fn infer_aesthetic(&self, path: &Path) -> Result<f64, TaggerError> {
         #[derive(serde::Serialize)]
@@ -115,14 +148,24 @@ impl crate::InferClient {
         }
         // 传绝对路径（推理服务 cwd 与后端不同，相对路径会 404）
         let abs_path = crate::pipeline::to_absolute_path(path)?;
-        let resp = self
+        tracing::info!(base = %self.base_url, path = %abs_path, "infer_aesthetic: 发起请求");
+        let resp = match self
             .http()
             .post(format!("{}/infer/aesthetic", self.base_url))
             .json(&Req {
                 path: &abs_path,
             })
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // {:#} 显示 cause 链（连接/超时/代理的具体原因）
+                return Err(TaggerError::Invalid(format!(
+                    "推理服务 /infer/aesthetic 请求失败: {e:#}"
+                )));
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status().to_string();
             let body_snippet = resp
