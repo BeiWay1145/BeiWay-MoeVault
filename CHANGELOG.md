@@ -4,7 +4,44 @@
 
 ## [未发布]
 
+### 新增
+
+- **导入时创建批量任务**：拖入导入确认框新增「导入后」选项（自动打标 / 自动美学评分 / 自动溯源），
+  导入完成后自动对本次新增的图片提交对应批量任务
+- **美学批量强制重评**：图库与主目录的批量操作新增「强制重评（覆盖已有分数）」勾选，
+  忽略"已有美学分"过滤，重新评分并覆盖旧分数
+
 ### 修复
+
+- **拖入导入失效（拖入窗口显示 STOP 拒绝光标）**：wry 0.55.1 在 WebView2 上先调用
+  `SetAllowExternalDrop(false)` 关闭内置拖放，再以 `RevokeDragDrop(hwnd) != DRAGDROP_E_INVALIDHWND`
+  为前提注册自己的 OLE `IDropTarget`——关闭内置拖放后子窗口一般没有既有 target，
+  该条件短路导致注册被跳过，系统层面没有任何可接受拖放的目标窗口：
+  拖入显示拒绝光标，`DragDropEvent` 也永不触发。
+  修复：壳层新增 `src-tauri/src/drag_drop.rs`，在窗口及其子窗口上**无条件**注册 `IDropTarget`，
+  通过 Tauri 事件 `moevault://drag-drop` 把路径转发给前端；前端同时监听原生通道与官方通道。
+  顺带修复拖入导入忽略「默认导入方式」设置（此前硬编码为 move）。
+
+- **运行时数据迁移到安装目录**：venv、模型、缓存等大体积文件默认放在 `<安装目录>\runtime\`，
+  不再占用 C 盘（本机原占用 11.8 GB）。安装目录不可写时自动回退 `%LOCALAPPDATA%`；
+  可用环境变量 `MOEVAULT_RUNTIME_DIR` 显式指定
+- **打标 GPU 加速**：支持 onnxruntime-gpu（与 CPU 版共存），打标可真正跑在 CUDA 上；
+  设置页「推理设备」新增能力提示（GPU 是否就绪 / 缺 onnxruntime-gpu 时给出安装引导）
+
+### 修复
+
+- **批量打标不调用 GPU**（三层原因）：
+  1. venv 内为 CPU 版 onnxruntime，无 `CUDAExecutionProvider` → 装 `onnxruntime-gpu` 共存
+  2. `tagger_device` 设置**从未下发**到推理服务（后端无该字段）→ 打通
+     设置 → 后端 `InferClient.with_device` → `/infer/tagger/config`、`/infer/tags` 全链路
+  3. `/devices` 用 `ort_cuda or torch_cuda` 判定打标能力，装 CUDA 版 torch（美学用）时
+     会虚报打标 CUDA 选项，选中后静默回落 CPU → 改为**只依据 onnxruntime 自身能力**，
+     并返回 `capabilities` 供前端提示
+- `/infer/tagger/config` 支持 `model_dir` 为空（仅切换设备），修复“自动探测模型 + 选 GPU”无法生效
+- 选显卡时支持 `cuda:N` 指定具体 GPU（onnxruntime `device_id` / torch `cuda:N`）
+- 美学模型设备动态化：`set_device` 可在已加载模型上迁移设备，不再硬编码 `to("cuda")`
+
+### 修复（续）
 
 - **批量溯源限流**：SauceNAO 限流状态码 `-2`（Search Rate Too High）此前被当作普通错误——整批图被误判失败且冷却调度不合理。现改为：
   - `-2` / `3` 统一识别为限流，按 `retry_in` 等待

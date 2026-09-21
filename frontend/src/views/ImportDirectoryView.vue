@@ -46,6 +46,8 @@ const dirLoading = ref<Record<string, boolean>>({})
 const selected = ref<Set<number>>(new Set())
 const selectedCount = computed(() => selected.value.size)
 const forceSauce = ref(false)
+/** 增强1：美学批量评分是否强制重评（忽略已有分数，覆盖旧分数）。 */
+const forceAesthetic = ref(false)
 /** 增强3：溯源后自动替换更清晰的原图（大小比对 + 严格查重）。 */
 const autoReplaceSauce = ref(false)
 
@@ -236,7 +238,7 @@ async function onBatchAesthetic(ids?: number[]) {
   const list = ids ?? [...selected.value]
   if (list.length === 0) return
   try {
-    await taskStore.enqueueAesthetic(list)
+    await taskStore.enqueueAesthetic(list, forceAesthetic.value)
     if (!ids) selected.value = new Set()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -573,6 +575,9 @@ async function onSelectAll() {
         <el-option label="AI 检测" value="ai-detect" :disabled="batchActions.includes('export')" />
         <el-option label="导出" value="export" :disabled="batchActions.length > 0 && !batchActions.includes('export')" />
       </el-select>
+      <el-checkbox v-if="batchActions.includes('aesthetic')" v-model="forceAesthetic" size="small">
+        强制重评（覆盖已有分数）
+      </el-checkbox>
       <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制溯源</el-checkbox>
       <el-checkbox v-if="batchActions.includes('sauce')" v-model="autoReplaceSauce" size="small">原图替换</el-checkbox>
       <el-button

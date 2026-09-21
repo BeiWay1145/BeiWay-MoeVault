@@ -755,9 +755,15 @@ interface DeviceOption {
 }
 const taggerDevices = ref<DeviceOption[]>([])
 const aestheticDevices = ref<DeviceOption[]>([])
+/** 推理能力诊断（来自 /devices）：用于提示"打标 CUDA 是否真的可用"。 */
+const inferCaps = ref<{ tagger_cuda?: boolean; tagger_providers?: string[]; aesthetic_cuda?: boolean } | null>(null)
 async function loadDevices() {
   try {
-    const d = await get<{ devices: DeviceOption[] }>('/devices')
+    const d = await get<{
+      devices: DeviceOption[]
+      capabilities?: { tagger_cuda?: boolean; tagger_providers?: string[]; aesthetic_cuda?: boolean }
+    }>('/devices')
+    inferCaps.value = d.capabilities ?? null
     // 打标设备：onnxruntime 的 cuda/cpu；美学设备：torch 的 cuda:/cpu
     const all = d.devices
     taggerDevices.value = [
@@ -991,6 +997,14 @@ onMounted(async () => {
               <el-select v-model="settings.settings.tagger_device" style="width: 260px">
                 <el-option v-for="d in taggerDevices" :key="d.id" :label="d.name" :value="d.id" />
               </el-select>
+              <span v-if="inferCaps && inferCaps.tagger_cuda === false" class="hint hint-warn">
+                打标当前只能跑 CPU：onnxruntime 未提供 CUDAExecutionProvider
+                （已安装的 providers：{{ (inferCaps.tagger_providers || []).join('、') || '未知' }}）。
+                如需 GPU 打标，请在推理环境安装 onnxruntime-gpu。
+              </span>
+              <span v-else-if="inferCaps && inferCaps.tagger_cuda" class="hint">
+                打标 GPU 可用（CUDAExecutionProvider 已就绪）
+              </span>
               <span class="hint">GPU 加速打标（下次任务生效）</span>
             </el-form-item>
           </el-form>
@@ -1280,6 +1294,9 @@ onMounted(async () => {
   border-radius: 6px;
   padding: 8px;
   background: var(--el-fill-color-lighter);
+}
+.hint-warn {
+  color: var(--el-color-warning);
 }
 .rate-window-alert {
   margin-bottom: 10px;

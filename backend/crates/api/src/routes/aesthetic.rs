@@ -25,8 +25,11 @@ pub fn router() -> Router<AppState> {
 
 #[derive(Debug, Deserialize)]
 pub struct RunAestheticRequest {
-    /// 指定 image_ids 强制重评分；None = 全部未评分 active 图。
+    /// 指定 image_ids；None = 全部未评分 active 图。
     pub force_ids: Option<Vec<i64>>,
+    /// 增强1：强制重新评分（忽略"已有美学分"过滤，覆盖旧分数）。
+    #[serde(default)]
+    pub force: bool,
 }
 
 async fn run_aesthetic(
@@ -35,6 +38,7 @@ async fn run_aesthetic(
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     let st = state.clone();
     let force_ids = req.force_ids;
+    let force = req.force;
 
     // 创建任务记录
     let payload = force_ids
@@ -48,19 +52,32 @@ async fn run_aesthetic(
     .map_err(super::join_error_response)?
     .map_err(super::db_error_response)?;
 
-    let infer = Arc::new(InferClient::new(state.infer_base_url.clone()));
+    // 推理设备：从设置读取（auto / cuda:0 / cpu），透传给推理服务
+    let device = {
+        let db = state.db.clone();
+        tokio::task::spawn_blocking(move || db.get_setting("aesthetic_device").ok().flatten())
+            .await
+            .ok()
+            .flatten()
+            .filter(|d| !d.trim().is_empty())
+    };
+    if let Some(d) = device.as_deref() {
+        tracing::info!(device = d, "美学任务推理设备");
+    }
+    let infer = Arc::new(InferClient::new(state.infer_base_url.clone()).with_device(device.clone()));
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
-        let _ = db.add_log("info", "aesthetic", &format!("美学任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
+        let _ = db.add_log("info", "aesthetic", &format!("美学任务 #{job_id} 启动（{} 张，设备 {}{}）", force_ids.as_ref().map_or(0, |v| v.len()), device.as_deref().unwrap_or("auto"), if force { "，强制重评" } else { "" }));
         let result = moevault_tagger::run_aesthetic_pipeline(
             &db,
             &infer,
             &library_dir,
             force_ids,
             Some(job_id),
+            force,
         )
         .await;
         let (status, done, failed, error) = match &result {
@@ -125,7 +142,15 @@ async fn rescore_image(
     .map_err(super::join_error_response)?
     .map_err(super::db_error_response)?;
 
-    let infer = Arc::new(InferClient::new(state.infer_base_url.clone()));
+    let device = {
+        let db = state.db.clone();
+        tokio::task::spawn_blocking(move || db.get_setting("aesthetic_device").ok().flatten())
+            .await
+            .ok()
+            .flatten()
+            .filter(|d| !d.trim().is_empty())
+    };
+    let infer = Arc::new(InferClient::new(state.infer_base_url.clone()).with_device(device));
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {
@@ -137,6 +162,7 @@ async fn rescore_image(
             &library_dir,
             Some(vec![id]),
             Some(job_id),
+            true, // 单张重评：始终强制
         )
         .await;
         let (status, done, failed, error) = match &result {

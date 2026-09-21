@@ -47,23 +47,48 @@ _aesthetic = AestheticModel()
 _infer_lock = threading.Lock()
 
 
+def _apply_tagger_device(device: str | None) -> None:
+    """按请求指定推标设备（None = 不改动）。仅在变化时重载，避免每张图都重建 session。"""
+    if not device:
+        return
+    want = str(device).strip()
+    if not want or want == _tagger.device:
+        return
+    _tagger.set_device(want)
+
+
+def _apply_aesthetic_device(device: str | None) -> None:
+    """按请求指定美学设备（None = 不改动）。"""
+    if not device:
+        return
+    want = str(device).strip()
+    if not want or want == _aesthetic.device:
+        return
+    _aesthetic.set_device(want)
+
+
 # ---------- 请求模型 ----------
+# device：None/缺省 = 不干预（沿用当前设备）；"auto" / "cuda:0" / "cpu" 可显式指定
 class TagRequest(BaseModel):
     path: str
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    device: str | None = None
 
 
 class BatchTagRequest(BaseModel):
     paths: list[str]
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    device: str | None = None
 
 
 class AestheticRequest(BaseModel):
     path: str
+    device: str | None = None
 
 
 class BatchAestheticRequest(BaseModel):
     paths: list[str]
+    device: str | None = None
 
 
 # ---------- 工具 ----------
@@ -136,17 +161,21 @@ def devices():
 
     # 打标：onnxruntime 可用 providers（CUDA provider 存在即 GPU 可用）
     ort_cuda = False
+    ort_available = False
     try:
         import onnxruntime as ort
 
+        ort_available = True
         for p in ort.get_available_providers():
             if "CUDA" in p:
                 ort_cuda = True
     except Exception:
         pass
 
-    # 打标设备：GPU 存在（onnxruntime CUDA 或 torch CUDA）→ 逐卡列出；否则 CPU
-    if ort_cuda or torch_cuda:
+    # 打标设备：**只能依据 onnxruntime 自身能力**判断。
+    # 早期版本用 `ort_cuda or torch_cuda`，导致装了 CUDA 版 torch（美学用）时，
+    # 即使 onnxruntime 是 CPU 版也会列出 CUDA 选项，选中后静默回落到 CPU（误导性 UI）。
+    if ort_cuda:
         if gpus:
             for i, name in gpus:
                 result.append({"id": f"cuda:{i}", "name": f"CUDA GPU{i + 1}（{name}）", "kind": "tagger"})
@@ -160,30 +189,53 @@ def devices():
             result.append({"id": f"cuda:{i}", "name": f"CUDA GPU{i + 1}（{name}）", "kind": "aesthetic"})
     else:
         result.append({"id": "cpu", "name": f"CPU（{cpu_name}）", "kind": "aesthetic"})
-    return {"devices": result}
+    # 诊断：把两侧能力如实告知前端（用于禁用不可用选项 / 给出安装提示）
+    return {
+        "devices": result,
+        "capabilities": {
+            "tagger_cuda": ort_cuda,
+            "tagger_providers": sorted(ort.get_available_providers()) if ort_available else [],
+            "aesthetic_cuda": torch_cuda,
+        },
+    }
 
 
 # ---------- 打标 ----------
 class TaggerConfigRequest(BaseModel):
-    model_dir: str
+    # 为空 = 不切换目录，仅应用 device（"自动探测模型 + 选 GPU" 场景必需）
+    model_dir: str = ""
     # 可选：cl_tagger / wd14 / auto（缺省 auto=按目录内容判定）
     model_kind: str | None = None
+    # 推理设备：auto / cuda:0 / cpu；None = 不改动
+    device: str | None = None
 
 
 @app.post("/infer/tagger/config")
 def tagger_config(req: TaggerConfigRequest):
-    """切换打标模型目录/种类（重新加载模型）。"""
+    """切换打标模型目录/种类 和/或 推理设备（重新加载模型）。
+
+    model_dir 为空时仅应用 device，保留已加载的模型目录。
+    """
     import os
 
-    if not os.path.isdir(req.model_dir):
-        raise HTTPException(status_code=404, detail=f"模型目录不存在: {req.model_dir}")
+    model_dir = (req.model_dir or "").strip()
+    device = (req.device or "").strip() or None
+    if not model_dir and device is None:
+        raise HTTPException(status_code=422, detail="model_dir 与 device 至少需要一个")
+    if model_dir and not os.path.isdir(model_dir):
+        raise HTTPException(status_code=404, detail=f"模型目录不存在: {model_dir}")
     try:
         with _infer_lock:
-            _tagger.load_from_dir(req.model_dir, kind=req.model_kind)
+            if model_dir:
+                _tagger.load_from_dir(model_dir, kind=req.model_kind, device=device or "auto")
+            elif device is not None:
+                _tagger.set_device(device)
         return {
             "ok": True,
             "model_dir": _tagger.model_dir,
             "model_kind": _tagger.kind,
+            "device": _tagger.device,
+            "providers": _tagger.providers,
             "tags": len(_tagger._idx_to_tag),
         }
     except Exception as e:  # noqa: BLE001
@@ -192,13 +244,17 @@ def tagger_config(req: TaggerConfigRequest):
 
 class AestheticConfigRequest(BaseModel):
     kind: str  # qalign / anime（议题4：二次元美学模型切换）
+    device: str | None = None  # 推理设备：auto / cuda:0 / cpu；None = 不改动
 
 
 @app.post("/infer/aesthetic/config")
 def aesthetic_config(req: AestheticConfigRequest):
-    """切换美学模型种类（qalign/anime，下次评分生效）。"""
+    """切换美学模型种类与推理设备（下次评分生效）。"""
     _aesthetic.set_kind(req.kind)
-    return {"ok": True, "kind": _aesthetic.kind}
+    device = (req.device or "").strip()
+    if device:
+        _aesthetic.set_device(device)
+    return {"ok": True, "kind": _aesthetic.kind, "device": _aesthetic.device}
 
 
 @app.post("/infer/tags")
@@ -207,10 +263,13 @@ def infer_tags(req: TagRequest):
     t0 = time.perf_counter()
     try:
         with _infer_lock:
+            _apply_tagger_device(req.device)
             tags = _tagger.infer(req.path, req.threshold)
         return {
             "tags": [{"name": k, "confidence": v} for k, v in tags.items()],
             "model": _tagger.kind or "unknown",
+            "device": _tagger.device,
+            "providers": _tagger.providers,
             "elapsed_ms": time_ms(t0),
         }
     except Exception as e:  # noqa: BLE001
@@ -227,6 +286,7 @@ def infer_tags_batch(req: BatchTagRequest):
         t0 = time.perf_counter()
         try:
             with _infer_lock:
+                _apply_tagger_device(req.device)
                 tags = _tagger.infer(p, req.threshold)
             results.append(
                 {
@@ -248,6 +308,7 @@ def infer_aesthetic(req: AestheticRequest):
     t0 = time.perf_counter()
     try:
         with _infer_lock:
+            _apply_aesthetic_device(req.device)
             out = _aesthetic.score(req.path)
         out["elapsed_ms"] = time_ms(t0)
         return out
@@ -265,6 +326,7 @@ def infer_aesthetic_batch(req: BatchAestheticRequest):
         t0 = time.perf_counter()
         try:
             with _infer_lock:
+                _apply_aesthetic_device(req.device)
                 out = _aesthetic.score(p)
             out["elapsed_ms"] = time_ms(t0)
             results.append({"path": p, "ok": True, **out})

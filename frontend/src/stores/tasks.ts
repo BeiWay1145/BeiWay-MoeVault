@@ -166,11 +166,14 @@ export const useTaskStore = defineStore('tasks', () => {
     return r
   }
 
-  /** 提交美学任务。 */
-  async function enqueueAesthetic(ids: number[]) {
-    const r = await post<{ started: boolean; job_id: number; kind: string }>('/aesthetic/run', { force_ids: ids })
+  /** 提交美学任务。force=true 时忽略「已有美学分」过滤，强制重新评分（覆盖旧分数）。 */
+  async function enqueueAesthetic(ids: number[], force = false) {
+    const r = await post<{ started: boolean; job_id: number; kind: string }>('/aesthetic/run', {
+      force_ids: ids,
+      force,
+    })
     notifyEnqueued(r.kind, r.job_id, ids.length)
-    reportLog(`提交批量美学任务 #${r.job_id}（${ids.length} 张）`)
+    reportLog(`提交批量美学任务 #${r.job_id}（${ids.length} 张${force ? '，强制重评' : ''}）`)
     load()
     return r
   }

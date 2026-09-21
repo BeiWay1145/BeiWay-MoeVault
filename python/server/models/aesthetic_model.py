@@ -23,6 +23,8 @@ class AestheticModel:
         self._model = None
         self._processor = None
         self._load_error = None
+        # 推理设备：auto / cuda / cuda:N / cpu（auto = 有 CUDA 就用）
+        self._device = "auto"
         # anime 后端独立的模型句柄（切换 kind 时互不干扰）
         self._anime_model = None
         self._anime_processor = None
@@ -37,6 +39,49 @@ class AestheticModel:
         kind = (kind or "").strip().lower()
         if kind in ("qalign", "anime"):
             self._kind = kind
+
+    # ---------- device ----------
+    @property
+    def device(self) -> str:
+        return self._device
+
+    def set_device(self, device: str) -> None:
+        """切换推理设备；已加载的模型立即迁移到新设备（不重新下载权重）。
+
+        device：auto / cuda / cuda:N / cpu
+        """
+        device = (str(device) or "").strip().lower() or "auto"
+        with self._lock:
+            if device == self._device:
+                return
+            self._device = device
+            try:
+                import torch
+
+                target = self._torch_device(torch)
+                if self._model is not None:
+                    self._model = self._model.to(target)
+                if self._anime_model is not None:
+                    self._anime_model = self._anime_model.to(target)
+            except Exception as e:  # noqa: BLE001
+                self._load_error = f"{type(e).__name__}: {e}"
+
+    def _torch_device(self, torch):
+        """把 device 字符串解析成 torch.device（不可用时回落 cpu）。"""
+        want = self._device or "auto"
+        has_cuda = torch.cuda.is_available()
+        if want == "auto":
+            return torch.device("cuda" if has_cuda else "cpu")
+        if want.startswith("cuda"):
+            if not has_cuda:
+                return torch.device("cpu")
+            if ":" in want:
+                try:
+                    return torch.device("cuda", int(want.split(":", 1)[1]))
+                except (ValueError, RuntimeError):
+                    return torch.device("cuda")
+            return torch.device("cuda")
+        return torch.device("cpu")
 
     # ---------- 加载 ----------
     def load(self) -> None:
@@ -57,8 +102,7 @@ class AestheticModel:
             self._processor = AutoImageProcessor.from_pretrained(model_ref)
             self._model = AutoModelForImageClassification.from_pretrained(model_ref)
             self._model.eval()
-            if torch.cuda.is_available():
-                self._model = self._model.to("cuda")
+            self._model = self._model.to(self._torch_device(torch))
             self._load_error = None
         except Exception as e:  # noqa: BLE001
             self._load_error = f"{type(e).__name__}: {e}"
@@ -87,8 +131,7 @@ class AestheticModel:
             self._anime_processor = ViTImageProcessor.from_pretrained(model_ref, use_fast=True)
             self._anime_model = ViTForImageClassification.from_pretrained(model_ref, torch_dtype=torch.float32)
             self._anime_model.eval()
-            if torch.cuda.is_available():
-                self._anime_model = self._anime_model.to("cuda")
+            self._anime_model = self._anime_model.to(self._torch_device(torch))
             self._anime_load_error = None
         except Exception as e:  # noqa: BLE001
             self._anime_load_error = f"{type(e).__name__}: {e}"
@@ -117,8 +160,9 @@ class AestheticModel:
         self.load()
         image = Image.open(image_path).convert("RGB")
         inputs = self._processor(images=image, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        target = self._torch_device(torch)
+        if target.type == "cuda":
+            inputs = {k: v.to(target) for k, v in inputs.items()}
         with torch.no_grad():
             out = self._model(**inputs)
         raw = float(out.logits.reshape(-1)[0])
@@ -148,8 +192,9 @@ class AestheticModel:
         background = Image.new("RGBA", image.size, (255, 255, 255))
         image = Image.alpha_composite(background, image).convert("RGB")
         inputs = self._anime_processor(images=image, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        target = self._torch_device(torch)
+        if target.type == "cuda":
+            inputs = {k: v.to(target) for k, v in inputs.items()}
         with torch.no_grad():
             logits = self._anime_model(**inputs).logits
             probs = torch.softmax(logits, dim=-1)

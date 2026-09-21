@@ -302,8 +302,10 @@ pub struct RetagRequest {
     pub force_sauce: Option<bool>,
 }
 
-/// 从 settings 表读取打标配置。返回 (api_keys, min_sim, tag_threshold, model_dir, model_kind)。
+/// 从 settings 表读取打标配置。
+/// 返回 (api_keys, min_sim, tag_threshold, model_dir, model_kind, device)。
 /// 多 key 优先读 saucenao_keys JSON（含名称/等级），回退旧逗号分隔。
+/// device：auto / cuda:0 / cpu 等，透传给推理服务决定 onnxruntime provider。
 #[allow(clippy::type_complexity)]
 pub(crate) fn read_tag_config_public(
     db: &moevault_db::Db,
@@ -312,6 +314,7 @@ pub(crate) fn read_tag_config_public(
         Vec<moevault_core::models::SauceNaoKey>,
         f64,
         f64,
+        Option<String>,
         Option<String>,
         Option<String>,
     ),
@@ -362,7 +365,12 @@ pub(crate) fn read_tag_config_public(
     let model_kind = db
         .get_setting("tagger_model_kind")
         .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
-    Ok((keys, min_sim, tag_threshold, model_dir, model_kind))
+    // 推理设备：auto（默认，由服务端按可用 provider 自动选）/ cuda:0 / cpu
+    let device = db
+        .get_setting("tagger_device")
+        .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?
+        .filter(|v| !v.trim().is_empty());
+    Ok((keys, min_sim, tag_threshold, model_dir, model_kind, device))
 }
 
 /// 获取/初始化全局 SauceNAO key pool（含持久化恢复）。
@@ -399,24 +407,32 @@ pub(crate) async fn init_pool_public(
     Ok(pool)
 }
 
-/// 通知推理服务切换打标模型目录/种类（可选）。
-/// 空/未设置 = 自动探测模式：跳过切换，推理服务保持其自动探测到的目录/种类。
+/// 通知推理服务应用打标配置（模型目录/种类 + 推理设备）。
+/// 模型目录为空 = 自动探测模式：不下发 model_dir（服务端沿用自动探测结果），
+/// 但**设备仍会下发**——否则「自动探测模型 + 选择 GPU」的组合永远无法生效。
 async fn sync_tagger_model(
     state: &AppState,
     model_dir: &Option<String>,
     model_kind: &Option<String>,
+    device: &Option<String>,
 ) {
-    if let Some(dir) = model_dir {
-        if dir.trim().is_empty() {
-            return; // 自动探测模式，无需切换
-        }
+    let dir = model_dir
+        .clone()
+        .filter(|d| !d.trim().is_empty());
+    // 目录与设备都未指定 → 无需打扰服务端
+    if dir.is_none() && device.as_deref().map(|d| d.trim().is_empty()).unwrap_or(true) {
+        return;
+    }
+    {
         let st = state.clone();
-        let dir = dir.clone();
         let kind = model_kind.clone().filter(|k| !k.trim().is_empty());
+        let dev = device.clone().filter(|d| !d.trim().is_empty());
         tokio::spawn(async move {
-            let infer = InferClient::new(st.infer_base_url.clone());
-            if let Err(e) = infer.use_tagger_model(&dir, kind.as_deref()).await {
-                tracing::warn!(error = %e, "切换打标模型失败");
+            let infer = InferClient::new(st.infer_base_url.clone()).with_device(dev);
+            // 目录为空时用当前目录占位，仅把 device 送下去（服务端按 model_dir 空值处理为"不改目录"）
+            let dir_arg = dir.unwrap_or_default();
+            if let Err(e) = infer.use_tagger_model(&dir_arg, kind.as_deref()).await {
+                tracing::warn!(error = %e, "应用打标配置失败");
             }
         });
     }
@@ -431,7 +447,7 @@ async fn run_tagging(
 
     // 从 settings 读配置（spawn_blocking 包同步 DB 访问）
     let db_for_config = state.db.clone();
-    let (api_keys, min_sim, tag_threshold, model_dir, model_kind) =
+    let (api_keys, min_sim, tag_threshold, model_dir, model_kind, tagger_device) =
         tokio::task::spawn_blocking(move || read_tag_config_public(&db_for_config))
             .await
             .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -457,11 +473,11 @@ async fn run_tagging(
     .map_err(db_error_response)?;
 
     // 同步打标模型目录/种类到推理服务
-    sync_tagger_model(&state, &model_dir, &model_kind).await;
+    sync_tagger_model(&state, &model_dir, &model_kind, &tagger_device).await;
 
     let pool = init_pool_public(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
-    let infer = InferClient::new(infer_base);
+    let infer = InferClient::new(infer_base).with_device(tagger_device.clone());
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {
@@ -516,7 +532,7 @@ async fn run_sauce(
 
     // 配置
     let db_for_config = state.db.clone();
-    let (api_keys, min_sim, _, _, _) = tokio::task::spawn_blocking(move || {
+    let (api_keys, min_sim, _, _, _, _) = tokio::task::spawn_blocking(move || {
         read_tag_config_public(&db_for_config)
     })
     .await
@@ -719,7 +735,7 @@ async fn retag_image(
     let st = state.clone();
     // 配置
     let db_for_config = state.db.clone();
-    let (api_keys, min_sim, tag_threshold, model_dir, model_kind) =
+    let (api_keys, min_sim, tag_threshold, model_dir, model_kind, tagger_device) =
         tokio::task::spawn_blocking(move || read_tag_config_public(&db_for_config))
             .await
             .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -739,11 +755,11 @@ async fn retag_image(
     .map_err(db_error_response)?;
 
     // 同步打标模型目录/种类到推理服务
-    sync_tagger_model(&state, &model_dir, &model_kind).await;
+    sync_tagger_model(&state, &model_dir, &model_kind, &tagger_device).await;
 
     let pool = init_pool_public(&state, &api_keys).await?;
     let sauce = Arc::new(SauceNaoClient::new(min_sim));
-    let infer = InferClient::new(infer_base);
+    let infer = InferClient::new(infer_base).with_device(tagger_device.clone());
     let library_dir = st.library_dir();
 
     tokio::spawn(async move {

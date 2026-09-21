@@ -7,10 +7,11 @@
  */
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
+import { useTaskStore } from '@/stores/tasks'
 import { useRouter } from 'vue-router'
 import { FolderOpened, Document, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { post } from '@/api/client'
+import { get, post } from '@/api/client'
 import { reportLog } from '@/api/log'
 import { isTauri } from '@/api/infer'
 
@@ -31,8 +32,13 @@ const dialogVisible = ref(false)
 const paths = ref<string[]>([])
 // 功能增强2：默认导入方式取自通用设置（确认框内可临时切换）
 const settingsStore = useSettingsStore()
+const taskStore = useTaskStore()
 const mode = ref<'move' | 'copy'>(settingsStore.settings.import_default_mode ?? 'move')
 const submitting = ref(false)
+// 增强2：导入完成后自动提交的批量任务（对本次导入的新图生效）
+const postTasks = ref<string[]>([])
+/** 保存待跟进的任务配置：导入完成事件到达后据此提交。 */
+let pendingFollowUp: { batchId: number; tasks: string[]; baselineId: number } | null = null
 
 /** 打开确认框时刷新默认导入方式。 */
 watch(dialogVisible, (v) => {
@@ -68,7 +74,8 @@ async function onDragDropEvent(e: DragDropEventWrapper) {
         return
       }
       paths.value = dropped
-      mode.value = 'move'
+      // 尊重通用设置里的默认导入方式（此前硬编码 move，忽略了用户设置）
+      mode.value = settingsStore.settings.import_default_mode ?? 'move'
       dialogVisible.value = true
       break
     }
@@ -76,21 +83,82 @@ async function onDragDropEvent(e: DragDropEventWrapper) {
 }
 
 let unlisten: (() => void) | null = null
+let unlistenNative: (() => void) | null = null
+
+/**
+ * 壳层原生拖放事件（`moevault://drag-drop`）的回调。
+ *
+ * 背景：wry 0.55.1 在 WebView2 上注册 OLE IDropTarget 的条件过于苛刻，
+ * 导致系统层面无接受拖放的目标（拖入显示 STOP 拒绝光标），
+ * Tauri 官方的 onDragDropEvent 也就永远不会触发。
+ * 壳层改用自己注册的 IDropTarget（见 src-tauri/src/drag_drop.rs），
+ * 事件通过下面的通道转发；两条通道同时监听，谁生效都能工作。
+ */
+interface NativeDropEvent {
+  type: 'enter' | 'over' | 'drop' | 'leave'
+  paths?: string[]
+  position?: [number, number]
+}
+function onNativeDropEvent(ev: NativeDropEvent) {
+  onDragDropEvent({ payload: { type: ev.type, paths: ev.paths } })
+}
+
+const taskLabel = (t: string) => ({ tag: '打标', aesthetic: '美学评分', sauce: '溯源' })[t] ?? t
+
+/** 增强2：导入完成后，对本次导入的图片自动提交所选任务。 */
+async function onImportFinished(e: Event) {
+  const cfg = pendingFollowUp
+  if (!cfg) return
+  const d = (e as CustomEvent).detail as { batch_id?: number }
+  if (d?.batch_id !== cfg.batchId) return
+  pendingFollowUp = null
+  try {
+    // 取本次新增的图片 id（id 大于导入前的最大 id；新图按 id 递增写入）
+    const r = await get<{ items: { id: number }[] }>('/images?limit=50&sort=imported&order=desc')
+    const ids = (r.items ?? []).map((i) => i.id).filter((id) => id > cfg.baselineId)
+    if (ids.length === 0) {
+      ElMessage.warning('导入完成，但没有可提交的图片（可能全部为重复图）')
+      return
+    }
+    for (const task of cfg.tasks) {
+      if (task === 'tag') await taskStore.enqueueTag(ids)
+      else if (task === 'aesthetic') await taskStore.enqueueAesthetic(ids)
+      else if (task === 'sauce') await taskStore.enqueueSauce(ids)
+    }
+    ElMessage.success(`已为导入的 ${ids.length} 张图提交：${cfg.tasks.map(taskLabel).join('、')}`)
+  } catch (err) {
+    ElMessage.error(`导入后自动提交任务失败：${(err as Error).message}`)
+  }
+}
 
 onMounted(async () => {
   if (!isTauri()) return
+  window.addEventListener('moevault:import-done', onImportFinished)
+  // 通道 1：壳层原生 IDropTarget（Windows 上的主通道）
+  try {
+    const { listen } = await import('@tauri-apps/api/event')
+    unlistenNative = await listen<NativeDropEvent>('moevault://drag-drop', (e) =>
+      onNativeDropEvent(e.payload),
+    )
+  } catch (e) {
+    console.warn('[DragImport] 原生拖放监听注册失败', e)
+  }
+  // 通道 2：Tauri 官方 drag-drop（其它平台 / 未来版本恢复时可用）
   try {
     const { getCurrentWebview } = await import('@tauri-apps/api/webview')
     unlisten = await getCurrentWebview().onDragDropEvent(onDragDropEvent)
   } catch (e) {
     // 拖放监听失败不应阻塞应用：降级为无拖入功能
-    console.error('[DragImport] 注册拖放监听失败', e)
+    console.warn('[DragImport] 注册 webview 拖放监听失败', e)
   }
 })
 
 onUnmounted(() => {
+  window.removeEventListener('moevault:import-done', onImportFinished)
   unlisten?.()
   unlisten = null
+  unlistenNative?.()
+  unlistenNative = null
 })
 
 /** 确认导入：与 TopBar 手动导入同一后端契约（POST /api/v1/import）。 */
@@ -99,9 +167,23 @@ async function onConfirm() {
   const modeLabel = mode.value === 'copy' ? '复制进库' : '移动进库'
   submitting.value = true
   try {
+    // 增强2：先记录当前最大图片 id，导入完成后据此圈定"本次新增的图"
+    let baselineId = 0
+    if (postTasks.value.length > 0) {
+      try {
+        const s = await get<{ items: { id: number }[] }>('/images?limit=1&sort=imported&order=desc')
+        baselineId = s.items?.[0]?.id ?? 0
+      } catch {
+        baselineId = 0
+      }
+    }
     const res = await post<{ batch_id: number }>('/import', { paths: paths.value, mode: mode.value })
-    ElMessage.success(`导入任务 #${res.batch_id} 已创建（${modeLabel}，共 ${paths.value.length} 个路径）`)
-    reportLog(`拖入导入：提交任务 #${res.batch_id}（${paths.value.length} 个路径，${modeLabel}）`)
+    // 记录导入后要自动提交的批量任务（等导入完成事件再对新图提交）
+    pendingFollowUp =
+      postTasks.value.length > 0 ? { batchId: res.batch_id, tasks: [...postTasks.value], baselineId } : null
+    const followHint = postTasks.value.length > 0 ? `，导入完成后自动提交：${postTasks.value.map(taskLabel).join('、')}` : ''
+    ElMessage.success(`导入任务 #${res.batch_id} 已创建（${modeLabel}，共 ${paths.value.length} 个路径${followHint}）`)
+    reportLog(`拖入导入：提交任务 #${res.batch_id}（${paths.value.length} 个路径，${modeLabel}${followHint}）`)
     dialogVisible.value = false
     paths.value = []
     if (router.currentRoute.value.name === 'imports') {
@@ -155,6 +237,14 @@ async function onConfirm() {
           <el-radio value="move">移动进库（源位置清空）</el-radio>
           <el-radio value="copy">复制进库（保留源文件）</el-radio>
         </el-radio-group>
+      </el-form-item>
+      <el-form-item label="导入后">
+        <el-checkbox-group v-model="postTasks">
+          <el-checkbox value="tag">自动打标</el-checkbox>
+          <el-checkbox value="aesthetic">自动美学评分</el-checkbox>
+          <el-checkbox value="sauce">自动溯源</el-checkbox>
+        </el-checkbox-group>
+        <div class="follow-hint">导入完成后，对本次导入的图片自动创建对应批量任务（不勾选则不提交）</div>
       </el-form-item>
       <el-alert
         v-if="mode === 'move'"
@@ -212,6 +302,11 @@ async function onConfirm() {
   opacity: 0;
 }
 
+.follow-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.5;
+}
 .path-summary {
   font-size: 13px;
   color: var(--el-text-color-secondary);

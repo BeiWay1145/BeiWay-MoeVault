@@ -9,6 +9,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+mod drag_drop;
+
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent, RunEvent};
 
@@ -122,6 +124,14 @@ pub fn run() {
         .build(app)
         .expect("托盘图标创建失败");
       std::mem::forget(_tray); // 防止 drop 移除托盘图标
+
+      // Windows 原生拖放：注册 IDropTarget（详见 drag_drop.rs 顶部说明）。
+      // wry 0.55.1 在 WebView2 上因 SetAllowExternalDrop(false) 后子窗口无既有 target，
+      // 注册被条件短路跳过 → 拖入显示 STOP 拒绝光标且事件永不触发。
+      if let Some(win) = app.get_webview_window("main") {
+        // 守卫交给 drag_drop 模块自身持有（COM 对象非 Send，不能放进全局 static）
+        drag_drop::install(&win);
+      }
 
       // 启动后端
       match start_backend() {
@@ -274,6 +284,8 @@ fn start_backend() -> std::io::Result<Child> {
   } else {
     eprintln!("[MoeVault] 警告: 未找到前端静态目录，根路径将 404");
   }
+  // 运行时目录：后端据此定位是否已有迁移数据（不直接使用，仅作诊断透出）
+  cmd.env("MOEVAULT_RUNTIME_DIR", runtime_root());
   // Windows：隐藏后端控制台窗口
   #[cfg(target_os = "windows")]
   {
@@ -469,30 +481,100 @@ fn kill_infer_port_owner() {
   }
 }
 
+/// 运行时数据根目录（venv / 模型 / 日志等大体积文件的家）。
+///
+/// 优先级：
+/// 1. 环境变量 `MOEVAULT_RUNTIME_DIR`（可显式指定，便于迁移与测试）
+/// 2. 安装根目录下的 `runtime/`（便携式：所有数据随软件走，不占用 C 盘）
+/// 3. `%LOCALAPPDATA%\BeiWay-MoeVault`（安装目录不可写时的回退，如只读安装位置）
+///
+/// 判定方式为**实际写入探测**：在候选目录创建并删除探针文件，成功即采用。
+/// 结果缓存，避免每次调用都做磁盘探测。
+fn runtime_root() -> PathBuf {
+  use std::sync::OnceLock;
+  static CACHED: OnceLock<PathBuf> = OnceLock::new();
+  CACHED
+    .get_or_init(|| {
+      // 1) 显式覆盖
+      if let Ok(v) = std::env::var("MOEVAULT_RUNTIME_DIR") {
+        let p = PathBuf::from(v);
+        if ensure_writable(&p) {
+          eprintln!("[MoeVault] 运行时目录（环境变量）: {}", p.display());
+          return p;
+        }
+        eprintln!("[MoeVault] 警告: MOEVAULT_RUNTIME_DIR 不可写，改用默认位置");
+      }
+      // 2) 安装根目录/runtime
+      if let Some(root) = install_root() {
+        let candidate = root.join("runtime");
+        if ensure_writable(&candidate) {
+          eprintln!("[MoeVault] 运行时目录（安装根目录）: {}", candidate.display());
+          return candidate;
+        }
+        eprintln!(
+          "[MoeVault] 安装目录不可写，回退用户数据目录: {}",
+          candidate.display()
+        );
+      }
+      // 3) 用户数据目录回退
+      let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+      let fallback = base.join("BeiWay-MoeVault");
+      let _ = std::fs::create_dir_all(&fallback);
+      eprintln!("[MoeVault] 运行时目录（用户数据）: {}", fallback.display());
+      fallback
+    })
+    .clone()
+}
+
+/// 安装根目录（exe 所在目录；debug 下为 workspace 根）。
+fn install_root() -> Option<PathBuf> {
+  if cfg!(debug_assertions) {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    return Some(PathBuf::from(manifest).join(".."));
+  }
+  std::env::current_exe()
+    .ok()
+    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+}
+
+/// 探测目录是否可写（创建即删的探针文件）。目录不存在时尝试创建。
+fn ensure_writable(dir: &std::path::Path) -> bool {
+  if std::fs::create_dir_all(dir).is_err() {
+    return false;
+  }
+  let probe = dir.join(".moevault_write_probe");
+  match std::fs::write(&probe, b"1") {
+    Ok(()) => {
+      let _ = std::fs::remove_file(&probe);
+      true
+    }
+    Err(_) => false,
+  }
+}
+
 /// 定位推理服务 python 目录（server 包所在目录）。
 /// - debug：workspace 根 python/
-/// - release：%LOCALAPPDATA%\BeiWay-MoeVault\python（可写）；每次启动从安装目录资源同步
-///   （安装目录 Program Files 通常无写权限，运行时代码/日志/venv 一律放用户数据目录）
+/// - release：<运行时根目录>\python；每次启动从安装目录资源同步源码
+///   （venv/日志/model 等大体积运行期产物留在运行时目录，不污染安装目录也不占 C 盘）
 fn infer_python_dir() -> PathBuf {
   if cfg!(debug_assertions) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     PathBuf::from(manifest).join("..").join("python")
   } else {
-    let base = std::env::var("LOCALAPPDATA")
-      .map(PathBuf::from)
-      .unwrap_or_else(|_| std::env::temp_dir());
-    let runtime = base.join("BeiWay-MoeVault").join("python");
+    let runtime = runtime_root().join("python");
     // 从安装包资源同步推理服务代码/脚本到运行时目录（幂等，每次启动覆盖旧文件：
     // 升级安装后 server 代码与 bat 随之更新，避免旧版本代码长期残留；
     // copy_dir_recursive 跳过 infer.log/__pycache__/.venv 等运行期生成物）
     if let Some(src) = bundled_python_dir() {
       eprintln!(
-        "[MoeVault] 同步推理服务资源 {} → {}",
+        "[MoeVault] 同步推理服务代码 {} → {}",
         src.display(),
         runtime.display()
       );
       if let Err(e) = copy_dir_recursive(&src, &runtime) {
-        eprintln!("[MoeVault] 同步推理服务资源失败: {e}");
+        eprintln!("[MoeVault] 同步推理服务代码失败: {e}");
       }
     } else {
       eprintln!("[MoeVault] 警告: 安装目录未找到推理服务资源（python/server）");
@@ -794,14 +876,17 @@ fn start_infer() -> std::io::Result<Option<Child>> {
       .current_dir(&cwd)
       .stdout(Stdio::from(log_file.try_clone()?))
       .stderr(Stdio::from(log_file.try_clone()?));
-    // HF_HOME 指向用户系统缓存：纯净 venv 下 transformers 默认用 venv 内缓存，
-    // 会找不到已下载的 Q-Align / Aesthetic Shadow 模型（网络被墙时重新下载卡死）。
-    // 优先系统缓存（%USERPROFILE%\.cache\huggingface），不存在则用 venv 内 hf_cache。
-    let hf_home = std::env::var("USERPROFILE")
+    // HF_HOME：优先运行时目录内的 hf_cache（随软件走，不依赖 C 盘用户缓存）；
+    // 若该目录不存在但系统缓存里有已下载模型，则沿用系统缓存（兼容旧安装迁移前的数据）。
+    let runtime_hf = cwd.join("hf_cache");
+    let system_hf = std::env::var("USERPROFILE")
       .ok()
-      .map(|u| std::path::Path::new(&u).join(".cache").join("huggingface"))
-      .filter(|p| p.is_dir())
-      .unwrap_or_else(|| cwd.join("hf_cache"));
+      .map(|u| std::path::Path::new(&u).join(".cache").join("huggingface"));
+    let hf_home = if runtime_hf.is_dir() {
+      runtime_hf
+    } else {
+      system_hf.filter(|p| p.is_dir()).unwrap_or_else(|| cwd.join("hf_cache"))
+    };
     cmd.env("HF_HOME", &hf_home);
     cmd.env("TRANSFORMERS_CACHE", hf_home.join("hub"));
     cmd.args(&prefix);

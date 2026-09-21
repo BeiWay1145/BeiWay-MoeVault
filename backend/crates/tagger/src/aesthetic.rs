@@ -26,20 +26,25 @@ struct AestheticResp {
 }
 
 /// 为指定图片（或全部未评分 active 图）执行美学评分。
+///
+/// `force`：true = 忽略"已有美学分"过滤，强制重新评分（覆盖旧分数）。
+/// 单张（详情页手动重评）始终保留强制语义。
 pub async fn run_aesthetic_pipeline(
     db: &Db,
     infer: &crate::InferClient,
     library_dir: &Path,
     image_ids: Option<Vec<i64>>,
     job_id: Option<i64>,
+    force: bool,
 ) -> Result<AestheticProgress, TaggerError> {
     let ids = match image_ids {
         Some(ids) => {
-            // 批量（>1 张）过滤已有美学分的图；单张（详情页手动重评）保留强制语义
-            if ids.len() > 1 {
-                filter_eligible(db, "aesthetic", &ids, false)?
-            } else {
+            // force=true（用户勾选强制重试）或单张（详情页手动重评）→ 不过滤，直接全部重评；
+            // 否则批量时过滤掉已有美学分的图，避免重复消耗算力。
+            if force || ids.len() <= 1 {
                 ids
+            } else {
+                filter_eligible(db, "aesthetic", &ids, false)?
             }
         }
         None => db.unscored_active_images(10000)?,
@@ -118,16 +123,21 @@ async fn score_one(
 }
 
 impl crate::InferClient {
-    /// 切换推理服务美学模型种类（qalign/anime）。
+    /// 切换推理服务美学模型种类（qalign/anime）与推理设备。
     pub async fn set_aesthetic_kind(&self, kind: &str) -> Result<(), TaggerError> {
         #[derive(serde::Serialize)]
         struct Req<'a> {
             kind: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device: Option<&'a str>,
         }
         let resp = self
             .http()
             .post(format!("{}/infer/aesthetic/config", self.base_url))
-            .json(&Req { kind })
+            .json(&Req {
+                kind,
+                device: self.device(),
+            })
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -145,6 +155,8 @@ impl crate::InferClient {
         #[derive(serde::Serialize)]
         struct Req<'a> {
             path: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device: Option<&'a str>,
         }
         // 传绝对路径（推理服务 cwd 与后端不同，相对路径会 404）
         let abs_path = crate::pipeline::to_absolute_path(path)?;
@@ -154,6 +166,7 @@ impl crate::InferClient {
             .post(format!("{}/infer/aesthetic", self.base_url))
             .json(&Req {
                 path: &abs_path,
+                device: self.device(),
             })
             .send()
             .await

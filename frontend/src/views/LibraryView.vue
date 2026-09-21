@@ -212,7 +212,7 @@ async function onBatchAesthetic() {
   const ids = [...library.selected]
   if (ids.length === 0) return
   try {
-    await taskStore.enqueueAesthetic(ids)
+    await taskStore.enqueueAesthetic(ids, forceAesthetic.value)
     library.clearSelect()
   } catch (e) {
     ElMessage.error((e as Error).message)
@@ -238,6 +238,8 @@ async function onBatchSauce() {
 
 /** 批量溯源是否强制重试不可溯源图。 */
 const forceSauce = ref(false)
+/** 增强1：美学批量评分是否强制重评（忽略已有分数，覆盖旧分数）。 */
+const forceAesthetic = ref(false)
 /** 增强3：溯源后自动替换更清晰的原图（大小比对 + 严格查重）。 */
 const autoReplaceSauce = ref(false)
 
@@ -581,6 +583,9 @@ watch(
           <el-option label="AI 检测" value="ai-detect" :disabled="batchActions.includes('export')" />
           <el-option label="导出" value="export" :disabled="batchActions.length > 0 && !batchActions.includes('export')" />
         </el-select>
+        <el-checkbox v-if="batchActions.includes('aesthetic')" v-model="forceAesthetic" size="small">
+          强制重评（覆盖已有分数）
+        </el-checkbox>
         <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
         <el-checkbox v-if="batchActions.includes('sauce')" v-model="autoReplaceSauce" size="small">原图替换</el-checkbox>
         <el-button :type="execArmed ? 'danger' : 'primary'" plain @click="onExecClick" :title="'Shift+点击直接执行'">

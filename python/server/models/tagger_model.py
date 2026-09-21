@@ -67,6 +67,41 @@ class TaggerModel:
     def kind(self):
         return self._kind
 
+    @property
+    def device(self):
+        """当前推理设备（auto / cuda:0 / cpu）。"""
+        return self._device
+
+    @property
+    def providers(self):
+        """当前 session 实际使用的 onnxruntime providers（诊断用）。"""
+        try:
+            return list(self._session.get_providers()) if self._session is not None else []
+        except Exception:  # noqa: BLE001
+            return []
+
+    def set_device(self, device: str) -> None:
+        """切换推理设备：若模型已加载则用同一目录重建 session（保留目录/种类）。
+
+        device：auto / cuda:0 / cpu
+        """
+        device = str(device).strip() or "auto"
+        with self._lock:
+            if device == self._device and self._session is not None:
+                return
+            self._device = device
+            if self._model_dir:
+                # 已加载过模型：用同目录重建 session，使新 provider 生效
+                prev_kind = self._requested_kind
+                self._session = None
+                self._processor = None
+                self._idx_to_tag = {}
+                self._is_naflex = False
+                self._load_error = None
+                self._kind = config.MODEL_KIND_AUTO
+                self._requested_kind = prev_kind
+                self._do_load(self._model_dir, prev_kind)
+
     def _do_load(self, model_dir, kind=None) -> None:
         model_dir = str(model_dir)
         try:
@@ -184,16 +219,45 @@ class TaggerModel:
 
     # ---------- 公共 ----------
     def _resolve_providers(self):
+        """把 device 解析成 onnxruntime providers 列表。
+
+        device 取值：auto / cuda / cuda:N / cpu。
+        auto = 有 CUDAExecutionProvider 就用 GPU，否则 CPU。
+        注意：onnxruntime 在指定了不可用的 provider 时会**静默回落**，
+        因此这里必须先用 get_available_providers() 校验，避免"以为在用 GPU"。
+        """
         import onnxruntime as ort
 
-        device = self._device
+        available = set(ort.get_available_providers())
+        device = str(self._device or "auto").strip().lower()
         if device == "auto":
-            device = "cuda" if "CUDAExecutionProvider" in ort.get_available_providers() else "cpu"
-        return (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if device == "cuda"
-            else ["CPUExecutionProvider"]
-        )
+            device = "cuda" if "CUDAExecutionProvider" in available else "cpu"
+        want_cuda = device.startswith("cuda")
+        if want_cuda and "CUDAExecutionProvider" not in available:
+            # 显式要求 GPU 但环境不支持：记录警告并回落 CPU（不静默）
+            import warnings
+
+            warnings.warn(
+                "requested CUDAExecutionProvider but it is not available "
+                f"(available: {sorted(available)}); falling back to CPU. "
+                "请安装 onnxruntime-gpu 后重试。",
+                stacklevel=2,
+            )
+            want_cuda = False
+        providers = ["CPUExecutionProvider"]
+        if want_cuda:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            # cuda:N 指定具体显卡
+            if ":" in device:
+                try:
+                    idx = int(device.split(":", 1)[1])
+                    providers = [
+                        ("CUDAExecutionProvider", {"device_id": idx}),
+                        "CPUExecutionProvider",
+                    ]
+                except ValueError:
+                    pass
+        return providers
 
     @property
     def loaded(self) -> bool:

@@ -47,6 +47,8 @@ pub struct SauceHit {
 pub struct InferClient {
     http: reqwest::Client,
     pub(crate) base_url: String,
+    /// 推理设备：None = 不指定（服务端按 auto 处理）/ "cuda:0" / "cpu"。
+    device: Option<String>,
 }
 
 impl InferClient {
@@ -60,7 +62,19 @@ impl InferClient {
                 .build()
                 .expect("构建推理客户端失败"),
             base_url,
+            device: None,
         }
+    }
+
+    /// 指定推理设备（链式调用）。device 为 None/空 时表示不干预（服务端 auto）。
+    pub fn with_device(mut self, device: Option<String>) -> Self {
+        self.device = device.filter(|d| !d.trim().is_empty());
+        self
+    }
+
+    /// 当前指定的设备（供日志/诊断）。
+    pub fn device(&self) -> Option<&str> {
+        self.device.as_deref()
     }
 
     /// 通用 HTTP 客户端（供 booru 爬取复用）。
@@ -68,8 +82,9 @@ impl InferClient {
         &self.http
     }
 
-    /// 通知推理服务切换打标模型目录/种类（重载模型）。
+    /// 通知推理服务切换打标模型目录/种类/推理设备（重载模型）。
     /// kind：cl_tagger / wd14 / auto（None=不指定，由推理服务按目录内容自动判定）
+    /// device：随客户端配置透传（None 时不发送，服务端沿用当前值）
     pub async fn use_tagger_model(
         &self,
         model_dir: &str,
@@ -80,6 +95,8 @@ impl InferClient {
             model_dir: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             model_kind: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device: Option<&'a str>,
         }
         let resp = self
             .http
@@ -87,6 +104,7 @@ impl InferClient {
             .json(&Req {
                 model_dir,
                 model_kind,
+                device: self.device(),
             })
             .send()
             .await?;
@@ -105,6 +123,8 @@ impl InferClient {
         struct Req<'a> {
             path: &'a str,
             threshold: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device: Option<&'a str>,
         }
         #[derive(Deserialize)]
         struct TagItem {
@@ -124,6 +144,7 @@ impl InferClient {
             .json(&Req {
                 path: &abs_path,
                 threshold,
+                device: self.device(),
             })
             .send()
             .await?;
