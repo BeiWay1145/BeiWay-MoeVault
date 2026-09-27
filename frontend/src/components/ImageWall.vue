@@ -86,6 +86,18 @@ function forwardDragOut(img: ImageItem) {
   emit('dragOut', img)
 }
 
+/**
+ * 缩略图加载完成 → 合并重排瀑布流。
+ *
+ * 必要性：卡片高度由图片宽高比决定，而缩略图 lazy 加载——
+ * 加载前测量得到极矮高度，span 全为 1，卡片会挤成细条堆叠（布局塌陷）。
+ * 每张图加载完成都会触发，scheduleLayout 内部用 rAF 合并成一次重排。
+ */
+function onThumbReady() {
+  if (props.viewMode !== 'waterfall') return
+  scheduleLayout()
+}
+
 const containerRef = ref<HTMLElement | null>(null)
 const COL_GAP = 12
 const ROW_UNIT = 4
@@ -108,21 +120,25 @@ function resolveColumns(): number {
   )
 }
 
-/** 测量卡片自然高度 → 按严格行序计算每张卡片的行列定位。 */
-async function layoutWaterfall() {
+/**
+ * 测量卡片自然高度 → 按严格行序计算每张卡片的行列定位。
+ *
+ * 重要：**必须同步测量**（不能在中间 await 让出线程）。
+ * 原因：让出线程后浏览器会按"旧 layout"重排一次 DOM，卡片高度随之改变，
+ * 随后测到的是中间态高度 → span 全错 → 表现为所有卡片挤成细条堆叠（布局塌陷）。
+ * 调用方负责确保 DOM 已就绪（watch 后先 nextTick）。
+ */
+function layoutWaterfall() {
   const el = containerRef.value
   if (!el || props.viewMode !== 'waterfall' || props.images.length === 0) return
   const newCols = resolveColumns()
-  const colsChanged = newCols !== cols.value
-  if (colsChanged) {
+  if (newCols !== cols.value) {
     cols.value = newCols
   }
-  // 等一帧：列数变化会改变 grid 模板，卡片宽度随之变化；
-  // 宽度变化（如侧边栏收起/展开）同样需要让浏览器先完成布局，
-  // 否则 offsetHeight 读到的是过渡中间态 → span 算错 → 间隙变大或卡片重叠（BUG2）。
-  await nextTick()
-  await new Promise<void>((r) => requestAnimationFrame(() => r()))
   const items = el.querySelectorAll<HTMLElement>('.waterfall-item')
+  // 测量前先把 layout 置空：否则卡片仍按旧 grid 坐标摆放，
+  // 测到的高度受旧定位影响（首帧尤其明显）。
+  layout.value = {}
   // 第一遍：测每张卡片高度 → row span。
   // 注意：offsetHeight 不含 margin-bottom，但 item 在 grid 轨道内的实际占位 = 卡片高 + 12px 间距，
   // 必须把间距计入 span，否则卡片高度恰为 4px 倍数时 margin 溢出轨道与下一张重叠。
@@ -150,7 +166,7 @@ watch(
   () => props.images.map((i) => i.id).join(','),
   async () => {
     await nextTick()
-    await layoutWaterfall()
+    layoutWaterfall()
   },
 )
 // 动画批次变化 → 元素被重建（key 变了）→ 瀑布流需重新测量布局。
@@ -160,8 +176,7 @@ watch(
   () => props.appearEpoch,
   async () => {
     await nextTick()
-    await new Promise<void>((r) => requestAnimationFrame(() => r()))
-    await layoutWaterfall()
+    layoutWaterfall()
   },
 )
 // 列数设置变化 → 重新布局
@@ -169,16 +184,16 @@ watch(
   () => props.waterfallColumns,
   async () => {
     await nextTick()
-    await layoutWaterfall()
+    layoutWaterfall()
   },
 )
-// 切到瀑布流视图 → 激活时重新布局
+// 切到瀑布流视图 → 激活时重新布局（列数在其它视图下未测量，需重新算）
 watch(
   () => props.viewMode,
   async (v) => {
     if (v === 'waterfall') {
       await nextTick()
-      await layoutWaterfall()
+      layoutWaterfall()
     }
   },
 )
@@ -207,7 +222,7 @@ function scheduleLayout() {
 
 onMounted(async () => {
   await nextTick()
-  await layoutWaterfall()
+  layoutWaterfall()
   const el = containerRef.value
   if (el) {
     lastWidth = el.clientWidth
@@ -286,6 +301,7 @@ function itemStyle(img: ImageItem) {
           @select="forwardSelect"
           @contextmenu="forwardContext"
           @drag-out="forwardDragOut"
+          @thumb-ready="onThumbReady"
         />
       </div>
     </TransitionGroup>
@@ -307,6 +323,7 @@ function itemStyle(img: ImageItem) {
           @select="forwardSelect"
           @contextmenu="forwardContext"
           @drag-out="forwardDragOut"
+          @thumb-ready="onThumbReady"
         />
       </div>
     </TransitionGroup>
@@ -324,6 +341,7 @@ function itemStyle(img: ImageItem) {
           @select="forwardSelect"
           @contextmenu="forwardContext"
           @drag-out="forwardDragOut"
+          @thumb-ready="onThumbReady"
         />
       </div>
     </TransitionGroup>

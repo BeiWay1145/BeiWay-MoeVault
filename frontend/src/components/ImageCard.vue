@@ -29,6 +29,14 @@ const emit = defineEmits<{
   contextmenu: [image: ImageItem, event: MouseEvent]
   /** 已选中的图片上开始拖动 → 请求拖出到资源管理器（复制语义）。 */
   dragOut: [image: ImageItem, event: MouseEvent]
+  /**
+   * 缩略图加载完成（含换图）。
+   *
+   * 瀑布流卡片高度取决于图片宽高比，而缩略图是 lazy 加载的：
+   * 加载前测量会把卡片算得极矮 → row span 全为 1 → 卡片挤成细条堆叠。
+   * 父级据此重新测量布局。
+   */
+  thumbReady: [image: ImageItem]
 }>()
 
 const src = computed(() => thumbUrl(props.image.thumbRel))
@@ -91,6 +99,8 @@ const appearing = computed(() => animOn.value && props.appearDelay !== undefined
 const thumbLoaded = ref(false)
 function onThumbLoad() {
   thumbLoaded.value = true
+  // 通知父级：卡片实际高度已确定，需重新测量瀑布流布局
+  emit('thumbReady', props.image)
 }
 // 换图时重置（虚拟滚动/列表复用时同一 DOM 会换数据）
 watch(

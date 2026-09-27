@@ -177,17 +177,32 @@ onUnmounted(() => {
   if (appearTimer !== undefined) window.clearTimeout(appearTimer)
 })
 
-/** 恢复滚动位置：定位到上次查看详情的图片附近。返回是否成功恢复。 */
+/**
+ * 恢复滚动位置（从详情页返回时调用）。
+ *
+ * 行为修正（BUG：返回后位置向下错位一张）：
+ * 此前无条件用 `scrollIntoView({block:"center"})` —— 会把目标**强行居中**，
+ * 即使它原本就在视口内（例如位于上部）也会被拉动，表现为"向下滚了一张"。
+ * 现在：目标已在视口内 → 不动；不在视口内 → 用 `nearest` 最小幅度滚动使其可见；
+ * 目标不存在（已删除/筛选变化）→ 回退到记录的 scrollTop。
+ */
 function restorePos() {
   const pos = library.restoreDetailPos('library')
   if (!pos) return false
+  const scroller = document.querySelector('.app-main')
   const el = document.querySelector<HTMLElement>(`.app-main [data-image-id="${pos.imageId}"]`)
   if (el) {
-    el.scrollIntoView({ block: 'center' })
+    // 视口内则不滚动（保持用户离开时的视觉位置）
+    if (!scroller) return true
+    const r = el.getBoundingClientRect()
+    const sr = scroller.getBoundingClientRect()
+    const fullyVisible = r.top >= sr.top && r.bottom <= sr.bottom
+    if (!fullyVisible) {
+      el.scrollIntoView({ block: 'nearest' })
+    }
     return true
   }
   // 图片不在当前列表（可能已删除/筛选变化）：按比例恢复滚动
-  const scroller = document.querySelector('.app-main')
   if (scroller && pos.scrollTop > 0) scroller.scrollTop = pos.scrollTop
   return true
 }
