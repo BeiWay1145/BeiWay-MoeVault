@@ -6,6 +6,18 @@
 
 ### 修复
 
+- **入场动画异常（卡片"飞过来"、明显卡顿、切回复现）**：三处根因——
+  1. 卡片关键帧含 `transform: translateY(...)`，与卡片所在 grid/瀑布流布局及
+     `TransitionGroup` 的位移动画互相干扰，表现为卡片从右下侧汇聚到左上角。
+     现改为**纯 opacity 淡入**，不触碰 transform。
+  2. `TransitionGroup` 的 `.flip-move { transition: all }` 会把 grid 定位、尺寸等
+     一并做成动画（卡片从旧格子"飞"到新格子）。现只过渡透明度。
+  3. 曾用 `appearEpoch` 拼进列表项 key 以强制重播动画 → **每次播放都整表 DOM 重建**，
+     200+ 张图时卡顿明显，且元素重建期间瀑布流测量到 0 高度触发多轮重排。
+     现改为 key 只用图片 id；卡片自身监听 `appearEpoch`，
+     用「短暂关闭动画 → 读 offsetWidth 强制重算样式 → 重新开启」的方式重播，**不重建 DOM**。
+  另：元素重建后等 `nextTick + rAF` 再测量瀑布流，避免测量到未渲染的高度。
+
 - **「复制图片」导致应用闪退**（严重）：`OleSetClipboard` 要求数据对象在剪贴板使用期间保持存活，
   而此前该对象是局部变量，函数返回即释放 → 剪贴板持有悬空指针 → 访问违例崩溃。
   现改为直接 `SetClipboardData(CF_HDROP, hmem)`（内存块所有权转移给系统），

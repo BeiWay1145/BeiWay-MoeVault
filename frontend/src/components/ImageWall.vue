@@ -53,12 +53,14 @@ const APPEAR_ROW_MS = 34
 const APPEAR_COL_MS = 14
 const APPEAR_MAX_MS = 620
 /**
- * 列表项 key。拼入 appearEpoch 后，父级要求播放动画时 key 变化 → 元素重建 →
- * CSS 入场动画可靠重播（只切 class 常被浏览器优化掉，不重放）。
- * 无动画时 epoch 恒定，key 稳定，Vue 复用元素（不影响性能与状态）。
+ * 列表项 key：**只用 id**。
+ *
+ * 曾把 appearEpoch 拼进 key 以强制重播动画，但那会让整表 DOM 在每次播放动画时
+ * 全部销毁重建（200+ 张图时明显卡顿，且元素重建期间瀑布流测量到 0 高度、多次重排）。
+ * 现改为「不改 key」，仅通过 appearDelay 的变化驱动卡片的动画样式（见 ImageCard）。
  */
 function imageKey(img: ImageItem): string {
-  return `${props.appearEpoch ?? 0}:${img.id}`
+  return String(img.id)
 }
 
 function appearDelayOf(img: ImageItem, idx: number): number | undefined {
@@ -146,11 +148,14 @@ watch(
     await layoutWaterfall()
   },
 )
-// 动画批次变化 → 元素被重建（key 变了）→ 瀑布流需重新测量布局
+// 动画批次变化 → 元素被重建（key 变了）→ 瀑布流需重新测量布局。
+// 注意：元素重建后卡片尚未完成首帧渲染，立即测量会得到 0 高度并触发多轮重排（卡顿）。
+// 因此等两帧（nextTick + rAF）再测，且只测一次。
 watch(
   () => props.appearEpoch,
   async () => {
     await nextTick()
+    await new Promise<void>((r) => requestAnimationFrame(() => r()))
     await layoutWaterfall()
   },
 )
@@ -224,7 +229,7 @@ function itemStyle(img: ImageItem) {
   <!-- 瀑布流：行序错落（grid + 测量 row-span），DOM 顺序 = 从左到右、从上到下 -->
   <div v-if="viewMode === 'waterfall'" ref="containerRef" class="waterfall-measure-wrap">
     <TransitionGroup
-      name="flip"
+      :name="appearAnim ? 'flip' : ''"
       tag="div"
       class="waterfall"
       :style="waterfallStyle"
@@ -240,6 +245,7 @@ function itemStyle(img: ImageItem) {
           :image="img"
           :selected="selected?.has(img.id)"
           :appear-delay="appearDelayOf(img, idx)"
+          :appear-epoch="appearEpoch"
           waterfall-mode
           @click="emit('click', $event)"
           @toggle-select="emit('toggleSelect', $event)"
@@ -260,6 +266,7 @@ function itemStyle(img: ImageItem) {
           :image="img"
           :selected="selected?.has(img.id)"
           :appear-delay="appearDelayOf(img, idx)"
+          :appear-epoch="appearEpoch"
           list-mode
           @click="emit('click', $event)"
           @toggle-select="emit('toggleSelect', $event)"
@@ -277,6 +284,7 @@ function itemStyle(img: ImageItem) {
           :image="img"
           :selected="selected?.has(img.id)"
           :appear-delay="appearDelayOf(img, idx)"
+          :appear-epoch="appearEpoch"
           @click="emit('click', $event)"
           @toggle-select="emit('toggleSelect', $event)"
           @preview="emit('preview', $event)"
@@ -330,19 +338,20 @@ function itemStyle(img: ImageItem) {
   overflow: hidden; /* 防止卡片内 nowrap 文字撑宽导致横向溢出 */
 }
 
-/* 删除/新增补位动效（瀑布流、网格、列表通用） */
-.flip-enter-active,
-.flip-leave-active,
+/* 删除/新增补位动效（瀑布流、网格、列表通用）。
+   注意：这里**不能用 transition: all** —— 它会把 grid 定位属性、尺寸等一并做成动画，
+   表现为卡片从旧位置"飞"到新位置（用户反馈的"从右下侧汇聚到左上角"）。
+   只过渡透明度。 */
 .flip-move {
-  transition: all 0.25s ease;
+  transition: opacity 0.25s ease;
 }
-.flip-enter-from {
-  opacity: 0;
-  transform: scale(0.92);
+.flip-enter-active,
+.flip-leave-active {
+  transition: opacity 0.2s ease;
 }
+.flip-enter-from,
 .flip-leave-to {
   opacity: 0;
-  transform: scale(0.92);
 }
 .flip-leave-active {
   position: absolute;

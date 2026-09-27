@@ -64,17 +64,21 @@ function onLibraryPageSizeChange(s: number) {
  * 这些情况下保持即时显示，避免每次操作都"重放一遍"动画。
  */
 const appearAnim = ref(false)
-/** 动画批次号：每次播放递增，作为列表项 key 前缀强制重播动画。 */
+/**
+ * 动画批次号：每次要求播放时递增。
+ * 卡片监听它来重播动画（**不重建 DOM**——曾用 key 前缀强制重建，
+ * 200+ 张图时卡顿明显且干扰瀑布流测量，已弃用）。
+ */
 const appearEpoch = ref(0)
 let appearTimer: number | undefined
 
 /**
  * 播放入场动画一批。
  *
- * 实现：递增 appearEpoch（列表项 key 随之变化 → 元素重建 → CSS 动画必然重播），
- * 同时打开 appearAnim 以计算延迟；动画播完后关闭，后续追加项不再动画。
+ * 实现：打开 appearAnim（卡片据此计算逐张延迟）并递增 appearEpoch（卡片据此重播动画），
+ * 动画播完后关闭，后续追加项不再动画。
  *
- * 注意：必须在**数据已渲染之后**调用——否则重建的是旧内容（调用方在 fetchPage 后 await）。
+ * 注意：必须在**数据已渲染之后**调用——调用方在 fetchPage 之后 await 本函数。
  */
 async function playAppearAnimation() {
   // 等一帧确保新数据已进入 DOM（Vue 的 nextTick 只保证虚拟 DOM 更新，

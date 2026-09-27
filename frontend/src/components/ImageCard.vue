@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import type { ImageItem } from '@/stores/library'
 import { thumbUrl } from '@/stores/library'
 
@@ -10,9 +10,11 @@ const props = defineProps<{
   waterfallMode?: boolean
   /**
    * 入场动画延迟（毫秒）。用于首次加载/切换筛选时按「从上到下、从左到右」渐变显示。
-   * undefined = 不播放入场动画（滚动追加、窗口resize 等场景保持即时显示）。
+   * undefined = 不播放入场动画（滚动追加、窗口 resize 等场景保持即时显示）。
    */
   appearDelay?: number
+  /** 动画批次号：变化时重播动画（不重建 DOM，只重置内联动画）。 */
+  appearEpoch?: number
 }>()
 
 const emit = defineEmits<{
@@ -41,17 +43,43 @@ const src = computed(() => thumbUrl(props.image.thumbRel))
 //
 // 注意：此前用「锁定式 playEnter」会导致动画状态永不复位，
 // 翻页/追加项也带延迟（表现为"效果变奇怪"），已移除。
+const cardRef = ref<HTMLElement | null>(null)
+
+/**
+ * 动画是否处于"本次应当播放"状态。
+ * 由 appearDelay 是否有值决定；epoch 变化时短暂关闭再打开以重播动画。
+ */
+const animOn = ref(false)
+
+/** 重播入场动画：不重建 DOM，仅重置内联动画（读一次 offsetWidth 强制重算样式）。 */
+function replay() {
+  const el = cardRef.value
+  if (!el || props.appearDelay === undefined) return
+  animOn.value = false
+  // 强制浏览器重算样式，使后续重新加上 animationName 时动画从头播放
+  void el.offsetWidth
+  animOn.value = true
+}
+
+// 延迟值变化（数据换了一批）或批次号变化（父级要求重播）→ 重播
+watch(() => props.appearDelay, replay)
+watch(() => props.appearEpoch, replay)
+// 首次挂载：直接播放（无需重播技巧）
+onMounted(() => {
+  if (props.appearDelay !== undefined) animOn.value = true
+})
+
 const appearStyle = computed(() => {
-  if (props.appearDelay === undefined) return undefined
+  if (!animOn.value || props.appearDelay === undefined) return undefined
   return {
     animationDelay: `${props.appearDelay}ms`,
     animationFillMode: 'backwards',
-    animationDuration: '0.32s',
+    animationDuration: '0.3s',
     animationTimingFunction: 'ease-out',
     animationName: 'card-appear',
   }
 })
-const appearing = computed(() => props.appearDelay !== undefined)
+const appearing = computed(() => animOn.value && props.appearDelay !== undefined)
 
 /**
  * 缩略图自身的淡入。
@@ -170,6 +198,7 @@ function fmtSize(bytes: number) {
 
 <template>
   <div
+    ref="cardRef"
     class="image-card"
     :class="{ selected, 'list-mode': listMode, 'waterfall-mode': waterfallMode, appearing }"
     :style="appearStyle"
@@ -223,17 +252,17 @@ function fmtSize(bytes: number) {
 </template>
 
 <style scoped>
-/* 入场：淡入 + 轻微上浮（渐变显示）。
-   注意：动画由内联 style 的 animationName 触发（见 appearStyle），
-   而不是靠切换 class —— 这样即使父级随后关掉 appearAnim，已开始的动画也不会被打断。 */
+/* 入场：纯淡入（渐变显示）。
+   **刻意不使用 transform**：卡片处于 grid/瀑布流布局中，
+   任何 transform 都会与布局、TransitionGroup 的位移动画互相干扰
+   （曾出现"卡片从右下侧飞向左上角"的异常）。
+   逐张延迟由内联 style 的 animationDelay 提供，形成从左到右、从上到下的顺序出现。 */
 @keyframes card-appear {
   from {
     opacity: 0;
-    transform: translateY(12px) scale(0.98);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
   }
 }
 
