@@ -146,6 +146,14 @@ watch(
     await layoutWaterfall()
   },
 )
+// 动画批次变化 → 元素被重建（key 变了）→ 瀑布流需重新测量布局
+watch(
+  () => props.appearEpoch,
+  async () => {
+    await nextTick()
+    await layoutWaterfall()
+  },
+)
 // 列数设置变化 → 重新布局
 watch(
   () => props.waterfallColumns,

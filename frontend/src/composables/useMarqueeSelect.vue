@@ -42,20 +42,36 @@ function rectStyle() {
   return { left: left + 'px', top: top + 'px', width: width + 'px', height: height + 'px' }
 }
 
-/** 判断某元素是否属于"空白区"（即没有落在图片卡片上）。 */
+/**
+ * 判断是否应当起框。
+ *
+ * 条件：
+ * 1. 没有落在图片卡片上（卡片上的按下是选择/拖出）
+ * 2. 没有落在交互控件上（输入框/按钮/下拉/链接/菜单）
+ * 3. 位于内容区域内——用"是否在 .app-main 内"判定，而非严格限定在图片墙容器：
+ *    图片墙容器的左右留白、上下间距也属于可框选的空白区，
+ *    此前用 containerRef.contains 会把这些区域排除掉（表现为"某些空白处拖不出框"）。
+ */
 function isBlankTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null
   if (!el) return true
-  // 落在卡片/缩略图/信息区/按钮上 → 不算空白
-  return !el.closest('[data-image-id]')
+  if (el.closest('[data-image-id]')) return false
+  // 交互控件上不起框（避免与输入/点击冲突）
+  if (el.closest('input, textarea, select, button, a, .el-select, .el-input, .el-checkbox, .el-dropdown, .ctx-menu, .el-dialog, .el-tabs, .side-nav, aside')) {
+    return false
+  }
+  return true
 }
 
 function onMouseDown(e: MouseEvent) {
   if (e.button !== 0) return
   if (!isBlankTarget(e.target)) return
+  // 必须落在主内容区（排除左侧导航、顶栏、弹窗等）
   const el = props.containerRef
-  if (!el) return
-  if (!el.contains(e.target as Node) && e.target !== el) return
+  const target = e.target as HTMLElement | null
+  if (!target) return
+  const inMain = !!target.closest('.app-main')
+  if (!inMain && !(el && el.contains(target))) return
   active.value = true
   dragging.value = false
   startX.value = e.clientX

@@ -71,17 +71,22 @@ let appearTimer: number | undefined
 /**
  * 播放入场动画一批。
  *
- * 实现：递增 appearEpoch（列表项 key 随之变化 → 元素重建 → CSS 动画重播），
+ * 实现：递增 appearEpoch（列表项 key 随之变化 → 元素重建 → CSS 动画必然重播），
  * 同时打开 appearAnim 以计算延迟；动画播完后关闭，后续追加项不再动画。
+ *
+ * 注意：必须在**数据已渲染之后**调用——否则重建的是旧内容（调用方在 fetchPage 后 await）。
  */
 async function playAppearAnimation() {
+  // 等一帧确保新数据已进入 DOM（Vue 的 nextTick 只保证虚拟 DOM 更新，
+  // 这里再让出一次以覆盖瀑布流的测量时机）
+  await nextTick()
   appearAnim.value = true
   appearEpoch.value += 1
   if (appearTimer !== undefined) window.clearTimeout(appearTimer)
-  // 最长延迟(620ms) + 动画时长(340ms) + 余量
+  // 最长延迟(620ms) + 动画时长(320ms) + 余量
   appearTimer = window.setTimeout(() => {
     appearAnim.value = false
-  }, 1100)
+  }, 1000)
 }
 
 /** 按当前分页状态拉取（分页开启→cursor 翻页；关闭→一次拉取）。 */

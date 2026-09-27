@@ -6,6 +6,20 @@
 
 ### 修复
 
+- **「复制图片」导致应用闪退**（严重）：`OleSetClipboard` 要求数据对象在剪贴板使用期间保持存活，
+  而此前该对象是局部变量，函数返回即释放 → 剪贴板持有悬空指针 → 访问违例崩溃。
+  现改为直接 `SetClipboardData(CF_HDROP, hmem)`（内存块所有权转移给系统），
+  不依赖任何 Rust 侧对象存活。
+- **Shift 连选会选中文字**：框选路径已禁用文本选择，但 Shift/Ctrl 连选走的是**单击**路径，
+  浏览器在 `mousedown` 时就开始文本选择。现三层防护：卡片 `mousedown` 阻止默认行为、
+  信息区 `mousedown.prevent`、卡片样式加 `user-select: none`。
+- **部分空白区域无法起框**：框选起框条件用了 `containerRef.contains(target)`，
+  把图片墙容器的左右留白与上下间距也排除了。现改为「在 `.app-main` 内且不落在卡片/交互控件上」即可起框。
+- **渐进入场动画效果异常**：上一版引入的「锁定式 playEnter」一旦为 true 便永不复位，
+  导致翻页、追加加载的项也带延迟（表现为动画"变奇怪"）；且 `appearEpoch` 递增与数据渲染是异步分离的。
+  现移除锁定逻辑，动画完全由 `appearDelay` 是否传入决定，并在动画前 `await nextTick()` 确保新数据已进入 DOM；
+  同时补齐 `appearEpoch` 变化后的瀑布流重排。
+
 - **选择交互三处问题**：
   - **拖动会选中文字/图片（变蓝）**：框选/Shift 连选期间未禁用文本选择。
     现框选按下时给 `body` 加 `no-select`（`user-select: none`），松开或卸载时移除。

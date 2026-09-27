@@ -32,47 +32,26 @@ const emit = defineEmits<{
 const src = computed(() => thumbUrl(props.image.thumbRel))
 
 // ---- 入场动画 ----
-// 仅当父级传入 appearDelay 时启用（首次加载 / 切换筛选词条），
-// 按索引递增延迟形成「从上到下、从左到右」的渐进出现；
-// 其它场景（滚动追加、窗口 resize）不传该 prop，保持即时渲染。
-/**
- * 入场动画是否"本次应当播放"。
- *
- * 由父级通过 appearDelay 的**出现**来决定：
- * 父级在需要动画时把 appearDelay 从 undefined 变为数值，
- * 卡片捕获这一变化并锁定为 true（之后父级关掉开关也不影响已开始的动画）。
- */
-const playEnter = ref(props.appearDelay !== undefined)
-watch(
-  () => props.appearDelay,
-  (v) => {
-    if (v !== undefined) playEnter.value = true
-  },
-)
-
-/**
- * 用 key 强制重挂载：需要重播动画时递增，Vue 会重建元素从而重放 CSS 动画。
- * 这是 CSS 动画最可靠的"重播"手段（改 class 常因浏览器优化而不重放）。
- */
-const enterKey = ref(0)
-watch(
-  () => props.appearDelay,
-  (v) => {
-    if (v !== undefined) enterKey.value++
-  },
-)
-
+//
+// 设计（保持简单可靠）：
+// - 父级传入 appearDelay（数值）= 本次要播放，延迟按"从上到下、从左到右"递增
+// - 未传入（undefined）= 不播放，立即显示（翻页/追加/窗口 resize 等场景）
+// - 动画通过内联 style 的 animationName 触发；配合父级按 epoch 重建元素，
+//   每次需要播放时元素是新的 → 动画必然从头播放
+//
+// 注意：此前用「锁定式 playEnter」会导致动画状态永不复位，
+// 翻页/追加项也带延迟（表现为"效果变奇怪"），已移除。
 const appearStyle = computed(() => {
-  if (!playEnter.value || props.appearDelay === undefined) return {}
+  if (props.appearDelay === undefined) return undefined
   return {
     animationDelay: `${props.appearDelay}ms`,
     animationFillMode: 'backwards',
-    animationDuration: '0.34s',
+    animationDuration: '0.32s',
     animationTimingFunction: 'ease-out',
     animationName: 'card-appear',
   }
 })
-const appearing = computed(() => playEnter.value && props.appearDelay !== undefined)
+const appearing = computed(() => props.appearDelay !== undefined)
 
 /**
  * 缩略图自身的淡入。
@@ -136,6 +115,10 @@ let pressOnSelected = false
 
 function onThumbMouseDown(e: MouseEvent) {
   if (e.button !== 0) return
+  // 阻止浏览器从这里开始文本选择：
+  // 不阻止的话，Shift/Ctrl 连选（单击路径）会把卡片文字乃至整页文字一起选蓝。
+  // 框选路径由 useMarqueeSelect 给 body 加 no-select 兜底。
+  e.preventDefault()
   pressX = e.clientX
   pressY = e.clientY
   // 只有"已选中"的卡片才触发拖出（未选中时按下是框选/普通点击）
@@ -229,7 +212,7 @@ function fmtSize(bytes: number) {
       </button>
     </div>
     <!-- 信息区（名称/分辨率/大小/清晰度）：点击 = 单选；Ctrl/Shift 修饰 -->
-    <div class="meta" @click="onMetaClick">
+    <div class="meta" @click="onMetaClick" @mousedown.prevent>
       <div class="name" :title="image.name">{{ image.name }}</div>
       <div class="sub">
         {{ image.width }}×{{ image.height }} · {{ fmtSize(image.sizeBytes) }}
@@ -273,6 +256,9 @@ function fmtSize(bytes: number) {
 }
 
 .image-card {
+  /* 卡片内的文字（文件名/分辨率等）是信息展示，不是可选中内容；
+     禁用后 Shift/Ctrl 连选不会把文字选蓝。 */
+  user-select: none;
   border-radius: 8px;
   overflow: hidden;
   border: 2px solid transparent;

@@ -19,7 +19,6 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenC
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
 use windows::Win32::System::Ole::{
   CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize,
-  OleSetClipboard,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DROPFILES, HDROP};
@@ -260,6 +259,12 @@ pub fn do_drag_out(hwnd: HWND, paths: Vec<String>) -> Result<(), String> {
 }
 
 /// 复制文件到剪贴板（CF_HDROP）：可在资源管理器中直接"粘贴"。
+///
+/// 实现说明（重要）：
+/// 早期版本用 `OleSetClipboard(&data)` 并让数据对象留作局部变量——
+/// 剪贴板会长期持有该对象，而函数返回时它已被释放 → **访问违例导致应用闪退**。
+/// 现改为直接 `SetClipboardData(CF_HDROP, hmem)`：内存块所有权转移给系统，
+/// 不依赖任何 Rust 侧对象的存活，安全且被资源管理器广泛支持。
 pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<usize, String> {
   let valid: Vec<String> = paths
     .into_iter()
@@ -269,11 +274,20 @@ pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<usize, String> {
     return Err("没有可复制的文件".into());
   }
   let n = valid.len();
-  // 剪贴板依赖 OLE；未初始化会导致静默失败（复制图片无效的根因）
-  let _guard = OleGuard::new()?;
   unsafe {
-    let data: IDataObject = FileDataObject::new(valid).into();
-    OleSetClipboard(&data).map_err(|e| format!("写入剪贴板失败: {e}"))?;
+    // CF_HDROP 走 shell 剪贴板格式，无需 OLE 数据对象
+    let hdrop = build_hdrop(&valid).ok_or_else(|| "构造文件列表失败".to_string())?;
+    OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+    // 失败路径也要确保关闭剪贴板，避免其它程序无法访问
+    let result = (|| -> Result<(), String> {
+      EmptyClipboard().map_err(|e| format!("清空剪贴板失败: {e}"))?;
+      // 所有权在此转移给系统：成功后不可再释放该内存块
+      SetClipboardData(CF_HDROP.0 as u32, Some(windows::Win32::Foundation::HANDLE(hdrop.0 as _)))
+        .map_err(|e| format!("写入剪贴板失败: {e}"))?;
+      Ok(())
+    })();
+    let _ = CloseClipboard();
+    result?;
   }
   Ok(n)
 }
