@@ -268,11 +268,48 @@ async function recycle() {
   }
 }
 
+/**
+ * 视觉改进1：返回图库时，让详情页的大图"缩小飞回"它在图库缩略图网格中的位置。
+ *
+ * 实现（FLIP）：
+ * 1. 记录当前大图的位置与尺寸（First）
+ * 2. 用一个固定定位的浮层承载这张图，放到大图位置，然后过渡到目标缩略图位置（Last）
+ * 3. 过渡结束后移除浮层（目标页面已渲染出真实缩略图，视觉上无缝衔接）
+ *
+ * 目标位置通过 store 传递：图库在挂载/激活后按其 data-image-id 元素查找并回调。
+ */
+function playFlyBack(onDone: () => void) {
+  const img = image.value
+  const stage = stageRef.value?.querySelector<HTMLElement>('.stage-img')
+  const el = stage ?? stageRef.value
+  if (!img || !el) {
+    onDone()
+    return
+  }
+  const from = el.getBoundingClientRect()
+  if (from.width === 0 || from.height === 0) {
+    onDone()
+    return
+  }
+  // 交给图库：它会在路由切换后查找目标缩略图并驱动过渡
+  library.setFlyBack({
+    imageId: img.id,
+    src: originalUrl(img.id),
+    from: { x: from.x, y: from.y, w: from.width, h: from.height },
+  })
+  onDone()
+}
+
 /** 返回来源页（画廊/主目录）——叉号点击直接返回，不受浏览多张影响。 */
 function goBack() {
   const from = library.detailPos?.from
-  if (from === 'imports') router.push('/imports')
-  else router.push('/library')
+  const target = from === 'imports' ? '/imports' : '/library'
+  // 仅图库有缩略图 → 播放"缩小回缩略图"过渡；主目录暂不播放（结构不同）
+  if (target === '/library') {
+    playFlyBack(() => router.push(target))
+  } else {
+    router.push(target)
+  }
 }
 
 // 手动打标（BUG3 任务化）：加入打标队列，进度见任务中心

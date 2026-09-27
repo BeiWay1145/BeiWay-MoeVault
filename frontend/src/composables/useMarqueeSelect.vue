@@ -20,6 +20,14 @@ const props = defineProps<{
   onSelect: (ids: number[], additive: boolean) => void
   /** 空白处"普通单击"（未拖动）时回调：用于取消选择。 */
   onBlankClick?: () => void
+  /**
+   * 是否启用框选。
+   *
+   * 必须由父级控制：图库被 keep-alive 缓存，切到详情页时组件**不会卸载**，
+   * 全局 mousedown 监听若继续生效，就会在详情页误触发框选、
+   * 并因 no-select 导致详情页文字无法选中（BUG1）。
+   */
+  enabled?: boolean
 }>()
 
 /** 拖拽阈值：小于该像素视为点击。 */
@@ -64,6 +72,8 @@ function isBlankTarget(target: EventTarget | null): boolean {
 }
 
 function onMouseDown(e: MouseEvent) {
+  // 未启用（如在详情页、或组件被 keep-alive 缓存但当前不在前台）时不响应
+  if (props.enabled === false) return
   if (e.button !== 0) return
   if (!isBlankTarget(e.target)) return
   // 必须落在主内容区（排除左侧导航、顶栏、弹窗等）
@@ -78,8 +88,9 @@ function onMouseDown(e: MouseEvent) {
   startY.value = e.clientY
   curX.value = e.clientX
   curY.value = e.clientY
-  // 框选期间禁止文本选择，否则拖动会把文字/图片一起选蓝
-  document.body.classList.add('no-select')
+  // 框选期间禁止文本选择（只作用于图片墙容器，不用 body——
+  // 加到 body 会波及详情页等其它区域）。
+  el?.classList.add('no-select')
 }
 
 function onMouseMove(e: MouseEvent) {
@@ -99,7 +110,7 @@ function onMouseUp(e: MouseEvent) {
   const wasDragging = dragging.value
   active.value = false
   dragging.value = false
-  document.body.classList.remove('no-select')
+  props.containerRef?.classList.remove('no-select')
   if (!wasDragging) {
     // 空白处普通单击（未拖动）→ 取消选择（按需求：选中状态下点击空白取消）
     props.onBlankClick?.()
@@ -135,7 +146,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onMouseDown)
   document.removeEventListener('mousemove', onMouseMove)
   document.removeEventListener('mouseup', onMouseUp)
-  document.body.classList.remove('no-select')
+  props.containerRef?.classList.remove('no-select')
 })
 </script>
 
@@ -146,9 +157,10 @@ onBeforeUnmount(() => {
 </template>
 
 <style>
-/* 框选/拖动期间禁止文本选择（全局：作用于 body，故不能用 scoped） */
-body.no-select,
-body.no-select * {
+/* 框选期间禁止文本选择。作用于图片墙容器（而非 body），
+   避免波及其它页面（如详情页本该可选中的文字）。 */
+.no-select,
+.no-select * {
   user-select: none !important;
   -webkit-user-select: none !important;
 }

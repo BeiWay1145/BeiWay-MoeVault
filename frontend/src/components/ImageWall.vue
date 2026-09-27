@@ -113,10 +113,15 @@ async function layoutWaterfall() {
   const el = containerRef.value
   if (!el || props.viewMode !== 'waterfall' || props.images.length === 0) return
   const newCols = resolveColumns()
-  if (newCols !== cols.value) {
+  const colsChanged = newCols !== cols.value
+  if (colsChanged) {
     cols.value = newCols
-    await nextTick()
   }
+  // 等一帧：列数变化会改变 grid 模板，卡片宽度随之变化；
+  // 宽度变化（如侧边栏收起/展开）同样需要让浏览器先完成布局，
+  // 否则 offsetHeight 读到的是过渡中间态 → span 算错 → 间隙变大或卡片重叠（BUG2）。
+  await nextTick()
+  await new Promise<void>((r) => requestAnimationFrame(() => r()))
   const items = el.querySelectorAll<HTMLElement>('.waterfall-item')
   // 第一遍：测每张卡片高度 → row span。
   // 注意：offsetHeight 不含 margin-bottom，但 item 在 grid 轨道内的实际占位 = 卡片高 + 12px 间距，
@@ -180,19 +185,42 @@ watch(
 
 let resizeObs: ResizeObserver | null = null
 let rafId: number | undefined
+/** 侧边栏过渡结束后的收尾定时器（见下）。 */
+let settleTimer: number | undefined
+/** 上一次测量到的容器宽度（用于识别宽度变化）。 */
+let lastWidth = 0
+
+/**
+ * 重排瀑布流（合并到下一帧，避免密集回调导致抖动）。
+ *
+ * 什么时候需要重排：容器宽度变化会改变卡片宽度 → aspect-ratio 高度变化 →
+ * 之前算出的 row span 失效，必须重新测量，否则出现间隙变大或卡片重叠（BUG2）。
+ * 典型来源：窗口缩放、以及**侧边栏收起/展开**（宽度过渡动画）。
+ */
+function scheduleLayout() {
+  if (rafId !== undefined) return
+  rafId = requestAnimationFrame(() => {
+    rafId = undefined
+    layoutWaterfall()
+  })
+}
+
 onMounted(async () => {
   await nextTick()
   await layoutWaterfall()
   const el = containerRef.value
   if (el) {
-    resizeObs = new ResizeObserver(() => {
-      // 窗口宽度变化（即使列数不变）也会改变卡片宽度 → aspect-ratio 高度变化 → span 失效。
-      // 用 requestAnimationFrame 合并：拖拽窗口时每帧最多重排一次，实时跟随且不塌缩闪烁。
-      if (rafId !== undefined) return
-      rafId = requestAnimationFrame(() => {
-        rafId = undefined
-        layoutWaterfall()
-      })
+    lastWidth = el.clientWidth
+    resizeObs = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? el.clientWidth
+      // 宽度未变（例如仅内容高度变化）→ 无需重排，省掉无谓开销
+      if (Math.abs(w - lastWidth) < 0.5) return
+      lastWidth = w
+      scheduleLayout()
+      // 侧边栏是**过渡动画**：过渡期间宽度连续变化，最后一帧回调未必在过渡结束之后。
+      // 这里再补一次延时重排，确保最终宽度下位置正确（修 BUG2：收起/展开后不重算）。
+      if (settleTimer !== undefined) window.clearTimeout(settleTimer)
+      settleTimer = window.setTimeout(() => scheduleLayout(), 320)
     })
     resizeObs.observe(el)
   }
@@ -203,6 +231,10 @@ onBeforeUnmount(() => {
   if (rafId !== undefined) {
     cancelAnimationFrame(rafId)
     rafId = undefined
+  }
+  if (settleTimer !== undefined) {
+    window.clearTimeout(settleTimer)
+    settleTimer = undefined
   }
 })
 

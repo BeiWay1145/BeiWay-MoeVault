@@ -201,6 +201,21 @@ export const useLibraryStore = defineStore('library', () => {
     selected.value = new Set()
   }
 
+  /**
+   * 视觉改进1：详情页返回时的"缩小飞回缩略图"过渡数据。
+   *
+   * 详情页在返回前写入（记录大图位置与图片地址），
+   * 图库在激活后读取、驱动 FLIP 过渡，完成后清空。
+   */
+  const flyBack = ref<{
+    imageId: number
+    src: string
+    from: { x: number; y: number; w: number; h: number }
+} | null>(null)
+function setFlyBack(v: typeof flyBack.value) {
+  flyBack.value = v
+}
+
   /** 记录进入详情页时的位置（来源页 + 图片 id + 滚动位置），供返回/重启还原。 */
   function saveDetailPos(from: string, imageId: number) {
     const scroller = document.querySelector('.app-main')
@@ -240,6 +255,8 @@ export const useLibraryStore = defineStore('library', () => {
     applyFilter,
     clearFilter,
     removeImageById,
+    flyBack,
+    setFlyBack,
     toggleSelect,
     clearSelect,
     saveDetailPos,
