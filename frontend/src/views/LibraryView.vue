@@ -111,6 +111,10 @@ onActivated(async () => {
   if (!restored) {
     const scroller = document.querySelector('.app-main')
     if (scroller) scroller.scrollTop = 0
+    // 视觉改进1：从其它板块切回（非详情返回）→ 重新播放渐进入场。
+    // 修复：此前只在 onMounted 播放，而 keep-alive 下切回不会重新挂载，
+    // 导致"切换到主目录再切回来"动画消失。
+    await playAppearAnimation()
   }
 })
 
