@@ -15,6 +15,12 @@ const props = defineProps<{
    * 滚动追加、窗口尺寸变化等场景为 false（保持即时显示，避免闪烁）。
    */
   appearAnim?: boolean
+  /**
+   * 动画批次号：每次需要播放入场动画时由父级递增。
+   * 作为列表项 key 的前缀 → 元素被重建 → CSS 动画可靠重播
+   * （仅改 class 常因浏览器优化而不重放，这是最稳的做法）。
+   */
+  appearEpoch?: number
 }>()
 
 const emit = defineEmits<{
@@ -46,8 +52,19 @@ const emit = defineEmits<{
 const APPEAR_ROW_MS = 34
 const APPEAR_COL_MS = 14
 const APPEAR_MAX_MS = 620
+/**
+ * 列表项 key。拼入 appearEpoch 后，父级要求播放动画时 key 变化 → 元素重建 →
+ * CSS 入场动画可靠重播（只切 class 常被浏览器优化掉，不重放）。
+ * 无动画时 epoch 恒定，key 稳定，Vue 复用元素（不影响性能与状态）。
+ */
+function imageKey(img: ImageItem): string {
+  return `${props.appearEpoch ?? 0}:${img.id}`
+}
+
 function appearDelayOf(img: ImageItem, idx: number): number | undefined {
   if (!props.appearAnim) return undefined
+  // 网格/列表模式：按容器实际列数推算（网格是 CSS auto-fill，用宽度估算）
+  // 瀑布流：用已测量的 cols（未就绪时即时推算，保证行号正确而非全为 0）
   const n = Math.max(1, cols.value || resolveColumns() || 1)
   const row = Math.floor(idx / n)
   const col = idx % n
@@ -206,7 +223,7 @@ function itemStyle(img: ImageItem) {
     >
       <div
         v-for="(img, idx) in images"
-        :key="img.id"
+        :key="imageKey(img)"
         class="waterfall-item"
         :data-image-id="img.id"
         :style="itemStyle(img)"
@@ -230,7 +247,7 @@ function itemStyle(img: ImageItem) {
 
   <div v-else class="image-wall" :class="`view-${viewMode}`">
     <TransitionGroup v-if="viewMode === 'list'" name="flip" tag="div" class="list-wrap">
-      <div v-for="(img, idx) in images" :key="img.id" class="list-row" :data-image-id="img.id">
+      <div v-for="(img, idx) in images" :key="imageKey(img)" class="list-row" :data-image-id="img.id">
         <ImageCard
           :image="img"
           :selected="selected?.has(img.id)"
@@ -247,7 +264,7 @@ function itemStyle(img: ImageItem) {
       </div>
     </TransitionGroup>
     <TransitionGroup v-else name="flip" tag="div" class="grid-wrap">
-      <div v-for="(img, idx) in images" :key="img.id" class="grid-cell" :data-image-id="img.id">
+      <div v-for="(img, idx) in images" :key="imageKey(img)" class="grid-cell" :data-image-id="img.id">
         <ImageCard
           :image="img"
           :selected="selected?.has(img.id)"

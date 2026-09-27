@@ -32,7 +32,8 @@ const settingsStore = useSettingsStore()
 
 // ---- 架构重构：统一选择模型（资源管理器风格）----
 // 所有选择入口（信息区点击、Ctrl 叠加、Shift 范围、Ctrl+A、框选、右键）都收敛到 sel。
-const sel = useSelection(() => library.images.map((i) => i.id))
+// 注意：范围选择/Ctrl+A 都基于"当前可见"的图片——见下方 visibleImageIds 的说明
+const sel = useSelection(() => visibleImageIds())
 /** 批量参数（注册表声明，模板自动渲染或右键子菜单使用）。 */
 const batchOptions = ref(defaultBatchOptions())
 /** 右键菜单组件引用。 */
@@ -63,17 +64,24 @@ function onLibraryPageSizeChange(s: number) {
  * 这些情况下保持即时显示，避免每次操作都"重放一遍"动画。
  */
 const appearAnim = ref(false)
+/** 动画批次号：每次播放递增，作为列表项 key 前缀强制重播动画。 */
+const appearEpoch = ref(0)
 let appearTimer: number | undefined
-/** 播放入场动画一批：重新挂载动画状态并在动画结束后关闭（避免后续追加也带动画）。 */
+
+/**
+ * 播放入场动画一批。
+ *
+ * 实现：递增 appearEpoch（列表项 key 随之变化 → 元素重建 → CSS 动画重播），
+ * 同时打开 appearAnim 以计算延迟；动画播完后关闭，后续追加项不再动画。
+ */
 async function playAppearAnimation() {
-  appearAnim.value = false
-  await nextTick()
   appearAnim.value = true
+  appearEpoch.value += 1
   if (appearTimer !== undefined) window.clearTimeout(appearTimer)
-  // 动画总时长 ≈ 最大延迟 + 单卡时长，留些余量后关闭；后续追加项不再动画
+  // 最长延迟(620ms) + 动画时长(340ms) + 余量
   appearTimer = window.setTimeout(() => {
     appearAnim.value = false
-  }, 1200)
+  }, 1100)
 }
 
 /** 按当前分页状态拉取（分页开启→cursor 翻页；关闭→一次拉取）。 */
@@ -238,14 +246,35 @@ watch(
   },
 )
 
-/** Ctrl+A 全选 / Escape 清空（焦点在输入框时不拦截）。 */
+/**
+ * 当前"可见"的图片 id（Ctrl+A 与范围选择的实际范围）。
+ *
+ * 为什么不能直接用 library.images：该数组是**累积**的——
+ * 开启分页时翻页会 append，关闭分页时滚动加载也 append，
+ * 因此它可能包含数百张而屏幕上只显示当前页。
+ * 用 DOM 里实际渲染的卡片作为"可见范围"，语义与资源管理器一致。
+ */
+function visibleImageIds(): number[] {
+  const el = wallContainerRef.value
+  if (!el) return library.images.map((i) => i.id)
+  const ids: number[] = []
+  el.querySelectorAll<HTMLElement>('[data-image-id]').forEach((n) => {
+    const id = Number(n.dataset.imageId)
+    if (Number.isFinite(id)) ids.push(id)
+  })
+  // DOM 未就绪（首帧）时回退到数据源
+  return ids.length > 0 ? ids : library.images.map((i) => i.id)
+}
+
+/** Ctrl+A 全选可见图 / Escape 清空（焦点在输入框时不拦截）。 */
 function onLibraryKeydown(e: KeyboardEvent) {
   const t = e.target as HTMLElement | null
   const tag = t?.tagName?.toLowerCase()
   if (tag === 'input' || tag === 'textarea' || t?.isContentEditable) return
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
     e.preventDefault()
-    sel.selectAll()
+    // 全选"当前可见"而非全部已加载（修复：一页 100 张却选中 200 张）
+    sel.setSelection(visibleImageIds())
     return
   }
   if (e.key === 'Escape') {
@@ -557,6 +586,7 @@ watch(
         :selected="sel.selected.value"
         :waterfall-columns="settingsStore.settings.waterfall_columns"
         :appear-anim="appearAnim"
+        :appear-epoch="appearEpoch"
         @click="onCardClick"
         @select="onSelect"
         @contextmenu="onContextMenu"
@@ -591,7 +621,11 @@ watch(
     />
 
     <!-- 框选（空白区按下起框；Ctrl 叠加） -->
-    <MarqueeSelect :container-ref="wallContainerRef" :on-select="onMarqueeSelect" />
+    <MarqueeSelect
+      :container-ref="wallContainerRef"
+      :on-select="onMarqueeSelect"
+      :on-blank-click="() => sel.clear()"
+    />
 
     <!-- 右键菜单（复用批量操作注册表，与工具栏同源；无需二次确认） -->
     <ContextMenu

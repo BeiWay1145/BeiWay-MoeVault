@@ -18,6 +18,8 @@ const props = defineProps<{
   containerRef: HTMLElement | null
   /** 命中后回调：ids 为被框住的图片，additive 表示是否叠加。 */
   onSelect: (ids: number[], additive: boolean) => void
+  /** 空白处"普通单击"（未拖动）时回调：用于取消选择。 */
+  onBlankClick?: () => void
 }>()
 
 /** 拖拽阈值：小于该像素视为点击。 */
@@ -60,6 +62,8 @@ function onMouseDown(e: MouseEvent) {
   startY.value = e.clientY
   curX.value = e.clientX
   curY.value = e.clientY
+  // 框选期间禁止文本选择，否则拖动会把文字/图片一起选蓝
+  document.body.classList.add('no-select')
 }
 
 function onMouseMove(e: MouseEvent) {
@@ -79,7 +83,12 @@ function onMouseUp(e: MouseEvent) {
   const wasDragging = dragging.value
   active.value = false
   dragging.value = false
-  if (!wasDragging) return
+  document.body.classList.remove('no-select')
+  if (!wasDragging) {
+    // 空白处普通单击（未拖动）→ 取消选择（按需求：选中状态下点击空白取消）
+    props.onBlankClick?.()
+    return
+  }
   // 计算命中：与选择框相交的图片卡片
   const box = {
     left: Math.min(startX.value, curX.value),
@@ -110,6 +119,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onMouseDown)
   document.removeEventListener('mousemove', onMouseMove)
   document.removeEventListener('mouseup', onMouseUp)
+  document.body.classList.remove('no-select')
 })
 </script>
 
@@ -118,6 +128,15 @@ onBeforeUnmount(() => {
     <div v-if="dragging" class="marquee" :style="rectStyle()" />
   </Teleport>
 </template>
+
+<style>
+/* 框选/拖动期间禁止文本选择（全局：作用于 body，故不能用 scoped） */
+body.no-select,
+body.no-select * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+</style>
 
 <style scoped>
 .marquee {

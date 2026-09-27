@@ -18,10 +18,44 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
 use windows::Win32::System::Ole::{
-  CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl, OleSetClipboard,
+  CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize,
+  OleSetClipboard,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DROPFILES, HDROP};
+
+/// 确保当前线程已初始化 OLE/COM。
+///
+/// **这是拖出与剪贴板能工作的前提**：DoDragDrop / OleSetClipboard 都要求线程已 OleInitialize，
+/// 否则直接返回失败（此前"复制图片无效"即因此）。
+/// 重复初始化返回 S_FALSE 属正常（同线程多次调用），依旧需要配对 OleUninitialize。
+fn ensure_ole() -> Result<(), String> {
+  unsafe {
+    // S_OK：首次初始化成功；S_FALSE：该线程已初始化（同样可用）；
+    // RPC_E_CHANGED_MODE：已被其它套间模式初始化——此时仍可继续使用 OLE（不视为错误）。
+    if let Err(e) = OleInitialize(None) {
+      // 0x80010106 = RPC_E_CHANGED_MODE
+      if e.code().0 != 0x8001_0106u32 as i32 {
+        return Err(format!("OleInitialize 失败: {e}"));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// COM 生命周期守卫。
+///
+/// 说明：这里**故意不在 Drop 中调用 OleUninitialize**。
+/// 原因：剪贴板（OleSetClipboard）设置的数据对象在进程内需保持可用，
+/// 而过早反初始化会导致后续粘贴失败；线程/进程退出时由系统回收更安全。
+struct OleGuard;
+
+impl OleGuard {
+  fn new() -> Result<Self, String> {
+    ensure_ole()?;
+    Ok(Self)
+  }
+}
 
 /// 把路径列表打包成 CF_HDROP 所需的全局内存块（DROPFILES 头 + 双 NUL 结尾的宽字符串）。
 ///
@@ -209,6 +243,8 @@ pub fn do_drag_out(hwnd: HWND, paths: Vec<String>) -> Result<(), String> {
   if valid.is_empty() {
     return Err("文件不存在".into());
   }
+  // 拖放同样需要 OLE 初始化
+  let _guard = OleGuard::new()?;
   unsafe {
     let data: IDataObject = FileDataObject::new(valid).into();
     let source: IDropSource = CopyDropSource.into();
@@ -233,8 +269,9 @@ pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<usize, String> {
     return Err("没有可复制的文件".into());
   }
   let n = valid.len();
+  // 剪贴板依赖 OLE；未初始化会导致静默失败（复制图片无效的根因）
+  let _guard = OleGuard::new()?;
   unsafe {
-    // 用 OleSetClipboard 包装成数据对象，兼容性优于裸 SetClipboardData
     let data: IDataObject = FileDataObject::new(valid).into();
     OleSetClipboard(&data).map_err(|e| format!("写入剪贴板失败: {e}"))?;
   }

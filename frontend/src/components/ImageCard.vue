@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { ImageItem } from '@/stores/library'
 import { thumbUrl } from '@/stores/library'
 
@@ -35,14 +35,63 @@ const src = computed(() => thumbUrl(props.image.thumbRel))
 // 仅当父级传入 appearDelay 时启用（首次加载 / 切换筛选词条），
 // 按索引递增延迟形成「从上到下、从左到右」的渐进出现；
 // 其它场景（滚动追加、窗口 resize）不传该 prop，保持即时渲染。
+/**
+ * 入场动画是否"本次应当播放"。
+ *
+ * 由父级通过 appearDelay 的**出现**来决定：
+ * 父级在需要动画时把 appearDelay 从 undefined 变为数值，
+ * 卡片捕获这一变化并锁定为 true（之后父级关掉开关也不影响已开始的动画）。
+ */
+const playEnter = ref(props.appearDelay !== undefined)
+watch(
+  () => props.appearDelay,
+  (v) => {
+    if (v !== undefined) playEnter.value = true
+  },
+)
+
+/**
+ * 用 key 强制重挂载：需要重播动画时递增，Vue 会重建元素从而重放 CSS 动画。
+ * 这是 CSS 动画最可靠的"重播"手段（改 class 常因浏览器优化而不重放）。
+ */
+const enterKey = ref(0)
+watch(
+  () => props.appearDelay,
+  (v) => {
+    if (v !== undefined) enterKey.value++
+  },
+)
+
 const appearStyle = computed(() => {
-  if (props.appearDelay === undefined) return {}
+  if (!playEnter.value || props.appearDelay === undefined) return {}
   return {
     animationDelay: `${props.appearDelay}ms`,
     animationFillMode: 'backwards',
+    animationDuration: '0.34s',
+    animationTimingFunction: 'ease-out',
+    animationName: 'card-appear',
   }
 })
-const appearing = computed(() => props.appearDelay !== undefined)
+const appearing = computed(() => playEnter.value && props.appearDelay !== undefined)
+
+/**
+ * 缩略图自身的淡入。
+ *
+ * 为什么需要：卡片入场动画很快（0.34s），而缩略图是 lazy 加载的，
+ * 常常在卡片动画结束后才解码完成——此时图片会"啪"地出现，
+ * 破坏"渐显"的观感。这里让缩略图在加载完成时也做一次淡入（与卡片动画解耦）。
+ */
+const thumbLoaded = ref(false)
+function onThumbLoad() {
+  thumbLoaded.value = true
+}
+// 换图时重置（虚拟滚动/列表复用时同一 DOM 会换数据）
+watch(
+  () => props.image.id,
+  () => {
+    thumbLoaded.value = false
+  },
+)
 
 // 瀑布流：缩略图高度按原图宽高比（长图更高，形成错落）
 const thumbStyle = computed(() => {
@@ -157,7 +206,9 @@ function fmtSize(bytes: number) {
         :src="src"
         fit="cover"
         class="thumb-img"
+        :class="{ 'thumb-loaded': thumbLoaded }"
         lazy
+        @load="onThumbLoad"
       >
         <template #error>
           <div class="thumb-fallback">无图</div>
@@ -189,23 +240,35 @@ function fmtSize(bytes: number) {
 </template>
 
 <style scoped>
-/* 入场：淡入 + 轻微上浮（渐变显示）。仅在父级传入 appearDelay 时启用。 */
+/* 入场：淡入 + 轻微上浮（渐变显示）。
+   注意：动画由内联 style 的 animationName 触发（见 appearStyle），
+   而不是靠切换 class —— 这样即使父级随后关掉 appearAnim，已开始的动画也不会被打断。 */
 @keyframes card-appear {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(12px) scale(0.98);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+    transform: translateY(0) scale(1);
   }
 }
-.image-card.appearing {
-  animation: card-appear 0.32s ease-out both;
+
+/* 缩略图懒加载完成时淡入：与卡片动画解耦，避免"图片晚到"导致突现。 */
+.thumb-img {
+  opacity: 0;
+  transition: opacity 0.28s ease-out;
 }
+.thumb-img.thumb-loaded {
+  opacity: 1;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .image-card.appearing {
-    animation: none;
+  .image-card,
+  .thumb-img {
+    animation: none !important;
+    transition: none !important;
+    opacity: 1 !important;
   }
 }
 
