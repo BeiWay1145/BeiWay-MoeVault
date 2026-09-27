@@ -333,7 +333,9 @@ onMounted(() => {
   window.addEventListener('moevault:import-done', onImportDone)
 })
 onActivated(() => {
-  // 切回主目录：保留筛选/展开/加载状态（不重置为默认）
+  // 切回主目录：保留筛选/展开/已加载的图片。
+  // 注意：这里只刷新"树 + 分组计数"（loadTree(true)），**不重载图片列表**——
+  // 重载会让缩略图重新解码造成闪烁；已展开目录的图片由 dirImages 缓存保留。
   if (days.value.length === 0) loadTree()
   else loadTree(true)
 })

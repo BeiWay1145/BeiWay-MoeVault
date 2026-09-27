@@ -135,30 +135,24 @@ onMounted(async () => {
   window.addEventListener('moevault:import-done', onImportDone)
 })
 
-// keep-alive 激活（从其他板块切回 / 从详情页返回）：重新拉取数据
-// （keep-alive 缓存组件时 onMounted 不会再次触发，需 onActivated 刷新）
+// keep-alive 激活（从其他板块切回 / 从详情页返回）。
+//
+// 关键：**默认不重新拉取列表**。
+// keep-alive 的意义就是保住已有数据与 DOM；
+// 每次激活都 fetchPage 会让缩略图重新解码 → 页面短暂闪烁（BUG3）。
+// 只有在"列表为空"（例如首次或上次加载失败）时才补拉。
 onActivated(async () => {
   viewActive.value = true
-  // 从详情页返回（flyBack 有值）时**不重新拉取列表**：
-  // 数据未变化，重新拉取会让缩略图重新解码/懒加载，表现为短暂闪烁（BUG3）。
-  const fromDetail = !!library.flyBack
-  if (!fromDetail) {
+  if (library.images.length === 0) {
     await fetchPage().catch((e: Error) => ElMessage.error(e.message))
   }
   await nextTick()
   // 从详情页返回：恢复上次浏览位置；从其他板块切回：回到顶部
   const restored = restorePos()
-  // 视觉改进1：从详情页返回 → 播放"大图缩小飞回缩略图"过渡
-  if (fromDetail) {
-    await playFlyBackTransition()
-    return
-  }
   if (!restored) {
     const scroller = document.querySelector('.app-main')
     if (scroller) scroller.scrollTop = 0
-    // 视觉改进1：从其它板块切回（非详情返回）→ 重新播放渐进入场。
-    // 修复：此前只在 onMounted 播放，而 keep-alive 下切回不会重新挂载，
-    // 导致"切换到主目录再切回来"动画消失。
+    // 从其它板块切回：重新播放渐进入场（仅一次干净的淡入，不再重复拉数据）
     await playAppearAnimation()
   }
 })
@@ -171,64 +165,6 @@ onDeactivated(() => {
   viewActive.value = false
 })
 
-/**
- * 视觉改进1：驱动"详情页大图缩小飞回缩略图"的 FLIP 过渡。
- *
- * 时机：详情页返回前把数据写入 store；图库激活后先让浏览器完成渲染（找到目标缩略图），
- * 再把浮层从大图的旧位置过渡到缩略图的新位置。
- *
- * 注：浮层用 fixed 定位覆盖在页面上，因此不会受 keep-alive / 滚动位置影响。
- */
-async function playFlyBackTransition() {
-  const fb = library.flyBack
-  if (!fb) return
-  library.setFlyBack(null) // 立即消费，避免重复播放
-
-  // 等列表渲染出目标缩略图（详情返回时可能伴随数据刷新）
-  await nextTick()
-  let target: HTMLElement | null = null
-  for (let i = 0; i < 12 && !target; i++) {
-    target = wallContainerRef.value?.querySelector<HTMLElement>(`[data-image-id="${fb.imageId}"]`) ?? null
-    if (!target) {
-      await new Promise<void>((r) => requestAnimationFrame(() => r()))
-    }
-  }
-  if (!target) return
-
-  const to = target.getBoundingClientRect()
-  if (to.width === 0) return
-
-  // 构造浮层：初始位置 = 详情页大图，结束位置 = 缩略图
-  const ghost = document.createElement('img')
-  ghost.src = fb.src
-  Object.assign(ghost.style, {
-    position: 'fixed',
-    left: `${fb.from.x}px`,
-    top: `${fb.from.y}px`,
-    width: `${fb.from.w}px`,
-    height: `${fb.from.h}px`,
-    objectFit: 'contain',
-    zIndex: '5000',
-    pointerEvents: 'none',
-    borderRadius: '8px',
-    transition: 'left .34s cubic-bezier(.4,0,.2,1), top .34s cubic-bezier(.4,0,.2,1), width .34s cubic-bezier(.4,0,.2,1), height .34s cubic-bezier(.4,0,.2,1), opacity .34s ease',
-    opacity: '1',
-  } as CSSStyleDeclaration)
-  document.body.appendChild(ghost)
-
-  // 下一帧开始过渡（确保初始位置先被应用）
-  await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))
-  Object.assign(ghost.style, {
-    left: `${to.x}px`,
-    top: `${to.y}px`,
-    width: `${to.width}px`,
-    height: `${to.height}px`,
-    opacity: '0.85',
-  } as CSSStyleDeclaration)
-
-  // 过渡结束后移除浮层（真实缩略图此时已就位，视觉无缝）
-  window.setTimeout(() => ghost.remove(), 380)
-}
 
 /** 增强1：导入完成 → 按当前筛选/排序重新拉取（保留浏览状态）。 */
 function onImportDone() {

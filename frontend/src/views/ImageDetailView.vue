@@ -268,48 +268,60 @@ async function recycle() {
   }
 }
 
-/**
- * 视觉改进1：返回图库时，让详情页的大图"缩小飞回"它在图库缩略图网格中的位置。
- *
- * 实现（FLIP）：
- * 1. 记录当前大图的位置与尺寸（First）
- * 2. 用一个固定定位的浮层承载这张图，放到大图位置，然后过渡到目标缩略图位置（Last）
- * 3. 过渡结束后移除浮层（目标页面已渲染出真实缩略图，视觉上无缝衔接）
- *
- * 目标位置通过 store 传递：图库在挂载/激活后按其 data-image-id 元素查找并回调。
- */
-function playFlyBack(onDone: () => void) {
-  const img = image.value
-  const stage = stageRef.value?.querySelector<HTMLElement>('.stage-img')
-  const el = stage ?? stageRef.value
-  if (!img || !el) {
-    onDone()
-    return
-  }
-  const from = el.getBoundingClientRect()
-  if (from.width === 0 || from.height === 0) {
-    onDone()
-    return
-  }
-  // 交给图库：它会在路由切换后查找目标缩略图并驱动过渡
-  library.setFlyBack({
-    imageId: img.id,
-    src: originalUrl(img.id),
-    from: { x: from.x, y: from.y, w: from.width, h: from.height },
-  })
-  onDone()
-}
+/** 缩回过渡进行中（避免重复触发）。 */
+const zoomingOut = ref(false)
 
-/** 返回来源页（画廊/主目录）——叉号点击直接返回，不受浏览多张影响。 */
-function goBack() {
+/**
+ * 视觉改进1：返回图库前，让详情页大图"缩回"它在图库缩略图中的位置。
+ *
+ * 设计（相比上一版的修正）：
+ * - **在详情页内就地播放**，动画结束后才 `router.push` ——
+ *   上一版是"先导航、再由图库从零构建浮层"，期间真实缩略图已渲染，
+ *   两者叠加反而造成闪烁，且目标元素常常还没就绪（改进无效果）。
+ * - 目标位置需要缩略图的屏幕坐标：图库处于 keep-alive 中，
+ *   其 DOM 仍在文档里（只是被隐藏），因此**可以提前查到**目标矩形。
+ * - 过渡用 transform（GPU 加速、不影响布局），结束后导航，视觉上连续。
+ */
+async function goBack() {
   const from = library.detailPos?.from
-  const target = from === 'imports' ? '/imports' : '/library'
-  // 仅图库有缩略图 → 播放"缩小回缩略图"过渡；主目录暂不播放（结构不同）
-  if (target === '/library') {
-    playFlyBack(() => router.push(target))
-  } else {
-    router.push(target)
+  const isLibrary = from !== 'imports'
+  const img = image.value
+  const stage = stageRef.value
+
+  // 主目录结构不同（分组展开），暂不播放缩略回退动画
+  if (!isLibrary || !img || !stage || zoomingOut.value) {
+    if (from === 'imports') router.push('/imports')
+    else router.push('/library')
+    return
   }
+
+  // 查目标缩略图（图库在 keep-alive 中，DOM 仍在文档内）
+  const target = document.querySelector<HTMLElement>(`.app-main [data-image-id="${img.id}"]`)
+  const el = stage.querySelector<HTMLElement>('.stage-img') ?? stage
+  // 注意：图库被 keep-alive 缓存但通常以 display:none 隐藏 →
+  // 此时 getBoundingClientRect 返回全 0，无法作为动画目标。
+  // 因此只在目标**当前可见**时播放动画；否则直接返回（不阻塞导航）。
+  const toRect = target?.getBoundingClientRect()
+  const fromRect = el.getBoundingClientRect()
+  if (!target || !toRect || toRect.width === 0 || fromRect.width === 0) {
+    router.push('/library')
+    return
+  }
+
+  zoomingOut.value = true
+  // 用 transform 从当前位置缩放到目标位置（以中心点对齐）
+  const dx = toRect.left + toRect.width / 2 - (fromRect.left + fromRect.width / 2)
+  const dy = toRect.top + toRect.height / 2 - (fromRect.top + fromRect.height / 2)
+  const scale = toRect.width / fromRect.width
+  el.style.transition = 'transform .32s cubic-bezier(.4,0,.2,1), opacity .32s ease'
+  el.style.transformOrigin = 'center center'
+  el.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`
+  el.style.opacity = '0'
+
+  // 动画结束再导航（等真实缩略图所在页面呈现，视觉连续）
+  window.setTimeout(() => {
+    router.push('/library')
+  }, 300)
 }
 
 // 手动打标（BUG3 任务化）：加入打标队列，进度见任务中心
