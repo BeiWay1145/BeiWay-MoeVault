@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowDown, ArrowRight, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -39,6 +39,19 @@ const aiFilter = ref<'all' | 'ai' | 'not_ai'>('all')
 // 来源组展开状态 + 组内图片缓存 + 分页游标
 const expanded = ref<Set<string>>(new Set())
 const dirImages = ref<Record<string, ImageItem[]>>({})
+
+/** 视觉改进1：渐进入场动画开关（首次展开目录时播放，滚动"加载更多"不播放）。 */
+const appearAnim = ref(false)
+let appearTimer: number | undefined
+async function playAppearAnimation() {
+  appearAnim.value = false
+  await nextTick()
+  appearAnim.value = true
+  if (appearTimer !== undefined) window.clearTimeout(appearTimer)
+  appearTimer = window.setTimeout(() => {
+    appearAnim.value = false
+  }, 1200)
+}
 const dirNext = ref<Record<string, string | null>>({})
 const dirLoading = ref<Record<string, boolean>>({})
 
@@ -90,6 +103,8 @@ async function toggleDir(d: DayGroup, g: DirGroup) {
   expanded.value = new Set(expanded.value)
   if (!dirImages.value[k]) {
     await loadDirImages(k, d.date, g.source_dir)
+    // 视觉改进1：首次展开该目录 → 渐进入场（"加载更多"与筛选重载不播放）
+    await playAppearAnimation()
   }
 }
 
@@ -304,6 +319,7 @@ onActivated(() => {
 })
 onUnmounted(() => {
   window.removeEventListener('moevault:import-done', onImportDone)
+  if (appearTimer !== undefined) window.clearTimeout(appearTimer)
 })
 
 /** 导入完成事件（增强1）：刷新树（分组计数）+ 重新加载所有已展开组的图片。
@@ -627,10 +643,11 @@ async function onSelectAll() {
           </div>
 
           <div v-if="expanded.has(dirKey(d, g))" v-loading="dirLoading[dirKey(d, g)]" class="dir-images">
-            <div v-for="img in dirImages[dirKey(d, g)] ?? []" :key="img.id" class="dir-cell">
+            <div v-for="(img, idx) in dirImages[dirKey(d, g)] ?? []" :key="img.id" class="dir-cell">
               <ImageCard
                 :image="img"
                 :selected="selected.has(img.id)"
+                :appear-delay="appearAnim ? Math.min(620, Math.floor(idx / 5) * 34 + (idx % 5) * 14) : undefined"
                 @click="onCardClick(d, g, img)"
                 @toggle-select="toggleSelect(img.id)"
                 @recycle="() => {}"

@@ -37,6 +37,30 @@ function onLibraryPageSizeChange(s: number) {
   localStorage.setItem('moevault-library-page-size', String(s))
 }
 
+/**
+ * 是否播放入场动画（从上到下、从左到右渐变显示）。
+ *
+ * 触发场景（视觉改进1）：
+ *  - 首次打开图库（onMounted）
+ *  - 重置筛选/切换搜索词条后重新拉取（见 watchFilters）
+ *  - 切换视图模式（网格/瀑布流/列表）
+ * 排除场景：分页翻页、滚动追加、导入完成刷新、窗口尺寸变化、从其它页面切回——
+ * 这些情况下保持即时显示，避免每次操作都"重放一遍"动画。
+ */
+const appearAnim = ref(false)
+let appearTimer: number | undefined
+/** 播放入场动画一批：重新挂载动画状态并在动画结束后关闭（避免后续追加也带动画）。 */
+async function playAppearAnimation() {
+  appearAnim.value = false
+  await nextTick()
+  appearAnim.value = true
+  if (appearTimer !== undefined) window.clearTimeout(appearTimer)
+  // 动画总时长 ≈ 最大延迟 + 单卡时长，留些余量后关闭；后续追加项不再动画
+  appearTimer = window.setTimeout(() => {
+    appearAnim.value = false
+  }, 1200)
+}
+
 /** 按当前分页状态拉取（分页开启→cursor 翻页；关闭→一次拉取）。 */
 async function fetchPage() {
   if (paginationOn.value) {
@@ -68,6 +92,8 @@ watch([paginationOn, pageSize], async () => {
 onMounted(async () => {
   await settingsStore.load()
   await fetchPage().catch((e: Error) => ElMessage.error(e.message))
+  // 视觉改进1：首次加载 → 渐变显示
+  await playAppearAnimation()
   // 增强1：从详情返回/重启后还原上次浏览位置
   await nextTick()
   restorePos()
@@ -95,6 +121,7 @@ function onImportDone() {
 
 onUnmounted(() => {
   window.removeEventListener('moevault:import-done', onImportDone)
+  if (appearTimer !== undefined) window.clearTimeout(appearTimer)
 })
 
 /** 恢复滚动位置：定位到上次查看详情的图片附近。返回是否成功恢复。 */
@@ -270,6 +297,24 @@ async function toggleSelectAll(on: boolean) {
     selectingAll.value = false
   }
 }
+
+/** 视觉改进1：筛选条件变化（切换搜索词条/筛选）→ 重新播放渐进入场动画。
+ *  这里监听 filter 的序列化值，避免 library.images 变化（含分页/导入刷新）误触发。 */
+watch(
+  () => JSON.stringify(library.filter),
+  async () => {
+    await playAppearAnimation()
+  },
+)
+
+/** 视觉改进1：切换视图模式（网格/瀑布流/列表）→ 也重新播放一次。 */
+watch(
+  () => library.viewMode,
+  async () => {
+    await nextTick()
+    await playAppearAnimation()
+  },
+)
 
 /** 选中集随筛选自动收缩：library.images 变化时，selected 只保留仍在当前显示里的图。 */
 watch(
@@ -602,6 +647,7 @@ watch(
         :view-mode="library.viewMode"
         :selected="library.selected"
         :waterfall-columns="settingsStore.settings.waterfall_columns"
+        :appear-anim="appearAnim"
         @click="onCardClick"
         @toggle-select="library.toggleSelect($event.id)"
         @preview="openPreview"

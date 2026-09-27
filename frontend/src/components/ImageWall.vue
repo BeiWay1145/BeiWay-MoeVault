@@ -9,6 +9,12 @@ const props = defineProps<{
   selected?: Set<number>
   /** 瀑布流列数：auto=按容器宽度自适应（220px 基准，最多 5 列）/ 2-6=固定列数 */
   waterfallColumns?: string
+  /**
+   * 是否播放"渐进入场"动画（从上到下、从左到右依次淡入上浮）。
+   * 仅在首次加载 / 切换搜索词条时为 true；
+   * 滚动追加、窗口尺寸变化等场景为 false（保持即时显示，避免闪烁）。
+   */
+  appearAnim?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -24,6 +30,24 @@ const emit = defineEmits<{
 // → 阅读顺序严格从左到右、从上到下；各列独立堆叠形成错落（行尾参差）。
 // 注意：容器 align-items: start，卡片高度不受 grid 轨道压缩，offsetHeight 始终是真实高度，
 // 因此重排时无需切换 grid-auto-rows（避免布局塌缩闪烁）。
+/**
+ * 计算某张图的入场动画延迟（毫秒）。
+ *
+ * 目标效果：从上到下、从左到右依次出现——
+ * 因此延迟 = 行号 × 行延迟 + 列号 × 列延迟；未开启动画时返回 undefined（不播放）。
+ * 单张最大延迟做上限封顶，避免一次加载几百张时末尾等待过久。
+ */
+const APPEAR_ROW_MS = 34
+const APPEAR_COL_MS = 14
+const APPEAR_MAX_MS = 620
+function appearDelayOf(img: ImageItem, idx: number): number | undefined {
+  if (!props.appearAnim) return undefined
+  const n = Math.max(1, cols.value || resolveColumns() || 1)
+  const row = Math.floor(idx / n)
+  const col = idx % n
+  return Math.min(APPEAR_MAX_MS, row * APPEAR_ROW_MS + col * APPEAR_COL_MS)
+}
+
 const containerRef = ref<HTMLElement | null>(null)
 const COL_GAP = 12
 const ROW_UNIT = 4
@@ -162,7 +186,7 @@ function itemStyle(img: ImageItem) {
       :style="waterfallStyle"
     >
       <div
-        v-for="img in images"
+        v-for="(img, idx) in images"
         :key="img.id"
         class="waterfall-item"
         :data-image-id="img.id"
@@ -171,6 +195,7 @@ function itemStyle(img: ImageItem) {
         <ImageCard
           :image="img"
           :selected="selected?.has(img.id)"
+          :appear-delay="appearDelayOf(img, idx)"
           waterfall-mode
           @click="emit('click', $event)"
           @toggle-select="emit('toggleSelect', $event)"
@@ -183,10 +208,11 @@ function itemStyle(img: ImageItem) {
 
   <div v-else class="image-wall" :class="`view-${viewMode}`">
     <TransitionGroup v-if="viewMode === 'list'" name="flip" tag="div" class="list-wrap">
-      <div v-for="img in images" :key="img.id" class="list-row" :data-image-id="img.id">
+      <div v-for="(img, idx) in images" :key="img.id" class="list-row" :data-image-id="img.id">
         <ImageCard
           :image="img"
           :selected="selected?.has(img.id)"
+          :appear-delay="appearDelayOf(img, idx)"
           list-mode
           @click="emit('click', $event)"
           @toggle-select="emit('toggleSelect', $event)"
@@ -196,10 +222,11 @@ function itemStyle(img: ImageItem) {
       </div>
     </TransitionGroup>
     <TransitionGroup v-else name="flip" tag="div" class="grid-wrap">
-      <div v-for="img in images" :key="img.id" class="grid-cell" :data-image-id="img.id">
+      <div v-for="(img, idx) in images" :key="img.id" class="grid-cell" :data-image-id="img.id">
         <ImageCard
           :image="img"
           :selected="selected?.has(img.id)"
+          :appear-delay="appearDelayOf(img, idx)"
           @click="emit('click', $event)"
           @toggle-select="emit('toggleSelect', $event)"
           @preview="emit('preview', $event)"

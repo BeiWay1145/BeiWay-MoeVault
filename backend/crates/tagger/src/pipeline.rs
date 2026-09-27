@@ -174,9 +174,11 @@ impl InferClient {
 }
 
 /// 任务过滤：批量模式下排除无需处理的图片（不浪费配额）。
-/// - `tag`：排除 AI 生成、已有自动标签、不可溯源
-/// - `sauce`：排除 AI 生成、不可溯源、已溯源（有 source_url 或非 local 来源）
-/// - `aesthetic`：排除已有美学分
+/// - `tag`：仅排除「已有自动标签」与 GIF。**不受 `no_auto_sauce` 影响**——
+///   该标记的语义是"不再自动溯源"，与打标无关（BUG1 修复：此前它同时阻断了打标，
+///   导致溯源没命中的图永远无法打标）。
+/// - `sauce`：排除 AI 生成、不可溯源（`no_auto_sauce`，force 时忽略）、已溯源
+/// - `aesthetic`：排除已有美学分（force 时不过滤）
 pub(crate) fn filter_eligible(
     db: &Db,
     kind: &str,
@@ -199,8 +201,9 @@ pub(crate) fn filter_eligible(
             .any(|t| matches!(t.source.as_str(), "auto_danbooru" | "auto_gelbooru" | "auto_local"));
         let is_sauced = img.source_url.is_some() || (img.source != "local" && !img.source.is_empty());
         let eligible = match kind {
-            // 打标：AI 图也参与（无 prompt 标签时本地模型打标），仅跳过已有标签/不可溯源/GIF
-            "tag" => !has_auto_tags && !img.no_auto_sauce,
+            // 打标：AI 图也参与（无 prompt 标签时本地模型打标）。
+            // 仅跳过「已有自动标签」与 GIF；**不看 no_auto_sauce**（那是溯源专用标记）。
+            "tag" => !has_auto_tags,
             // 溯源：AI 图无需溯源（无来源），跳过
             "sauce" => !is_ai && (!img.no_auto_sauce || force_sauce) && !is_sauced,
             "aesthetic" => img.aesthetic_score.is_none(),
@@ -338,10 +341,12 @@ async fn tag_one(
         return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
     }
 
-    // 不可溯源标记检查：已标记的图不自动溯源（用户手动 force 时跳过此检查）
+    // 不可溯源标记：跳过「溯源」环节，但**继续本地模型打标**。
+    // BUG1 修复：此前直接返回 Err，导致溯源没命中的图连本地打标也做不了
+    // （表现为整批 53 张图提交打标任务后被全部跳过）。
     if img.no_auto_sauce {
-        info!(image_id, "图片已标记不可溯源，跳过自动溯源（可用手动 retag 强制）");
-        return Err(TaggerError::NoSource("图片标记为不可溯源".into()));
+        info!(image_id, "图片已标记不可溯源，跳过溯源，改用本地模型打标");
+        return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
     }
 
     // 1. 溯源缓存命中（仅用于避免重复溯源；标签结果以实际入库为准）

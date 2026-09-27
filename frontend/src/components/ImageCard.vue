@@ -8,6 +8,11 @@ const props = defineProps<{
   selected?: boolean
   listMode?: boolean
   waterfallMode?: boolean
+  /**
+   * 入场动画延迟（毫秒）。用于首次加载/切换筛选时按「从上到下、从左到右」渐变显示。
+   * undefined = 不播放入场动画（滚动追加、窗口resize 等场景保持即时显示）。
+   */
+  appearDelay?: number
 }>()
 
 const emit = defineEmits<{
@@ -18,6 +23,19 @@ const emit = defineEmits<{
 }>()
 
 const src = computed(() => thumbUrl(props.image.thumbRel))
+
+// ---- 入场动画 ----
+// 仅当父级传入 appearDelay 时启用（首次加载 / 切换筛选词条），
+// 按索引递增延迟形成「从上到下、从左到右」的渐进出现；
+// 其它场景（滚动追加、窗口 resize）不传该 prop，保持即时渲染。
+const appearStyle = computed(() => {
+  if (props.appearDelay === undefined) return {}
+  return {
+    animationDelay: `${props.appearDelay}ms`,
+    animationFillMode: 'backwards',
+  }
+})
+const appearing = computed(() => props.appearDelay !== undefined)
 
 // 瀑布流：缩略图高度按原图宽高比（长图更高，形成错落）
 const thumbStyle = computed(() => {
@@ -57,7 +75,8 @@ function fmtSize(bytes: number) {
 <template>
   <div
     class="image-card"
-    :class="{ selected, 'list-mode': listMode, 'waterfall-mode': waterfallMode }"
+    :class="{ selected, 'list-mode': listMode, 'waterfall-mode': waterfallMode, appearing }"
+    :style="appearStyle"
     @click="emit('click', image)"
   >
     <div class="thumb" :style="thumbStyle">
@@ -97,6 +116,26 @@ function fmtSize(bytes: number) {
 </template>
 
 <style scoped>
+/* 入场：淡入 + 轻微上浮（渐变显示）。仅在父级传入 appearDelay 时启用。 */
+@keyframes card-appear {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.image-card.appearing {
+  animation: card-appear 0.32s ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .image-card.appearing {
+    animation: none;
+  }
+}
+
 .image-card {
   border-radius: 8px;
   overflow: hidden;
