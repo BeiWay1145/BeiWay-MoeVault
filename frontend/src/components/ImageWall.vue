@@ -87,15 +87,14 @@ function forwardDragOut(img: ImageItem) {
 }
 
 /**
- * 缩略图加载完成 → 合并重排瀑布流。
+ * 缩略图加载完成。
  *
- * 必要性：卡片高度由图片宽高比决定，而缩略图 lazy 加载——
- * 加载前测量得到极矮高度，span 全为 1，卡片会挤成细条堆叠（布局塌陷）。
- * 每张图加载完成都会触发，scheduleLayout 内部用 rAF 合并成一次重排。
+ * 这里**不再触发重排**：row span 现已由图片宽高比直接算出（见 layoutWaterfall），
+ * 与缩略图是否加载完成无关，因此无需重排。
+ * 保留监听仅为将来需要（例如图片实际比例与元数据不符）时可在此补一次 scheduleLayout。
  */
 function onThumbReady() {
-  if (props.viewMode !== 'waterfall') return
-  scheduleLayout()
+  // 故意留空：高度不再依赖图片加载状态
 }
 
 const containerRef = ref<HTMLElement | null>(null)
@@ -123,10 +122,17 @@ function resolveColumns(): number {
 /**
  * 测量卡片自然高度 → 按严格行序计算每张卡片的行列定位。
  *
- * 重要：**必须同步测量**（不能在中间 await 让出线程）。
- * 原因：让出线程后浏览器会按"旧 layout"重排一次 DOM，卡片高度随之改变，
- * 随后测到的是中间态高度 → span 全错 → 表现为所有卡片挤成细条堆叠（布局塌陷）。
- * 调用方负责确保 DOM 已就绪（watch 后先 nextTick）。
+ * 两条必须遵守的规则（都踩过坑）：
+ *
+ * 1. **同步测量**：中间不能 await 让出线程。
+ *    让出后浏览器会先按旧 layout 重排，随后测到的是中间态高度。
+ *
+ * 2. **测量前绝不能清空 layout**：
+ *    清空会让所有卡片瞬间失去 grid 定位、挤进自动流（高度变得极小），
+ *    此时测出来的 span 全是 1 → 布局永久塌陷（用户反馈的"全部堆叠"）。
+ *    正确做法是「先在现有定位下测量，再整体替换 layout」（本函数即如此）。
+ *
+ * 调用方负责确保 DOM 已就绪（先 nextTick）。
  */
 function layoutWaterfall() {
   const el = containerRef.value
@@ -135,19 +141,25 @@ function layoutWaterfall() {
   if (newCols !== cols.value) {
     cols.value = newCols
   }
-  const items = el.querySelectorAll<HTMLElement>('.waterfall-item')
-  // 测量前先把 layout 置空：否则卡片仍按旧 grid 坐标摆放，
-  // 测到的高度受旧定位影响（首帧尤其明显）。
-  layout.value = {}
-  // 第一遍：测每张卡片高度 → row span。
-  // 注意：offsetHeight 不含 margin-bottom，但 item 在 grid 轨道内的实际占位 = 卡片高 + 12px 间距，
-  // 必须把间距计入 span，否则卡片高度恰为 4px 倍数时 margin 溢出轨道与下一张重叠。
+  // 卡片宽度：由容器宽度与列数确定（比逐张测量 DOM 更可靠、也更快）
+  const cardW = (el.clientWidth - COL_GAP * (newCols - 1)) / newCols
+
+  // 第一遍：算每张卡片的 row span。
+  //
+  // **改为由图片宽高比推算，而不是测量 DOM 高度**：
+  // 瀑布流卡片的高度 = 缩略图高度(aspect-ratio = 原图宽高比) + 信息区固定高度，
+  // 这两者都可从数据直接得出，无需等 DOM 完成布局。
+  // 用测量则必须保证"测量时卡片已有正确宽度"，一旦顺序有误就会读到塌陷高度，
+  // 且缩略图 lazy 加载也会让高度变化——这是此前反复出现布局塌陷的根源。
+  // 卡片信息区高度：与 ImageCard.vue 的 .meta 样式保持一致
+  //   padding 6px×2 + .name(12px 行高约 17) + .sub(11px 行高约 16) ≈ 45
+  // 留少量余量避免因字体差异导致重叠。
+  const INFO_BAR_H = 48
   const spans: Record<number, number> = {}
-  items.forEach((it) => {
-    const id = Number(it.dataset.imageId)
-    if (!Number.isFinite(id)) return
-    const h = it.offsetHeight
-    spans[id] = Math.max(1, Math.ceil((h + COL_GAP) / ROW_UNIT))
+  props.images.forEach((img) => {
+    const ratio = img.width > 0 ? img.height / img.width : 1.4
+    const h = cardW * ratio + INFO_BAR_H
+    spans[img.id] = Math.max(1, Math.ceil((h + COL_GAP) / ROW_UNIT))
   })
   // 第二遍：严格行序分配列（第 i 张 → 列 i%N），每列独立堆叠（错落）
   const colHeights = new Array<number>(newCols).fill(0)
@@ -260,14 +272,40 @@ const waterfallStyle = computed(() => {
   return { gridTemplateColumns: `repeat(${c}, minmax(0, 1fr))` }
 })
 
-/** 单张卡片的 grid 定位 style（0 基 → 1 基） */
-function itemStyle(img: ImageItem) {
+/**
+ * 单张卡片的 grid 定位 style（0 基 → 1 基）。
+ *
+ * 关键：**必须有兜底定位**。
+ * 若 layout 尚未算出（首帧、刚切到瀑布流、数据刚更新）就返回空对象，
+ * 卡片会全部落进 grid 自动流的同一列，被挤成细条堆叠——
+ * 这正是用户反复反馈的"布局塌陷"。
+ * 兜底策略：按索引推算出列号与估算行高（用图片宽高比预估，无需等图片加载），
+ * 让首帧就有合理位置；真实测量随后会覆盖它。
+ */
+function itemStyle(img: ImageItem, idx: number) {
   const p = layout.value[img.id]
-  if (!p) return {}
+  if (p) {
+    return {
+      gridColumnStart: p.col + 1,
+      gridRowStart: p.rowStart + 1,
+      gridRowEnd: p.rowStart + p.span + 1,
+    }
+  }
+  // 兜底：按索引分列，行跨度按图片宽高比估算（4px 行单元 → span）
+  const c = Math.max(1, cols.value || resolveColumns() || 1)
+  const col = idx % c
+  const rowIndex = Math.floor(idx / c)
+  const ratio = img.width > 0 ? img.height / img.width : 1.4
+  // 卡片宽度按容器宽度/列数估算，避免依赖尚未完成的布局
+  const el = containerRef.value
+  const cardW = el ? (el.clientWidth - COL_GAP * (c - 1)) / c : BASE_COL_WIDTH
+  const estH = cardW * ratio + 48 // +48 预留信息区高度（与 layoutWaterfall 的 INFO_BAR_H 一致）
+  const span = Math.max(1, Math.ceil((estH + COL_GAP) / ROW_UNIT))
+  const rowStart = rowIndex * span
   return {
-    gridColumnStart: p.col + 1,
-    gridRowStart: p.rowStart + 1,
-    gridRowEnd: p.rowStart + p.span + 1,
+    gridColumnStart: col + 1,
+    gridRowStart: rowStart + 1,
+    gridRowEnd: rowStart + span + 1,
   }
 }
 </script>
@@ -286,7 +324,7 @@ function itemStyle(img: ImageItem) {
         :key="imageKey(img)"
         class="waterfall-item"
         :data-image-id="img.id"
-        :style="itemStyle(img)"
+        :style="itemStyle(img, idx)"
       >
         <ImageCard
           :image="img"
