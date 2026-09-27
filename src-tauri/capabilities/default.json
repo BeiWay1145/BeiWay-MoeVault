@@ -21,6 +21,9 @@
     "allow-infer-status",
     "allow-infer-install-deps",
     "allow-infer-install-gpu",
-    "allow-infer-gpu-status"
+    "allow-infer-gpu-status",
+    "allow-file-drag-out",
+    "allow-file-copy-to-clipboard",
+    "allow-file-copy-paths"
   ]
 }

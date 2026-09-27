@@ -17,6 +17,8 @@ export interface ImageItem {
   importedAt: number
   /** 缩略图相对路径（Windows 反斜杠→正斜杠，供 /thumbs 访问） */
   thumbRel: string
+  /** 库内相对路径（原图）：拖出/复制类操作据此定位真实文件（壳层会拼接库目录）。 */
+  relPath?: string
   /** 是否 AI 生成图片 */
   isAi: boolean
   /** 文件扩展名（如 jpg/png） */
@@ -78,8 +80,9 @@ export const useLibraryStore = defineStore('library', () => {
   } catch {
     /* 忽略 */
   }
-  /** 多选模式（画廊/搜索共用）：开启后点击图片直接切换选择，用于批量操作 */
-  const multiSelect = ref(false)
+  // 架构重构：移除 multiSelect（"多选模式"）概念。
+  // 选择改为资源管理器式无模式交互，由 composables/useSelection.ts 统一管理；
+  // selected 仍保留供视图读取（由 useSelection 同步写入）。
 
   /**
    * 详情页浏览上下文（增强2）：来源视图的有序图片 id 列表。
@@ -108,10 +111,6 @@ export const useLibraryStore = defineStore('library', () => {
 
   // 视图模式变化 → 持久化
   watch(viewMode, (m) => localStorage.setItem('moevault-view-mode', m))
-  // E9: 关闭多选模式时自动取消选择
-  watch(multiSelect, (on) => {
-    if (!on) clearSelect()
-  })
 
   const images = ref<ImageItem[]>([])
   const total = ref(0)
@@ -158,6 +157,7 @@ export const useLibraryStore = defineStore('library', () => {
         isRedundant: it.is_redundant as boolean,
         importedAt: it.imported_at as number,
         thumbRel: (it.thumb_rel as string) ?? '',
+        relPath: (it.rel_path as string) ?? undefined,
         isAi: it.is_ai as boolean,
         format: (it.format as string) ?? undefined,
         sourceUrl: (it.source_url as string) ?? undefined,
@@ -228,7 +228,6 @@ export const useLibraryStore = defineStore('library', () => {
     selected,
     filter,
     detailPos,
-    multiSelect,
     viewerContext,
     setViewerContext,
     clearViewerContext,

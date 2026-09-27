@@ -20,6 +20,13 @@ const emit = defineEmits<{
   toggleSelect: [image: ImageItem]
   preview: [image: ImageItem]
   recycle: [image: ImageItem]
+  /** 资源管理器式选择：携带修饰键（ctrl 叠加 / shift 范围）。
+   *  缩略图区在按住 Ctrl 时也走此事件（按需求：Ctrl+点击图片同样选中）。 */
+  select: [image: ImageItem, mods: { ctrl: boolean; shift: boolean }]
+  /** 右键：ids 为菜单应作用的目标（由父级按"是否已选中"决定）。 */
+  contextmenu: [image: ImageItem, event: MouseEvent]
+  /** 已选中的图片上开始拖动 → 请求拖出到资源管理器（复制语义）。 */
+  dragOut: [image: ImageItem, event: MouseEvent]
 }>()
 
 const src = computed(() => thumbUrl(props.image.thumbRel))
@@ -43,6 +50,63 @@ const thumbStyle = computed(() => {
   const ratio = props.image.height / props.image.width
   return { aspectRatio: `${props.image.width} / ${props.image.height}`, height: 'auto' }
 })
+
+// ---- 资源管理器式点击语义 ----
+// 需求：点击"名称/分辨率/大小/清晰度"这块边框区域 = 单选；
+// 按住 Ctrl 时，点图片或边框都是叠加选择；单击缩略图（无修饰键）仍打开详情。
+
+/** 缩略图区点击。Ctrl/Shift 时转为选择，否则打开详情。 */
+function onThumbClick(e: MouseEvent) {
+  if (e.ctrlKey || e.shiftKey) {
+    emit('select', props.image, { ctrl: e.ctrlKey, shift: e.shiftKey })
+    return
+  }
+  emit('click', props.image)
+}
+
+/** 信息区点击：始终走选择（无修饰键 = 替换式单选）。 */
+function onMetaClick(e: MouseEvent) {
+  e.stopPropagation()
+  emit('select', props.image, { ctrl: e.ctrlKey, shift: e.shiftKey })
+}
+
+/** 右键：上报给父级决定作用范围，并阻止浏览器默认菜单。 */
+function onContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  emit('contextmenu', props.image, e)
+}
+
+// ---- 拖出到资源管理器 ----
+// 需求：拖动已选图片 → 复制到桌面/资源管理器（无确认）。
+// 浏览器无法用 HTML5 DnD 携带真实文件路径，因此交由壳层原生 DoDragDrop 处理。
+// 这里只负责"检测到拖动意图"并通知父级。
+const DRAG_OUT_THRESHOLD = 5
+let pressX = 0
+let pressY = 0
+let pressOnSelected = false
+
+function onThumbMouseDown(e: MouseEvent) {
+  if (e.button !== 0) return
+  pressX = e.clientX
+  pressY = e.clientY
+  // 只有"已选中"的卡片才触发拖出（未选中时按下是框选/普通点击）
+  pressOnSelected = props.selected === true
+}
+
+function onThumbMouseMove(e: MouseEvent) {
+  if (!pressOnSelected) return
+  if (e.buttons !== 1) return
+  const dx = Math.abs(e.clientX - pressX)
+  const dy = Math.abs(e.clientY - pressY)
+  if (dx > DRAG_OUT_THRESHOLD || dy > DRAG_OUT_THRESHOLD) {
+    pressOnSelected = false // 只触发一次
+    emit('dragOut', props.image, e)
+  }
+}
+
+function onThumbMouseUp() {
+  pressOnSelected = false
+}
 
 // 右下角叉号两击删除：第一次点击变色（armed），再点一次送去回收站；Shift+点击直接删除
 const armed = ref(false)
@@ -77,9 +141,17 @@ function fmtSize(bytes: number) {
     class="image-card"
     :class="{ selected, 'list-mode': listMode, 'waterfall-mode': waterfallMode, appearing }"
     :style="appearStyle"
-    @click="emit('click', image)"
+    @contextmenu="onContextMenu"
   >
-    <div class="thumb" :style="thumbStyle">
+    <!-- 缩略图区：单击打开详情；Ctrl/Shift+单击 = 选择 -->
+    <div
+      class="thumb"
+      :style="thumbStyle"
+      @click="onThumbClick"
+      @mousedown="onThumbMouseDown"
+      @mousemove="onThumbMouseMove"
+      @mouseup="onThumbMouseUp"
+    >
       <el-image
         v-if="src"
         :src="src"
@@ -105,7 +177,8 @@ function fmtSize(bytes: number) {
         <span class="del-x">✕</span>
       </button>
     </div>
-    <div class="meta">
+    <!-- 信息区（名称/分辨率/大小/清晰度）：点击 = 单选；Ctrl/Shift 修饰 -->
+    <div class="meta" @click="onMetaClick">
       <div class="name" :title="image.name">{{ image.name }}</div>
       <div class="sub">
         {{ image.width }}×{{ image.height }} · {{ fmtSize(image.sizeBytes) }}

@@ -7,11 +7,16 @@ import { useLibraryStore, type ImageItem, type ViewMode } from '@/stores/library
 import { useTaskStore } from '@/stores/tasks'
 import { useSettingsStore } from '@/stores/settings'
 import { post } from '@/api/client'
+import { invoke } from '@tauri-apps/api/core'
 import { reportLog } from '@/api/log'
 import ImageWall from '@/components/ImageWall.vue'
 import ImagePreview from '@/components/ImagePreview.vue'
 import SearchFilter from '@/components/SearchFilter.vue'
 import ExportDialog from '@/components/ExportDialog.vue'
+import ContextMenu from '@/components/ContextMenu.vue'
+import MarqueeSelect from '@/composables/useMarqueeSelect.vue'
+import { useSelection } from '@/composables/useSelection'
+import { actionsFor, defaultBatchOptions, type BatchAction } from '@/constants/batchActions'
 
 // keep-alive 缓存名（与路由 name 一致）
 defineOptions({ name: 'library' })
@@ -24,6 +29,16 @@ const router = useRouter()
 const library = useLibraryStore()
 const taskStore = useTaskStore()
 const settingsStore = useSettingsStore()
+
+// ---- 架构重构：统一选择模型（资源管理器风格）----
+// 所有选择入口（信息区点击、Ctrl 叠加、Shift 范围、Ctrl+A、框选、右键）都收敛到 sel。
+const sel = useSelection(() => library.images.map((i) => i.id))
+/** 批量参数（注册表声明，模板自动渲染或右键子菜单使用）。 */
+const batchOptions = ref(defaultBatchOptions())
+/** 右键菜单组件引用。 */
+const ctxMenuRef = ref<InstanceType<typeof ContextMenu> | null>(null)
+/** 工具栏使用的批量动作。 */
+const toolbarActions = computed<BatchAction[]>(() => actionsFor('toolbar'))
 
 // E6: 分页模式（图库每页数独立 localStorage，增强4）
 const page = ref(1)
@@ -90,6 +105,7 @@ watch([paginationOn, pageSize], async () => {
 })
 
 onMounted(async () => {
+  window.addEventListener('keydown', onLibraryKeydown)
   await settingsStore.load()
   await fetchPage().catch((e: Error) => ElMessage.error(e.message))
   // 视觉改进1：首次加载 → 渐变显示
@@ -125,6 +141,7 @@ function onImportDone() {
 
 onUnmounted(() => {
   window.removeEventListener('moevault:import-done', onImportDone)
+  window.removeEventListener('keydown', onLibraryKeydown)
   if (appearTimer !== undefined) window.clearTimeout(appearTimer)
 })
 
@@ -167,13 +184,10 @@ function openPreview(img: ImageItem) {
   previewVisible.value = true
 }
 
-/** 点击卡片：多选模式→切换选择；否则进入详情（记录位置）。
+/** 单击缩略图：打开详情（记录位置）。
+ *  选择改由 @select 事件承担（点击信息区 / Ctrl+点击 / Shift+点击）。
  *  增强2：把当前筛选/排序下的列表 id 设为浏览上下文（详情上/下一张在本列表内切换）。 */
 function onCardClick(img: ImageItem) {
-  if (library.multiSelect) {
-    library.toggleSelect(img.id)
-    return
-  }
   const tags = library.filter.tags
   library.setViewerContext(
     library.images.map((i) => i.id),
@@ -181,6 +195,115 @@ function onCardClick(img: ImageItem) {
   )
   library.saveDetailPos('library', img.id)
   router.push(`/library/${img.id}`)
+}
+
+/**
+ * 资源管理器式选择（来自 ImageCard 的 @select）：
+ * - 点击信息区、或 Ctrl/Shift+点击 → 语义由 useSelection 统一决定
+ */
+function onSelect(img: ImageItem, mods: { ctrl: boolean; shift: boolean }) {
+  sel.applySelection(img.id, mods)
+  library.selected = sel.selected.value
+}
+
+/** 右键：已在选中集里 → 作用于整个选择集；否则仅作用于该图（不改变现有选择）。 */
+function onContextMenu(img: ImageItem, e: MouseEvent) {
+  const ids = sel.selected.value.has(img.id) ? [...sel.selected.value] : [img.id]
+  ctxMenuRef.value?.open(e, ids)
+}
+
+/**
+ * 在已选图片上拖动 → 拖出到资源管理器（复制，无确认）。
+ *
+ * 实现要点：浏览器 HTML5 DnD 无法携带真实文件路径，
+ * 因此调用壳层命令 file_drag_out（内部用原生 DoDragDrop + CF_HDROP）。
+ * 拖动的是整个选择集（与右键菜单"作用于选择集"的语义一致）。
+ */
+async function onDragOut() {
+  const ids = [...sel.selected.value]
+  const paths = resolveImagePaths(ids)
+  if (paths.length === 0) return
+  try {
+    await invoke('file_drag_out', { paths })
+  } catch (e) {
+    ElMessage.error(`拖出失败：${(e as Error).message ?? e}`)
+  }
+}
+
+/** 同步选择集到 library store（保持既有读取 path 兼容：library.selected）。 */
+watch(
+  () => sel.selected.value,
+  (s) => {
+    library.selected = new Set(s)
+  },
+)
+
+/** Ctrl+A 全选 / Escape 清空（焦点在输入框时不拦截）。 */
+function onLibraryKeydown(e: KeyboardEvent) {
+  const t = e.target as HTMLElement | null
+  const tag = t?.tagName?.toLowerCase()
+  if (tag === 'input' || tag === 'textarea' || t?.isContentEditable) return
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+    e.preventDefault()
+    sel.selectAll()
+    return
+  }
+  if (e.key === 'Escape') {
+    sel.clear()
+  }
+}
+
+/** 打开导出弹窗（供注册表的 export 动作调用）。 */
+function openExportFor(ids: number[]) {
+  exportIds.value = ids
+  exportDialogVisible.value = true
+}
+
+/** 框选容器（图片墙所在 div）。 */
+const wallContainerRef = ref<HTMLElement | null>(null)
+
+/** 框选命中回调：additive（Ctrl 按住）时叠加，否则替换。 */
+function onMarqueeSelect(ids: number[], additive: boolean) {
+  if (additive) sel.addToSelection(ids)
+  else sel.setSelection(ids)
+  if (ids.length > 0) sel.anchor.value = ids[0]
+}
+
+/** 把图片 id 解析成磁盘路径（拖出/复制类动作需要）。 */
+function resolveImagePaths(ids: number[]): string[] {
+  const cur = new Set(ids)
+  const out: string[] = []
+  for (const img of library.images) {
+    if (!cur.has(img.id)) continue
+    // 用库内相对路径：壳层的 file_ops 会把它拼到 `<安装目录>/data/library` 下
+    if (img.relPath) out.push(img.relPath)
+  }
+  return out
+}
+
+/** 批量执行上下文（注册表动作的统一入参）。 */
+function batchCtx(ids: number[]) {
+  return {
+    ids,
+    options: batchOptions.value,
+    refresh: () => fetchPage().catch(() => {}),
+    openExport: openExportFor,
+    clearSelection: () => sel.clear(),
+    resolvePaths: resolveImagePaths,
+  }
+}
+
+/** 执行一个批量动作（工具栏与右键菜单共用）。 */
+async function runBatchAction(action: BatchAction, ids: number[]) {
+  if (ids.length === 0) {
+    ElMessage.warning('没有可执行的图片')
+    return
+  }
+  try {
+    await action.run(batchCtx(ids))
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
 }
 
 /** 移入回收站（卡片叉号触发，叉号两击/Shift 点击已是确认动作，不再弹框）。 */
@@ -195,110 +318,17 @@ async function onRecycle(img: ImageItem) {
   }
 }
 
-/** 批量入回收站。 */
-async function onRecycleSelected() {
-  const ids = [...library.selected]
+
+// ---- 批量执行（架构重构后：统一走注册表，工具栏与右键菜单同源）----
+/** 工具栏当前展开的批量面板是否可见（有选中即显示）。 */
+const batchPanelVisible = computed(() => sel.count.value > 0)
+
+/** 执行工具栏选中的动作（逐个执行，全部完成后清理选择）。 */
+async function executeActions(actions: BatchAction[]) {
+  const ids = [...sel.selected.value]
   if (ids.length === 0) return
-  try {
-    await ElMessageBox.confirm(`将所选 ${ids.length} 张图片移入回收站？可随时恢复。`, '批量删除', {
-      type: 'warning',
-      confirmButtonText: '移入回收站',
-    })
-  } catch {
-    return
-  }
-  let ok = 0
-  for (const id of ids) {
-    try {
-      await post(`/images/${id}/recycle`, { reason: 'manual' })
-      ok++
-    } catch {
-      /* 单张失败继续 */
-    }
-  }
-  ElMessage.success(`已回收 ${ok} 张`)
-  library.clearSelect()
-  await library.fetchImages()
-}
-
-/** 批量打标（后端管线自动跳过带 AI 生成标签/已溯源已打标/不可溯源的图）。 */
-async function onBatchTag() {
-  const ids = [...library.selected]
-  if (ids.length === 0) return
-  const skip = ids.filter((id) => {
-    const it = library.images.find((i) => i.id === id)
-    return it ? it.isAi || (it.sourceUrl != null && it.sourceUrl !== '') : false
-  }).length
-  if (skip > 0) ElMessage.info(`其中 ${skip} 张（AI 图/已溯源）将自动跳过`)
-  try {
-    await taskStore.enqueueTag(ids)
-    library.clearSelect()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
-
-/** 批量美学评分。 */
-async function onBatchAesthetic() {
-  const ids = [...library.selected]
-  if (ids.length === 0) return
-  try {
-    await taskStore.enqueueAesthetic(ids, forceAesthetic.value)
-    library.clearSelect()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
-
-/** 批量 SauceNAO 溯源（自动跳过 AI 生成图；可选智能替换）。 */
-async function onBatchSauce() {
-  const ids = [...library.selected]
-  if (ids.length === 0) return
-  const skip = ids.filter((id) => {
-    const it = library.images.find((i) => i.id === id)
-    return it ? it.isAi : false
-  }).length
-  if (skip > 0) ElMessage.info(`其中 ${skip} 张 AI 生成图将自动跳过溯源`)
-  try {
-    await taskStore.enqueueSauce(ids, forceSauce.value, autoReplaceSauce.value)
-    library.clearSelect()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
-
-/** 批量溯源是否强制重试不可溯源图。 */
-const forceSauce = ref(false)
-/** 增强1：美学批量评分是否强制重评（忽略已有分数，覆盖旧分数）。 */
-const forceAesthetic = ref(false)
-/** 增强3：溯源后自动替换更清晰的原图（大小比对 + 严格查重）。 */
-const autoReplaceSauce = ref(false)
-
-// ---- 增强3：下拉框多选批量执行（与主目录一致）+ 全选 + 选中集随筛选自动收缩 ----
-const batchActions = ref<string[]>([])
-const execArmed = ref(false)
-let execTimer: number | undefined
-/** 全选当前显示的图。 */
-const selectAllCurrent = ref(false)
-const selectingAll = ref(false)
-
-/** 全选/取消全选当前筛选结果（library.images 即当前显示的图）。
- *  BUG2 修复：全选时自动进入多选模式。 */
-async function toggleSelectAll(on: boolean) {
-  selectingAll.value = true
-  try {
-    if (on) {
-      library.multiSelect = true
-      const s = new Set<number>()
-      for (const img of library.images) s.add(img.id)
-      selectAllCurrent.value = true
-      library.selected = s
-    } else {
-      selectAllCurrent.value = false
-      library.selected = new Set()
-    }
-  } finally {
-    selectingAll.value = false
+  for (const a of actions) {
+    await runBatchAction(a, ids)
   }
 }
 
@@ -324,59 +354,11 @@ watch(
 watch(
   () => library.images.map((i) => i.id).join(','),
   () => {
-    const cur = new Set(library.images.map((i) => i.id))
-    const shrunk = new Set([...library.selected].filter((id) => cur.has(id)))
-    // 全选状态：当前显示的图是否全被选中
-    selectAllCurrent.value = library.images.length > 0 && library.images.every((i) => shrunk.has(i.id))
-    if (shrunk.size !== library.selected.size) {
-      library.selected = shrunk
-    }
+    // 架构重构：收缩逻辑收敛到 useSelection，视图不再各自实现
+    sel.shrinkToVisible()
   },
 )
 
-/** BUG1：关闭多选模式时同步重置全选状态（勾选图标回到未选）。 */
-watch(
-  () => library.multiSelect,
-  (on) => {
-    if (!on) {
-      selectAllCurrent.value = false
-    }
-  },
-)
-
-/** 按优先级执行批量行为：AI检测 → 溯源 → 打标 → 美学；导出走独立弹窗。 */
-async function onExecuteBatch() {
-  const ids = [...library.selected]
-  if (ids.length === 0) {
-    ElMessage.warning('没有可执行的图片（请先多选或全选）')
-    return
-  }
-  // 导出：打开导出弹窗（不提交任务）
-  if (batchActions.value.includes('export')) {
-    openExportDialog(ids)
-    return
-  }
-  const order = ['ai-detect', 'sauce', 'tag', 'aesthetic']
-  for (const act of order) {
-    if (!batchActions.value.includes(act)) continue
-    switch (act) {
-      case 'ai-detect':
-        await onBatchDetectAi()
-        break
-      case 'sauce':
-        await onBatchSauce()
-        break
-      case 'tag':
-        await onBatchTag()
-        break
-      case 'aesthetic':
-        await onBatchAesthetic()
-        break
-    }
-  }
-  if (batchActions.value.length > 0) ElMessage.success('批量任务已全部提交')
-  batchActions.value = []
-}
 
 // ---- 功能增强1：批量导出（共用 ExportDialog 组件）----
 const exportDialogVisible = ref(false)
@@ -403,55 +385,7 @@ function onExportDone(info: { count: number; recycled: number }) {
   }
 }
 
-/** 执行按钮两击确认：第一下变红显示「确认执行」，再点执行；Shift 直接执行。 */
-function onExecClick(e: MouseEvent) {
-  if (batchActions.value.length === 0) {
-    ElMessage.warning('请先选择批量行为')
-    return
-  }
-  if (e.shiftKey) {
-    execArmed.value = false
-    onExecuteBatch()
-    return
-  }
-  if (execArmed.value) {
-    execArmed.value = false
-    if (execTimer !== undefined) window.clearTimeout(execTimer)
-    onExecuteBatch()
-  } else {
-    execArmed.value = true
-    if (execTimer !== undefined) window.clearTimeout(execTimer)
-    execTimer = window.setTimeout(() => (execArmed.value = false), 3000)
-  }
-}
 
-/** 批量检测 AI（逐张读 PNG tEXt；自动跳过已标记 AI 的图）。 */
-async function onBatchDetectAi() {
-  const ids = [...library.selected]
-  if (ids.length === 0) return
-  const todo = ids.filter((id) => {
-    const it = library.images.find((i) => i.id === id)
-    return it ? !it.isAi : true
-  })
-  if (todo.length === 0) {
-    ElMessage.info('所选图片均已标记为 AI 生成')
-    library.clearSelect()
-    return
-  }
-  ElMessage.info(`正在检测 ${todo.length} 张图片的 AI 元信息…`)
-  let ok = 0
-  for (const id of todo) {
-    try {
-      await post(`/images/${id}/ai-info`)
-      ok++
-    } catch {
-      /* 单张失败继续 */
-    }
-  }
-  ElMessage.success(`AI 检测完成：${ok} 张已处理`)
-  library.clearSelect()
-  await library.fetchImages()
-}
 
 /** 排序变化时重新拉取（后端排序）。 */
 async function onSortChange() {
@@ -607,53 +541,26 @@ watch(
         <el-option label="未溯源" value="unsauced" />
       </el-select>
 
-      <el-checkbox v-model="library.multiSelect">
-        多选模式
-      </el-checkbox>
-
-      <el-checkbox
-        :model-value="selectAllCurrent"
-        :indeterminate="selectedCount > 0 && !selectAllCurrent"
-        :disabled="library.images.length === 0"
-        @change="(v: boolean) => toggleSelectAll(v)"
-      >
-        全选({{ selectedCount }})
-      </el-checkbox>
+      <span class="hint select-hint">
+        {{ sel.count.value > 0 ? `已选 ${sel.count.value} 张 · 右键图片执行批量操作` : '单击信息区选中 · Ctrl 加选 · Shift 连选 · Ctrl+A 全选 · 空白处拖拽框选' }}
+      </span>
 
       <div class="spacer" />
 
-      <!-- 增强3：下拉框多选批量行为 + 两击确认执行（与主目录一致） -->
-      <template v-if="selectedCount > 0 || batchActions.length > 0">
-        <el-button type="danger" plain @click="onRecycleSelected">删除所选 ({{ selectedCount }})</el-button>
-        <el-select v-model="batchActions" multiple collapse-tags placeholder="选择批量行为" style="width: 220px" size="default" class="batch-action-select">
-          <el-option label="美学评分" value="aesthetic" :disabled="batchActions.includes('export')" />
-          <el-option label="打标" value="tag" :disabled="batchActions.includes('export')" />
-          <el-option label="溯源" value="sauce" :disabled="batchActions.includes('export')" />
-          <el-option label="AI 检测" value="ai-detect" :disabled="batchActions.includes('export')" />
-          <el-option label="导出" value="export" :disabled="batchActions.length > 0 && !batchActions.includes('export')" />
-        </el-select>
-        <el-checkbox v-if="batchActions.includes('aesthetic')" v-model="forceAesthetic" size="small">
-          强制重评（覆盖已有分数）
-        </el-checkbox>
-        <el-checkbox v-if="batchActions.includes('sauce')" v-model="forceSauce" size="small">强制重试不可溯源</el-checkbox>
-        <el-checkbox v-if="batchActions.includes('sauce')" v-model="autoReplaceSauce" size="small">原图替换</el-checkbox>
-        <el-button :type="execArmed ? 'danger' : 'primary'" plain @click="onExecClick" :title="'Shift+点击直接执行'">
-          {{ execArmed ? '确认执行' : '执行' }}
-        </el-button>
-        <el-button @click="library.clearSelect(); batchActions = []">取消</el-button>
-      </template>
       <el-button :icon="Refresh" circle title="刷新" @click="onSortChange" />
     </div>
 
-    <div class="wall-container">
+    <div ref="wallContainerRef" class="wall-container">
       <ImageWall
         :images="library.images"
         :view-mode="library.viewMode"
-        :selected="library.selected"
+        :selected="sel.selected.value"
         :waterfall-columns="settingsStore.settings.waterfall_columns"
         :appear-anim="appearAnim"
         @click="onCardClick"
-        @toggle-select="library.toggleSelect($event.id)"
+        @select="onSelect"
+        @contextmenu="onContextMenu"
+        @drag-out="onDragOut"
         @preview="openPreview"
         @recycle="onRecycle"
       />
@@ -681,6 +588,19 @@ watch(
       :ids="exportIds"
       :images="exportImages"
       @exported="onExportDone"
+    />
+
+    <!-- 框选（空白区按下起框；Ctrl 叠加） -->
+    <MarqueeSelect :container-ref="wallContainerRef" :on-select="onMarqueeSelect" />
+
+    <!-- 右键菜单（复用批量操作注册表，与工具栏同源；无需二次确认） -->
+    <ContextMenu
+      ref="ctxMenuRef"
+      :options="batchOptions"
+      :refresh="() => fetchPage().catch(() => {})"
+      :open-export="openExportFor"
+      :clear-selection="() => sel.clear()"
+      :resolve-paths="resolveImagePaths"
     />
   </div>
 </template>

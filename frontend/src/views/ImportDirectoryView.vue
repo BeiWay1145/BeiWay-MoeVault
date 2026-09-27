@@ -7,6 +7,8 @@ import { useLibraryStore, type ImageItem } from '@/stores/library'
 import { useTaskStore } from '@/stores/tasks'
 import { get, post } from '@/api/client'
 import ImageCard from '@/components/ImageCard.vue'
+import ContextMenu from '@/components/ContextMenu.vue'
+import { defaultBatchOptions } from '@/constants/batchActions'
 import ExportDialog from '@/components/ExportDialog.vue'
 
 // keep-alive 缓存名（与路由 name 一致，保证跨板块状态保存）
@@ -57,6 +59,28 @@ const dirLoading = ref<Record<string, boolean>>({})
 
 // 选中（跨组）
 const selected = ref<Set<number>>(new Set())
+
+// ---- 操作大改（阶段5）：右键菜单 + 批量参数 ----
+const batchOptions = ref(defaultBatchOptions())
+const ctxMenuRef = ref<InstanceType<typeof ContextMenu> | null>(null)
+
+/** 右键：已在选中集 → 作用于整个选择集；否则仅作用于该图。 */
+function onCardContextMenu(img: ImageItem, e: MouseEvent) {
+  const ids = selected.value.has(img.id) ? [...selected.value] : [img.id]
+  ctxMenuRef.value?.open(e, ids)
+}
+
+/** 把图片 id 解析为库内相对路径（壳层拼库目录）。 */
+function resolveImagePaths(ids: number[]): string[] {
+  const all = Object.values(dirImages.value).flat()
+  const cur = new Set(ids)
+  return all.filter((i) => cur.has(i.id) && i.relPath).map((i) => i.relPath as string)
+}
+
+/** 批量动作执行后刷新当前展开的目录。 */
+function refreshDirs() {
+  onImportDone().catch(() => {})
+}
 const selectedCount = computed(() => selected.value.size)
 const forceSauce = ref(false)
 /** 增强1：美学批量评分是否强制重评（忽略已有分数，覆盖旧分数）。 */
@@ -189,14 +213,10 @@ function isDirAllSelected(d: DayGroup, g: DirGroup) {
   return imgs.length > 0 && imgs.every((i) => selected.value.has(i.id))
 }
 
-/** 点击图片：多选模式切换选择，否则进详情。
+/** 点击图片：进入详情（选择改由复选框/右键菜单承担；阶段5 将统一为资源管理器式）。
  *  增强2：先把当前来源组已加载图片的有序 id 设为浏览上下文，
  *  详情页上/下一张将在本组内切换（A→B→C），而非全局库其他图片。 */
 function onCardClick(d: DayGroup, g: DirGroup, img: ImageItem) {
-  if (library.multiSelect) {
-    toggleSelect(img.id)
-    return
-  }
   library.setViewerContext(
     (dirImages.value[dirKey(d, g)] ?? []).map((i) => i.id),
     `${fmtDate(d.date)} · ${g.name}`,
@@ -650,6 +670,7 @@ async function onSelectAll() {
                 :appear-delay="appearAnim ? Math.min(620, Math.floor(idx / 5) * 34 + (idx % 5) * 14) : undefined"
                 @click="onCardClick(d, g, img)"
                 @toggle-select="toggleSelect(img.id)"
+                @contextmenu="onCardContextMenu"
                 @recycle="() => {}"
               />
               <div class="cell-check" @click.stop>
@@ -672,6 +693,16 @@ async function onSelectAll() {
     :ids="exportIds"
     :images="exportImages"
     @exported="onExportDone"
+  />
+
+  <!-- 操作大改（阶段5）：右键菜单（复用批量操作注册表，与图库一致） -->
+  <ContextMenu
+    ref="ctxMenuRef"
+    :options="batchOptions"
+    :refresh="refreshDirs"
+    :open-export="openExportDialog"
+    :clear-selection="() => (selected = new Set())"
+    :resolve-paths="resolveImagePaths"
   />
 </template>
 

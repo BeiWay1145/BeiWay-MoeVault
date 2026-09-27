@@ -1,0 +1,16 @@
+# 文件操作命令授权（拖出到资源管理器 / 复制文件或路径到剪贴板）。
+# 桌面壳自定义命令需显式 ACL 授权，否则 WebView2（remote origin）调用报 "not allowed by ACL"。
+[[permission]]
+identifier = "allow-file-drag-out"
+description = "允许把图片文件拖出到资源管理器（复制语义）"
+commands = { allow = ["file_drag_out"] }
+
+[[permission]]
+identifier = "allow-file-copy-to-clipboard"
+description = "允许复制图片文件到剪贴板"
+commands = { allow = ["file_copy_to_clipboard"] }
+
+[[permission]]
+identifier = "allow-file-copy-paths"
+description = "允许复制文件路径文本到剪贴板"
+commands = { allow = ["file_copy_paths"] }

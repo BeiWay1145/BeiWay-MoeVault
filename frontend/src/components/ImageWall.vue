@@ -22,6 +22,12 @@ const emit = defineEmits<{
   toggleSelect: [image: ImageItem]
   preview: [image: ImageItem]
   recycle: [image: ImageItem]
+  /** 资源管理器式选择（携带 ctrl/shift 修饰键）。 */
+  select: [image: ImageItem, mods: { ctrl: boolean; shift: boolean }]
+  /** 右键（父级决定作用范围）。 */
+  contextmenu: [image: ImageItem, event: MouseEvent]
+  /** 在已选图片上拖动 → 拖出到资源管理器。 */
+  dragOut: [image: ImageItem]
 }>()
 
 // ---- 瀑布流行序错落布局 ----
@@ -46,6 +52,19 @@ function appearDelayOf(img: ImageItem, idx: number): number | undefined {
   const row = Math.floor(idx / n)
   const col = idx % n
   return Math.min(APPEAR_MAX_MS, row * APPEAR_ROW_MS + col * APPEAR_COL_MS)
+}
+
+/** 转发选择事件（模板中不能写 TS 类型标注，故在脚本里定义）。 */
+function forwardSelect(img: ImageItem, mods: { ctrl: boolean; shift: boolean }) {
+  emit('select', img, mods)
+}
+/** 转发右键事件。 */
+function forwardContext(img: ImageItem, e: MouseEvent) {
+  emit('contextmenu', img, e)
+}
+/** 转发拖出事件。 */
+function forwardDragOut(img: ImageItem) {
+  emit('dragOut', img)
 }
 
 const containerRef = ref<HTMLElement | null>(null)
@@ -201,6 +220,9 @@ function itemStyle(img: ImageItem) {
           @toggle-select="emit('toggleSelect', $event)"
           @preview="emit('preview', $event)"
           @recycle="emit('recycle', $event)"
+          @select="forwardSelect"
+          @contextmenu="forwardContext"
+          @drag-out="forwardDragOut"
         />
       </div>
     </TransitionGroup>
@@ -218,6 +240,9 @@ function itemStyle(img: ImageItem) {
           @toggle-select="emit('toggleSelect', $event)"
           @preview="emit('preview', $event)"
           @recycle="emit('recycle', $event)"
+          @select="forwardSelect"
+          @contextmenu="forwardContext"
+          @drag-out="forwardDragOut"
         />
       </div>
     </TransitionGroup>
@@ -231,6 +256,9 @@ function itemStyle(img: ImageItem) {
           @toggle-select="emit('toggleSelect', $event)"
           @preview="emit('preview', $event)"
           @recycle="emit('recycle', $event)"
+          @select="forwardSelect"
+          @contextmenu="forwardContext"
+          @drag-out="forwardDragOut"
         />
       </div>
     </TransitionGroup>

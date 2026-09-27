@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 mod drag_drop;
+mod file_ops;
 
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent, RunEvent};
@@ -46,7 +47,10 @@ pub fn run() {
       infer_status,
       infer_install_deps,
       infer_install_gpu,
-      infer_gpu_status
+      infer_gpu_status,
+      file_drag_out,
+      file_copy_to_clipboard,
+      file_copy_paths
     ])
     .on_window_event(|window, event| {
       // 关闭窗口：根据后端设置 close_to_tray 决定 最小化到托盘 or 正常退出
@@ -1140,4 +1144,79 @@ fn infer_gpu_status() -> Result<serde_json::Value, String> {
     }
   }
   Ok(serde_json::json!({ "installing": installing, "cuda_ready": cuda_ready }))
+}
+
+// ---------- 文件操作（阶段4：拖出 / 剪贴板）----------
+
+/// 定位后端库目录（安装目录/data/library）。
+fn backend_library_dir() -> PathBuf {
+  install_root()
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("data")
+    .join("library")
+}
+
+/// 把前端传来的路径统一为绝对路径（相对路径按库目录解析）。
+fn resolve_image_paths(paths: Vec<String>) -> Vec<String> {
+  let library = backend_library_dir();
+  paths
+    .into_iter()
+    .map(|p| {
+      let path = PathBuf::from(&p);
+      if path.is_absolute() {
+        path
+      } else {
+        library.join(&p)
+      }
+    })
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect()
+}
+
+/// 桌面壳命令：把文件拖出到资源管理器（默认复制，无确认步骤）。
+///
+/// DoDragDrop 会阻塞直到用户松开鼠标，因此放到 blocking 任务执行，
+/// 避免阻塞 Tauri 的命令线程。
+#[tauri::command]
+async fn file_drag_out(
+  window: tauri::WebviewWindow,
+  paths: Vec<String>,
+) -> Result<serde_json::Value, String> {
+  let abs = resolve_image_paths(paths);
+  if abs.is_empty() {
+    return Err("没有可拖出的文件".into());
+  }
+  let count = abs.len();
+  // HWND 非 Send，不能跨线程传递；转成裸地址（isize）后在线程内重建。
+  // 该地址在拖出期间始终有效（窗口不会在此刻销毁）。
+  let raw = window.hwnd().map_err(|e| format!("获取窗口句柄失败: {e}"))?.0 as isize;
+  tauri::async_runtime::spawn_blocking(move || {
+    let hwnd = windows::Win32::Foundation::HWND(raw as _);
+    file_ops::do_drag_out(hwnd, abs)
+  })
+  .await
+  .map_err(|e| format!("拖出任务失败: {e}"))??;
+  Ok(serde_json::json!({ "ok": true, "count": count }))
+}
+
+/// 桌面壳命令：复制图片文件到剪贴板（可在资源管理器中粘贴）。
+#[tauri::command]
+async fn file_copy_to_clipboard(paths: Vec<String>) -> Result<serde_json::Value, String> {
+  let abs = resolve_image_paths(paths);
+  let n = tauri::async_runtime::spawn_blocking(move || file_ops::copy_files_to_clipboard(abs))
+    .await
+    .map_err(|e| format!("复制任务失败: {e}"))??;
+  Ok(serde_json::json!({ "ok": true, "count": n }))
+}
+
+/// 桌面壳命令：复制文件路径文本到剪贴板。
+#[tauri::command]
+async fn file_copy_paths(paths: Vec<String>) -> Result<serde_json::Value, String> {
+  let abs = resolve_image_paths(paths);
+  let n = abs.len();
+  let text = abs.join("\r\n");
+  tauri::async_runtime::spawn_blocking(move || file_ops::copy_text_to_clipboard(&text))
+    .await
+    .map_err(|e| format!("复制任务失败: {e}"))??;
+  Ok(serde_json::json!({ "ok": true, "count": n }))
 }
