@@ -10,14 +10,14 @@ cd src-tauri; cargo tauri build
 ```
 产物：`src-tauri/target/release/bundle/msi/BeiWay-MoeVault_0.1.0_x64_en-US.msi`
 
-## 提交
+## 提交与推送
 
-**每次进行修改的会话结束后都要 `git commit`**。
+**每次进行修改的会话结束后都要 `git commit` 并 `git push`**。
 
 - 会话结束时（本轮所有改动都已落地、构建验证完成）即提交一次，不需要等待用户额外确认
+- 提交后**立即推送到远端**（`git push`）
 - 提交前：跑通 `cargo test --workspace` 与 `npm run build`
 - 提交信息用中文、写清本轮改动范围
-- **推送（`git push`）仍需用户明确要求**，不自动推送
 
 ## 测试卫生
 
