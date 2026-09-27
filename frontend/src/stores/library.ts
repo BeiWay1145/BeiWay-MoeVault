@@ -72,8 +72,22 @@ export const useLibraryStore = defineStore('library', () => {
   const sortAsc = ref(false)
   const selected = ref<Set<number>>(new Set())
   const filter = ref<LibraryFilter>({})
-  /** 详情位置记忆：{from, imageId, scrollTop}（localStorage 持久化，退出还原） */
-  const detailPos = ref<{ from: string; imageId: number; scrollTop: number } | null>(null)
+  /**
+   * 详情位置记忆：{from, imageId, scrollTop, thumbRect}。
+   *
+   * thumbRect 是进入详情时该图缩略图在视口中的矩形——
+   * 视觉改进1 的"缩回缩略图"动画需要它作为终点。
+   * 之所以在**进入详情时**记录而不是返回时查询：
+   * 图库被 keep-alive 缓存时通常以 display:none 隐藏，
+   * 返回时 getBoundingClientRect() 会返回全 0，无法作为动画目标。
+   * 注意：thumbRect 是"当时的视口坐标"，返回时需结合滚动位置换算（见视图侧）。
+   */
+  const detailPos = ref<{
+    from: string
+    imageId: number
+    scrollTop: number
+    thumbRect?: { x: number; y: number; w: number; h: number }
+} | null>(null)
   try {
     const raw = localStorage.getItem('moevault-detail-pos')
     if (raw) detailPos.value = JSON.parse(raw) as { from: string; imageId: number; scrollTop: number }
@@ -202,11 +216,20 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
 
-  /** 记录进入详情页时的位置（来源页 + 图片 id + 滚动位置），供返回/重启还原。 */
-  function saveDetailPos(from: string, imageId: number) {
+  /**
+   * 记录进入详情页时的位置（来源页 + 图片 id + 滚动位置 + 缩略图矩形），
+   * 供返回还原与"缩回缩略图"动画使用。
+   *
+   * thumbRect：可选，调用方传入目标缩略图当前在视口中的矩形。
+   */
+  function saveDetailPos(
+    from: string,
+    imageId: number,
+    thumbRect?: { x: number; y: number; w: number; h: number },
+  ) {
     const scroller = document.querySelector('.app-main')
     const scrollTop = scroller ? scroller.scrollTop : window.scrollY
-    detailPos.value = { from, imageId, scrollTop }
+    detailPos.value = { from, imageId, scrollTop, thumbRect }
     try {
       localStorage.setItem('moevault-detail-pos', JSON.stringify(detailPos.value))
     } catch {

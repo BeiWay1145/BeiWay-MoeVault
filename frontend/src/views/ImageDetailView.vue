@@ -52,6 +52,14 @@ function onStageImgError() {
 watch(
   () => route.params.id,
   (newId, oldId) => {
+    // 视觉改进1：切换图片时同步更新"浏览位置"里的 imageId ——
+    // 否则详情页翻了几张后返回，动画会缩到最初那张的位置（错误落点）。
+    // 缩略图矩形沿用最初记录的那张（新图此刻不在图库视口内，无法取得坐标），
+    // 但图库返回后会以真实缩略图为准，这里仅保证"缩到的图与显示的一致"。
+    const idNum = Number(newId)
+    if (library.detailPos && Number.isFinite(idNum) && library.detailPos.from !== 'imports') {
+      library.detailPos = { ...library.detailPos, imageId: idNum }
+    }
     // 已加载完成的图（loadedImgId）才是旧图；仅记住真正的已显示图
     prevSrc.value = loadedImgId.value != null ? originalUrl(loadedImgId.value) : undefined
     imgLoaded.value = false
@@ -283,45 +291,55 @@ const zoomingOut = ref(false)
  * - 过渡用 transform（GPU 加速、不影响布局），结束后导航，视觉上连续。
  */
 async function goBack() {
-  const from = library.detailPos?.from
-  const isLibrary = from !== 'imports'
+  const pos = library.detailPos
+  const from = pos?.from
   const img = image.value
   const stage = stageRef.value
+  const el = stage?.querySelector<HTMLElement>('.stage-img') ?? stage
 
   // 主目录结构不同（分组展开），暂不播放缩略回退动画
-  if (!isLibrary || !img || !stage || zoomingOut.value) {
+  const canAnimate =
+    from !== 'imports' && !!img && !!el && !!pos?.thumbRect && !zoomingOut.value
+  if (!canAnimate) {
     if (from === 'imports') router.push('/imports')
     else router.push('/library')
     return
   }
 
-  // 查目标缩略图（图库在 keep-alive 中，DOM 仍在文档内）
-  const target = document.querySelector<HTMLElement>(`.app-main [data-image-id="${img.id}"]`)
-  const el = stage.querySelector<HTMLElement>('.stage-img') ?? stage
-  // 注意：图库被 keep-alive 缓存但通常以 display:none 隐藏 →
-  // 此时 getBoundingClientRect 返回全 0，无法作为动画目标。
-  // 因此只在目标**当前可见**时播放动画；否则直接返回（不阻塞导航）。
-  const toRect = target?.getBoundingClientRect()
-  const fromRect = el.getBoundingClientRect()
-  if (!target || !toRect || toRect.width === 0 || fromRect.width === 0) {
+  const fromRect = el!.getBoundingClientRect()
+  if (fromRect.width === 0) {
     router.push('/library')
     return
   }
 
-  zoomingOut.value = true
-  // 用 transform 从当前位置缩放到目标位置（以中心点对齐）
-  const dx = toRect.left + toRect.width / 2 - (fromRect.left + fromRect.width / 2)
-  const dy = toRect.top + toRect.height / 2 - (fromRect.top + fromRect.height / 2)
-  const scale = toRect.width / fromRect.width
-  el.style.transition = 'transform .32s cubic-bezier(.4,0,.2,1), opacity .32s ease'
-  el.style.transformOrigin = 'center center'
-  el.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`
-  el.style.opacity = '0'
+  // 目标矩形：进入详情时记录的缩略图视口坐标。
+  // 若期间列表滚动过，需按滚动差换算（滚动后再返回时仍能落到正确位置）。
+  const rect = pos!.thumbRect!
+  const scroller = document.querySelector('.app-main')
+  const scrollNow = scroller ? scroller.scrollTop : 0
+  const scrollThen = pos!.scrollTop
+  const toRect = {
+    x: rect.x,
+    y: rect.y - (scrollNow - scrollThen),
+    w: rect.w,
+    h: rect.h,
+  }
 
-  // 动画结束再导航（等真实缩略图所在页面呈现，视觉连续）
+  zoomingOut.value = true
+  // transform 缩放平移（以中心点对齐目标缩略图中心）
+  const dx = toRect.x + toRect.w / 2 - (fromRect.left + fromRect.width / 2)
+  const dy = toRect.y + toRect.h / 2 - (fromRect.top + fromRect.height / 2)
+  const scale = Math.max(0.02, toRect.w / fromRect.width)
+  el!.style.transition =
+    'transform .34s cubic-bezier(.4,0,.2,1), opacity .34s ease'
+  el!.style.transformOrigin = 'center center'
+  el!.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`
+  el!.style.opacity = '0.2'
+
+  // 动画结束再导航：此时图库已处于正确滚动位置，真实缩略图接管，视觉连续
   window.setTimeout(() => {
     router.push('/library')
-  }, 300)
+  }, 320)
 }
 
 // 手动打标（BUG3 任务化）：加入打标队列，进度见任务中心

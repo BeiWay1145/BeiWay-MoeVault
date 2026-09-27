@@ -240,7 +240,15 @@ function onCardClick(img: ImageItem) {
     library.images.map((i) => i.id),
     tags && tags.length > 0 ? `标签：${tags.join(' + ')}` : '图库',
   )
-  library.saveDetailPos('library', img.id)
+  // 视觉改进1：记录该图缩略图当前在视口中的矩形，供返回时的"缩回"动画作为终点。
+  // 必须在导航前取（此时图库可见）；返回时图库处于隐藏态，取不到有效坐标。
+  const thumbEl = wallContainerRef.value?.querySelector<HTMLElement>(`[data-image-id="${img.id}"]`)
+  const tr = thumbEl?.getBoundingClientRect()
+  library.saveDetailPos(
+    'library',
+    img.id,
+    tr && tr.width > 0 ? { x: tr.x, y: tr.y, w: tr.width, h: tr.height } : undefined,
+  )
   router.push(`/library/${img.id}`)
 }
 
