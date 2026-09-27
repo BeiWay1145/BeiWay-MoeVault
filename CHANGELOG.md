@@ -6,6 +6,17 @@
 
 ### 修复
 
+- **瀑布流卡片高度塌陷（细长条）的真正根因**：`ImageCard` 的瀑布流样式中写了
+  `.waterfall-mode .thumb { aspect-ratio: auto; height: auto; }`，
+  这两条**覆盖了由内联 style 提供的 aspect-ratio（原图宽高比）**，
+  使缩略图容器高度塌陷为 0（`.thumb-img` 的 `height:100%` 在父高未定时亦为 0）→
+  卡片变成细长条，且因 row span 与实际高度不符，整片布局看起来"堆叠"。
+  现改为：瀑布流下 `.thumb` 只约束 `width: 100%`，高度完全交给内联 aspect-ratio；
+  `.thumb-img` 显式 `width/height: 100%` 撑满容器。
+
+  说明：此前多轮修复集中在 JS 的 row span 计算上（那部分现已改为按宽高比推算、逻辑正确），
+  但 CSS 这处覆盖才是"卡片高度不对"的直接原因。
+
 - **瀑布流布局塌陷（所有卡片挤成细条堆叠）**：根因是 `row span` 依赖"测量 DOM 高度"，
   而测量时机极易出错——缩略图 lazy 加载、`await` 让出线程、测量前清空 layout
   都会读到塌陷状态的高度，使 span 全为 1（卡片挤在一列）。

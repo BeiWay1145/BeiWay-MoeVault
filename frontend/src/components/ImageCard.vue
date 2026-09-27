@@ -338,13 +338,19 @@ function fmtSize(bytes: number) {
   height: 72px;
   flex: none;
 }
+/* 瀑布流：缩略图高度由**内联** aspect-ratio（原图宽高比）决定。
+   注意：这里绝不能写 `aspect-ratio: auto` 或 `height: auto` ——
+   它们会覆盖内联样式，使容器高度塌陷为 0，
+   卡片随之变成细长条（用户反馈的"塌陷"）。
+   只约束宽度，高度交给 aspect-ratio。 */
 .waterfall-mode .thumb {
-  aspect-ratio: auto;
-  height: auto;
   width: 100%;
 }
+/* 图片必须撑满容器（容器高度由 aspect-ratio 决定） */
 .waterfall-mode .thumb-img {
   display: block;
+  width: 100%;
+  height: 100%;
 }
 .badge {
   position: absolute;
