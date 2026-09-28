@@ -49,6 +49,9 @@ const SETTINGS_WHITELIST: &[&str] = &[
     "export_open_explorer_manual",
     "export_default_dir",
     "aesthetic_kind",
+    // 增强2：SauceNAO 多出口 IP 轮换（Clash 多入站端口）
+    "sauce_proxy_enabled",
+    "sauce_proxy_ports",
 ];
 
 pub fn router() -> Router<AppState> {
@@ -57,6 +60,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/settings/saucenao-keys", get(list_keys).post(add_key))
         .route("/api/v1/settings/saucenao-keys/{name}", delete(delete_key))
         .route("/api/v1/settings/saucenao-keys/{name}/quota", put(set_key_quota))
+        .route("/api/v1/settings/sauce-exits", get(list_exits).post(test_exits))
         .route("/api/v1/devices", get(proxy_devices))
         .route("/api/v1/infer/health", get(proxy_infer_health))
 }
@@ -213,6 +217,27 @@ async fn update_settings(
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
+
+    // 增强2：设置保存后重建出口池（端口列表/开关可能已变化）。
+    // 重建是廉价操作（只是构造几个绑定代理的 Client），故每次保存都做，
+    // 保证运行中的溯源任务立即使用新配置，无需重启。
+    let db2 = state.db.clone();
+    let (ports, enabled) = tokio::task::spawn_blocking(move || {
+        (read_exit_ports(&db2), exits_enabled(&db2))
+    })
+    .await
+    .unwrap_or_default();
+    let pool = moevault_tagger::ExitPool::new(&ports, enabled);
+    {
+        let mut slot = state.exit_pool.write().await;
+        if enabled && !ports.is_empty() {
+            tracing::info!(?ports, "SauceNAO 多出口已启用");
+            *slot = Some(std::sync::Arc::new(pool));
+        } else {
+            *slot = None;
+        }
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -393,4 +418,127 @@ async fn delete_key(
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---------- 增强2：SauceNAO 多出口 IP 轮换（Clash 多入站端口）----------
+
+///
+/// 从 settings 读取出口端口列表。
+///
+/// 存储格式：逗号分隔的端口号字符串（如 `7901,7902,7903`）。
+/// 只允许端口号（应用固定拼 `http://127.0.0.1:{port}`），避免用户填入任意外部代理。
+fn read_exit_ports(db: &moevault_db::Db) -> Vec<u16> {
+    db.get_setting("sauce_proxy_ports")
+        .ok()
+        .flatten()
+        .map(|s| {
+            s.split([',', ';', ' ', '\n'])
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
+                .collect::<Vec<u16>>()
+        })
+        .unwrap_or_default()
+}
+
+/// 出口开关是否开启。
+fn exits_enabled(db: &moevault_db::Db) -> bool {
+    db.get_setting("sauce_proxy_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// GET /api/v1/settings/sauce-exits：返回出口配置与各出口的实时状态。
+async fn list_exits(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let (ports, enabled) = tokio::task::spawn_blocking(move || {
+        let p = read_exit_ports(&db);
+        let e = exits_enabled(&db);
+        (p, e)
+    })
+    .await
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
+
+    let live = {
+        let slot = state.exit_pool.read().await;
+        match slot.as_ref() {
+            Some(pool) => Some(pool.snapshot().await),
+            None => None,
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exits: Vec<Value> = match live {
+        Some(states) => states
+            .iter()
+            .map(|s| {
+                json!({
+                    "port": s.port,
+                    "exit_ip": s.exit_ip,
+                    "total_requests": s.total_requests,
+                    "disabled": s.disabled,
+                    "cooldown_secs": s.cooldown_until.saturating_sub(now),
+                    "consecutive_failures": s.consecutive_failures,
+                })
+            })
+            .collect(),
+        None => ports
+            .iter()
+            .map(|p| {
+                json!({
+                    "port": p,
+                    "exit_ip": Value::Null,
+                    "total_requests": 0,
+                    "disabled": false,
+                    "cooldown_secs": 0,
+                    "consecutive_failures": 0,
+                })
+            })
+            .collect(),
+    };
+
+    Ok(Json(json!({ "enabled": enabled, "ports": ports, "exits": exits })))
+}
+
+/// POST /api/v1/settings/sauce-exits：测试所有出口（探测各自出口 IP 与延迟）。
+///
+/// 若多个端口返回**相同出口 IP**，说明 Clash 配置未生效（各端口走了同一节点），
+/// 此时轮换无意义 —— 前端据此给出明确警告。
+async fn test_exits(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    let ports = tokio::task::spawn_blocking(move || read_exit_ports(&db))
+        .await
+        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
+    if ports.is_empty() {
+        return Err(error_response(
+            ErrorKind::InvalidInput,
+            "尚未配置出口端口，请先在设置中填写 Clash 的入站端口号",
+        ));
+    }
+    let pool = moevault_tagger::ExitPool::new(&ports, true);
+    let results = pool.probe_all().await;
+    let items: Vec<Value> = results
+        .iter()
+        .map(|(port, ip, note)| json!({ "port": port, "exit_ip": ip, "note": note }))
+        .collect();
+    let mut ips: Vec<String> = results.iter().filter_map(|(_, ip, _)| ip.clone()).collect();
+    ips.sort();
+    let before = ips.len();
+    ips.dedup();
+    let duplicate_ips = ips.len() < before;
+    Ok(Json(json!({
+        "exits": items,
+        "duplicate_ips": duplicate_ips,
+        "hint": if duplicate_ips {
+            "检测到多个出口使用相同 IP —— Clash 的 listeners 可能未生效（各端口走了同一节点），轮换无意义"
+        } else { "" },
+    })))
 }

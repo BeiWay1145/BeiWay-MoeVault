@@ -485,6 +485,11 @@ async fn run_tagging(
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
         let _ = db.add_log("info", "task", &format!("打标任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
+        // 增强2：出口池（None = 直连）
+        let exits = {
+            let slot = st.exit_pool.read().await;
+            slot.as_ref().cloned()
+        };
         let result = run_tag_pipeline_async(
             &db,
             &sauce,
@@ -495,6 +500,7 @@ async fn run_tagging(
             tag_threshold,
             force_ids,
             Some(job_id),
+            exits.as_deref(),
         )
         .await;
         let (status, done, failed, error) = match &result {
@@ -579,6 +585,12 @@ async fn run_sauce(
         Vec::new()
     };
 
+    // 增强2：取出口池（未配置时为 None → pipeline 走直连）
+    let exits = {
+        let slot = st.exit_pool.read().await;
+        slot.as_ref().cloned()
+    };
+
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
@@ -587,6 +599,7 @@ async fn run_sauce(
             &db,
             &sauce,
             &pool,
+            exits.as_deref(),
             &infer,
             &library_dir,
             min_sim,
@@ -653,11 +666,13 @@ async fn run_tag_pipeline_async(
     tag_threshold: f64,
     force_ids: Option<Vec<i64>>,
     job_id: Option<i64>,
+    exits: Option<&moevault_tagger::ExitPool>,
 ) -> Result<moevault_tagger::TagProgress, moevault_tagger::TaggerError> {
     moevault_tagger::run_tag_pipeline(
         db,
         sauce,
         pool,
+        exits,
         infer,
         library_dir,
         min_sim,
@@ -763,6 +778,11 @@ async fn retag_image(
     let infer = InferClient::new(infer_base).with_device(tagger_device.clone());
     let library_dir = st.library_dir();
 
+    // 增强2：取出口池（未配置时为 None → 走直连）
+    let exits = {
+        let slot = st.exit_pool.read().await;
+        slot.as_ref().cloned()
+    };
     tokio::spawn(async move {
         let _ = st.db.start_job(job_id, 1);
         let result = run_tag_pipeline_async(
@@ -775,6 +795,7 @@ async fn retag_image(
             tag_threshold,
             Some(vec![id]),
             Some(job_id),
+            exits.as_deref(),
         )
         .await;
         let (status, done, failed, error) = match &result {

@@ -233,6 +233,7 @@ pub async fn run_tag_pipeline(
     db: &Db,
     sauce: &SauceNaoClient,
     pool: &ApiKeyPool,
+    exits: Option<&crate::ExitPool>,
     infer: &InferClient,
     library_dir: &Path,
     min_sim: f64,
@@ -269,7 +270,7 @@ pub async fn run_tag_pipeline(
     };
 
     for image_id in &ids {
-        let result = tag_one(db, sauce, pool, infer, library_dir, min_sim, tag_threshold, *image_id).await;
+        let result = tag_one(db, sauce, pool, exits, infer, library_dir, min_sim, tag_threshold, *image_id).await;
         match result {
             Ok(()) => {
                 progress.done += 1;
@@ -301,6 +302,7 @@ async fn tag_one(
     db: &Db,
     sauce: &SauceNaoClient,
     pool: &ApiKeyPool,
+    exits: Option<&crate::ExitPool>,
     infer: &InferClient,
     library_dir: &Path,
     min_sim: f64,
@@ -363,7 +365,7 @@ async fn tag_one(
     let mut hit: Option<SauceHit> = None;
     for attempt in 0..=MAX_RATE_RETRIES {
         let (api_key, key_idx) = pool.acquire().await;
-        match sauce_one(db, sauce, pool, infer, library_dir, min_sim, image_id, api_key, key_idx).await {
+        match sauce_one(db, sauce, pool, exits, infer, library_dir, min_sim, image_id, api_key, key_idx).await {
             Ok(h) => {
                 hit = h;
                 break;
@@ -403,6 +405,7 @@ async fn sauce_one(
     db: &Db,
     sauce: &SauceNaoClient,
     pool: &ApiKeyPool,
+    exits: Option<&crate::ExitPool>,
     infer: &InferClient,
     library_dir: &Path,
     min_sim: f64,
@@ -428,8 +431,18 @@ async fn sauce_one(
         return Ok(None);
     }
 
+    // 增强2：多出口 IP 轮换 —— 从出口池取一个"有空闲额度"的出口（未配置时退化为直连）。
+    // 调度语义（按需求）：当前出口被限流后会被标记冷却，下次自动换到其它可用出口。
+    let (http_client, exit_idx) = match exits {
+        Some(p) => {
+            let (c, i) = p.acquire().await;
+            (c, Some((p, i)))
+        }
+        None => (reqwest::Client::new(), None),
+    };
+
     // SauceNAO 溯源（带 key）；失败也携带配额头，用于更新调度器
-    let (result, quota) = match sauce.search_file(&file_path, &api_key).await {
+    let (result, quota) = match sauce.search_file_with(&http_client, &file_path, &api_key).await {
         Ok(r) => r,
         Err((e, err_quota)) => {
             // 先更新配额（若响应带配额头）
@@ -439,6 +452,11 @@ async fn sauce_one(
                 // 不再当作"该图失败"——否则一次限流会白扔掉整批图。
                 TaggerError::RateLimited(secs) => {
                     pool.note_rate_limited(key_idx, secs.max(1) as u64).await;
+                    // 该出口同样被限流（SauceNAO 按 IP 计）→ 标记冷却，
+                    // 下次 acquire 会自动换到其它有空闲的出口。
+                    if let Some((p, i)) = exit_idx {
+                        p.note_rate_limited(i, secs.max(1) as u64).await;
+                    }
                     return Err(TaggerError::RateLimited(secs));
                 }
                 // 调用成功但无匹配：正常消耗配额，不冷却（避免"无结果"白等 30s）
@@ -460,6 +478,10 @@ async fn sauce_one(
     };
     // 成功：更新配额头；仅当短窗口配额耗尽时才冷却，否则继续用（全局窗口限流兜底）
     pool.update(key_idx, quota.short_remaining, quota.long_remaining).await;
+    // 出口请求成功 → 清零其连续失败计数
+    if let Some((p, i)) = exit_idx {
+        p.note_success(i).await;
+    }
     match quota.short_remaining {
         Some(0) => pool.start_cooldown(key_idx, 30).await,
         Some(_) => {}
@@ -508,6 +530,7 @@ pub async fn run_sauce_pipeline(
     db: &Db,
     sauce: &SauceNaoClient,
     pool: &ApiKeyPool,
+    exits: Option<&crate::ExitPool>,
     infer: &InferClient,
     library_dir: &Path,
     min_sim: f64,
@@ -561,6 +584,8 @@ pub async fn run_sauce_pipeline(
     // SauceNaoClient / InferClient 无 Sync 要求但需 'static：Arc 包装
     let sauce = std::sync::Arc::new(sauce.clone());
     let infer = std::sync::Arc::new(infer.clone());
+    // 出口池是共享只读状态（内部用 Arc<Mutex>），克隆进各 worker 即可
+    let exits_shared: Option<crate::ExitPool> = exits.cloned();
     let mut handles = Vec::new();
     for _ in 0..worker_count {
         let queue = queue.clone();
@@ -568,6 +593,7 @@ pub async fn run_sauce_pipeline(
         let db = db.clone();
         let sauce = sauce.clone();
         let pool = pool.clone();
+        let exits = exits_shared.clone();
         let infer = infer.clone();
         let library_dir = library_dir.to_path_buf();
         handles.push(tokio::spawn(async move {
@@ -603,6 +629,7 @@ pub async fn run_sauce_pipeline(
                     &db,
                     &sauce,
                     &pool,
+                    exits.as_ref(),
                     &infer,
                     &library_dir,
                     min_sim,

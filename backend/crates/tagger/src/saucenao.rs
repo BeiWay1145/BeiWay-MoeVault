@@ -70,6 +70,22 @@ impl SauceNaoClient {
         path: &Path,
         api_key: &str,
     ) -> Result<(SauceNaoResult, QuotaHeaders), (TaggerError, QuotaHeaders)> {
+        self.search_file_with(&self.http, path, api_key).await
+    }
+
+    ///
+    /// 用**指定 HTTP 客户端**溯源（增强2：多出口 IP 轮换）。
+    ///
+    /// 出口池为每个 Clash 入站端口维护一个绑定该代理的 Client，
+    /// 调度时选一个传进来 —— 于是不同请求从不同出口 IP 发出，
+    /// 各自独立计算 SauceNAO 的 4 次/30 秒 限额。
+    ///
+    pub async fn search_file_with(
+        &self,
+        http: &reqwest::Client,
+        path: &Path,
+        api_key: &str,
+    ) -> Result<(SauceNaoResult, QuotaHeaders), (TaggerError, QuotaHeaders)> {
         let raw = tokio::fs::read(path)
             .await
             .map_err(|e| (TaggerError::Io(e), QuotaHeaders::default()))?;
@@ -114,7 +130,7 @@ impl SauceNaoClient {
             .text("numres", "5")
             .part("file", part);
 
-        let resp = match self.http.post(SAUCENAO_ENDPOINT).multipart(form).send().await {
+        let resp = match http.post(SAUCENAO_ENDPOINT).multipart(form).send().await {
             Ok(r) => r,
             Err(e) => return Err((TaggerError::Http(e), QuotaHeaders::default())),
         };

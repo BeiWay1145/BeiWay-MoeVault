@@ -229,6 +229,11 @@ async fn resume_task(
     let library_dir = st.library_dir();
     let ids_len = ids.len();
 
+    // 增强2：取出口池（未配置时为 None → 走直连）
+    let exits = {
+        let slot = st.exit_pool.read().await;
+        slot.as_ref().cloned()
+    };
     tokio::spawn(async move {
         let db = st.db.clone();
         let _ = db.start_job(id, ids_len as i64);
@@ -236,6 +241,7 @@ async fn resume_task(
             &db,
             &sauce,
             &pool,
+            exits.as_deref(),
             &infer,
             &library_dir,
             min_sim,

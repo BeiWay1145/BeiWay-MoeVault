@@ -8,11 +8,13 @@
 
 pub mod aesthetic;
 pub mod booru;
+pub mod exitpool;
 pub mod keypool;
 pub mod pipeline;
 pub mod saucenao;
 
 pub use aesthetic::{run_aesthetic_pipeline, AestheticProgress};
+pub use exitpool::{ExitPool, ExitState};
 pub use keypool::{ApiKeyPool, KeyState};
 pub use pipeline::{run_sauce_pipeline, run_tag_pipeline, InferClient, SauceHit, SauceProgress, TagProgress};
 pub use saucenao::{SauceNaoClient, SauceNaoResult};

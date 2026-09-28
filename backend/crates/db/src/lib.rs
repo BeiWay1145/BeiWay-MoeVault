@@ -2162,21 +2162,27 @@ fn build_filter_conds(
     let mut conds: Vec<String> = vec!["i.status = ?1".to_string()];
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(status.to_string())];
 
-    // 标签筛选（AND 语义：每标签一个 EXISTS；空格/下划线归一化匹配）
+    // 标签筛选（AND 语义：每标签一个 EXISTS；空格/下划线**双向归一化**匹配）
+    //
+    // BUG2 修复：此前只把**库里的**空格转成下划线再与传入值比较
+    // （REPLACE(tg.name,' ','_') = ?），而传入值里的空格没有一起转 ——
+    // 库里是 "dusk (arknights)"、传入也是 "dusk (arknights)"，
+    // 左边变成 "dusk_(arknights)" 后与右边永远不等，筛选结果恒为 0。
+    // 现改为两边都归一化，两种写法（空格/下划线）都能命中。
     for tag in &filter.tags {
         let t = format!("?{}", params.len() + 1);
         conds.push(format!(
             "EXISTS (SELECT 1 FROM image_tags it JOIN tags tg ON tg.id = it.tag_id
-             WHERE it.image_id = i.id AND REPLACE(tg.name, ' ', '_') = {t})"
+             WHERE it.image_id = i.id AND REPLACE(tg.name, ' ', '_') = REPLACE({t}, ' ', '_'))"
         ));
         params.push(Box::new(tag.clone()));
     }
-    // 排除标签
+    // 排除标签（同样双向归一化）
     for tag in &filter.exclude_tags {
         let t = format!("?{}", params.len() + 1);
         conds.push(format!(
             "NOT EXISTS (SELECT 1 FROM image_tags it2 JOIN tags tg2 ON tg2.id = it2.tag_id
-             WHERE it2.image_id = i.id AND tg2.name = {t})"
+             WHERE it2.image_id = i.id AND REPLACE(tg2.name, ' ', '_') = REPLACE({t}, ' ', '_'))"
         ));
         params.push(Box::new(tag.clone()));
     }
