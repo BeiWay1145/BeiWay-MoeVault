@@ -17,6 +17,7 @@ import ContextMenu from '@/components/ContextMenu.vue'
 import MarqueeSelect from '@/composables/useMarqueeSelect.vue'
 import { useSelection } from '@/composables/useSelection'
 import { actionsFor, defaultBatchOptions, type BatchAction } from '@/constants/batchActions'
+import { findScrollContainer } from '@/utils/scrollTarget'
 
 // keep-alive 缓存名（与路由 name 一致）
 defineOptions({ name: 'library' })
@@ -108,7 +109,7 @@ async function fetchPage() {
 async function onPageChange(p: number) {
   page.value = p
   await fetchPage()
-  const scroller = document.querySelector('.app-main')
+  const scroller = findScrollContainer()
   if (scroller) scroller.scrollTop = 0
 }
 
@@ -148,13 +149,41 @@ onActivated(async () => {
   }
   await nextTick()
   // 从详情页返回：恢复上次浏览位置；从其他板块切回：回到顶部
-  const restored = restorePos()
+  const restored = await restorePos()
   if (!restored) {
-    const scroller = document.querySelector('.app-main')
+    const scroller = findScrollContainer()
     if (scroller) scroller.scrollTop = 0
     // 从其它板块切回：重新播放渐进入场（仅一次干净的淡入，不再重复拉数据）
     await playAppearAnimation()
   }
+  // 视觉改进1（关键）：位置恢复完成后，用**当下的真实布局**重新采集一次坐标，
+  // 并把当前图的矩形写回 detailPos 作为飞行终点。
+  //
+  // 为什么必须重采：离开详情页时记录的坐标是"图库隐藏期间"的旧布局（容器宽度可能不同），
+  // 返回后瀑布流会用真实宽度重新布局，旧坐标随之失效（曾导致越往下偏移越大）。
+  // 此刻图库已可见且布局稳定，采集到的才是正确的落点。
+  if (library.images.length > 0) {
+    const cont = wallContainerRef.value
+    if (cont && cont.clientWidth > 50) {
+      const rects: Record<number, { x: number; y: number; w: number; h: number }> = {}
+      cont.querySelectorAll<HTMLElement>('[data-image-id]').forEach((node) => {
+        const id = Number(node.dataset.imageId)
+        if (!Number.isFinite(id)) return
+        const thumb = node.querySelector<HTMLElement>('.thumb') ?? node
+        const r = thumb.getBoundingClientRect()
+        if (r.width > 0 && r.height > 0) rects[id] = { x: r.x, y: r.y, w: r.width, h: r.height }
+      })
+      const sc = findScrollContainer()
+      library.listLayout = { rects, scrollTop: sc ? sc.scrollTop : 0 }
+      // 当前图不在本次采集范围内（未渲染）时不影响；在则刷新其目标矩形
+      const cur = library.detailPos
+      if (cur && rects[cur.imageId]) {
+        library.detailPos = { ...cur, thumbRect: rects[cur.imageId] }
+      }
+    }
+  }
+  // 视觉改进1：滚动位置与坐标表**均已就位** → 通知详情页可以开始"飞向缩略图"过渡。
+  window.dispatchEvent(new CustomEvent('moevault:library-ready'))
 })
 
 /**
@@ -189,22 +218,80 @@ onUnmounted(() => {
 function restorePos() {
   const pos = library.restoreDetailPos('library')
   if (!pos) return false
-  const scroller = document.querySelector('.app-main')
-  const el = document.querySelector<HTMLElement>(`.app-main [data-image-id="${pos.imageId}"]`)
-  if (el) {
-    // 视口内则不滚动（保持用户离开时的视觉位置）
-    if (!scroller) return true
-    const r = el.getBoundingClientRect()
-    const sr = scroller.getBoundingClientRect()
-    const fullyVisible = r.top >= sr.top && r.bottom <= sr.bottom
-    if (!fullyVisible) {
-      el.scrollIntoView({ block: 'nearest' })
+  const scroller = findScrollContainer()
+  if (!scroller) return false
+
+  // 恢复进入详情时记录的精确 scrollTop（不用 scrollIntoView：它按"让元素完全可见"
+  // 反推滚动量，元素部分可见时也会滚动，导致返回后位置下移）。
+  //
+  // 关键难点：图库刚激活（display 从 none 切回）时，瀑布流卡片可能尚未渲染出高度，
+  // 此时容器内容高度不足，赋 scrollTop 会被浏览器**直接忽略**（表现为"回顶"）。
+  // 因此改为**轮询重试**：等滚动范围足够后设置，并在数帧内反复校准。
+  const target = pos.scrollTop
+  // 关键：优先按"目标图片回到离开时的视口位置"来恢复，而不是死认 scrollTop。
+  //
+  // 原因：返回时瀑布流可能因容器宽度变化而重新布局，内容总高随之改变
+  // （实测离开时 scrollHeight=9240、返回时 8031）。此时**同一个 scrollTop
+  // 对应的视觉位置不同**，越靠下的内容累积偏移越大（用户反馈的"越往下偏差越大"）。
+  // 而"目标缩略图在视口中的 y"是视觉锚点，与内容总高无关，用它恢复最稳。
+  const anchorY = pos.thumbRect?.y
+  reportLog(
+    '[flyback] restorePos ' +
+      JSON.stringify({
+        target,
+        anchorY,
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+        curScrollTop: scroller.scrollTop,
+        scrollerCls: scroller.className,
+      }),
+    'info',
+  )
+  if (target <= 0 && anchorY == null) return true
+
+  return new Promise<boolean>((resolve) => {
+    let attempts = 0
+    const tryRestore = () => {
+      attempts += 1
+      // 目标元素：按记录的图片 id 找到它在图库中的卡片
+      const el = document.querySelector<HTMLElement>(`[data-image-id="${pos.imageId}"]`)
+      let ok = false
+      if (el && anchorY != null) {
+        // 用锚点恢复：把目标卡片调整到离开时的视口 y 位置
+        const r = el.getBoundingClientRect()
+        const delta = r.top - anchorY
+        if (Math.abs(delta) > 1.5) {
+          scroller.scrollTop += delta
+        }
+        const after = el.getBoundingClientRect().top
+        ok = Math.abs(after - anchorY) <= 1.5
+      } else {
+        // 回退：按 scrollTop 恢复
+        const maxScroll = scroller.scrollHeight - scroller.clientHeight
+        if (maxScroll >= target - 1) {
+          scroller.scrollTop = target
+          ok = Math.abs(scroller.scrollTop - target) <= 1
+        }
+      }
+      if (ok || attempts > 40) {
+        reportLog(
+          '[flyback] restorePos 结果 ' +
+            JSON.stringify({
+              target,
+              anchorY,
+              finalTop: el ? Math.round(el.getBoundingClientRect().top) : -1,
+              attempts,
+              ok,
+            }),
+          ok ? 'info' : 'warn',
+        )
+        resolve(true)
+        return
+      }
+      requestAnimationFrame(tryRestore)
     }
-    return true
-  }
-  // 图片不在当前列表（可能已删除/筛选变化）：按比例恢复滚动
-  if (scroller && pos.scrollTop > 0) scroller.scrollTop = pos.scrollTop
-  return true
+    tryRestore()
+  })
 }
 
 const viewOptions: { key: ViewMode; icon: typeof Grid; label: string }[] = [
@@ -242,8 +329,61 @@ function onCardClick(img: ImageItem) {
   )
   // 视觉改进1：记录该图缩略图当前在视口中的矩形，供返回时的"缩回"动画作为终点。
   // 必须在导航前取（此时图库可见）；返回时图库处于隐藏态，取不到有效坐标。
-  const thumbEl = wallContainerRef.value?.querySelector<HTMLElement>(`[data-image-id="${img.id}"]`)
+  const cardEl = wallContainerRef.value?.querySelector<HTMLElement>(`[data-image-id="${img.id}"]`)
+  // 取缩略图区域（.thumb）而非整卡：卡片还含信息区，用整卡尺寸会让飞行层偏小
+  const thumbEl = cardEl?.querySelector<HTMLElement>('.thumb') ?? cardEl
   const tr = thumbEl?.getBoundingClientRect()
+
+  // 视觉改进1：采集**所有已渲染缩略图的真实矩形**，供详情页翻页后查表定位。
+  //
+  // 为什么采集坐标而不是记录布局参数：
+  // 瀑布流是"各列独立堆叠"，各列高度不同，用行列公式复现必然有偏差
+  // （实测偏约 1/4 卡片高度）。直接记录渲染结果的坐标，查表即逐像素一致。
+  const cont = wallContainerRef.value
+  const scroller = findScrollContainer()
+  if (cont) {
+    // 采样前让浏览器完成一次布局（瀑布流的 grid 定位、列宽计算都在布局阶段完成）。
+    // 立刻读坐标可能拿到"上一帧的过渡态"，表现为偶发的落点偏差。
+    // 读一次 offsetHeight 强制同步布局即可，不引入异步等待（不阻塞导航）。
+    void (cont as HTMLElement).offsetHeight
+    const rects: Record<number, { x: number; y: number; w: number; h: number }> = {}
+    cont.querySelectorAll<HTMLElement>('[data-image-id]').forEach((node) => {
+      const id = Number(node.dataset.imageId)
+      if (!Number.isFinite(id)) return
+      // **取缩略图区域（.thumb），而不是整张卡片**。
+      // 卡片 = 缩略图 + 信息区（名称/分辨率/大小）；
+      // 若用整卡高度做目标，飞行层按 contain 装进更高的框里，
+      // 视觉上就会比真实缩略图小（用户反馈的"尺寸不匹配"）。
+      const thumb = node.querySelector<HTMLElement>('.thumb') ?? node
+      const r = thumb.getBoundingClientRect()
+      if (r.width > 0 && r.height > 0) {
+        rects[id] = { x: r.x, y: r.y, w: r.width, h: r.height }
+      }
+    })
+    library.listLayout = { rects, scrollTop: scroller ? scroller.scrollTop : 0 }
+    reportLog(
+      '[flyback] 记录滚动 ' +
+        JSON.stringify({
+          scrollTop: scroller ? scroller.scrollTop : -1,
+          cls: scroller?.className,
+          scrollHeight: scroller?.scrollHeight,
+          clientHeight: scroller?.clientHeight,
+          rectCount: Object.keys(rects).length,
+        }),
+      scroller && scroller.scrollTop > 0 ? 'info' : 'warn',
+    )
+  }
+  reportLog(
+    '[flyback] 记录矩形 ' +
+      JSON.stringify({
+        hasContainer: !!wallContainerRef.value,
+        hasThumbEl: !!thumbEl,
+        rect: tr
+          ? { x: Math.round(tr.x), y: Math.round(tr.y), w: Math.round(tr.width), h: Math.round(tr.height) }
+          : null,
+      }),
+    tr && tr.width > 0 ? 'info' : 'warn',
+  )
   library.saveDetailPos(
     'library',
     img.id,
@@ -414,11 +554,31 @@ async function executeActions(actions: BatchAction[]) {
   }
 }
 
-/** 视觉改进1：筛选条件变化（切换搜索词条/筛选）→ 重新播放渐进入场动画。
- *  这里监听 filter 的序列化值，避免 library.images 变化（含分页/导入刷新）误触发。 */
+/**
+ * 视觉改进1：筛选条件变化（切换搜索词条）→ 重新播放渐进入场动画。
+ *
+ * 关键：**必须等新数据加载完成再播放**（BUG3）。
+ * 此前在 filter 变化时立即播放，而 fetchImages 是异步的 —— 结果是：
+ * 动画播在**旧列表**上，随后新数据到达又重建卡片，产生"从右下角往左上角收起"的
+ * 错乱观感与明显卡顿（两批卡片各自播一遍动画）。
+ * 现改为：等 library.images 的内容真正更新后再播，且只播一次。
+ */
+let pendingAppear = false
 watch(
   () => JSON.stringify(library.filter),
+  () => {
+    // 只打标记；真正的播放交给 images 变化后的回调，确保播在新数据上
+    pendingAppear = true
+  },
+)
+
+/** 数据更新后，若此前有筛选变化待播放，则播一次入场动画。 */
+watch(
+  () => library.images.map((i) => i.id).join(','),
   async () => {
+    if (!pendingAppear) return
+    pendingAppear = false
+    await nextTick()
     await playAppearAnimation()
   },
 )

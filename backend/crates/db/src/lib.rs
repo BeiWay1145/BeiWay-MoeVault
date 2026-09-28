@@ -2180,10 +2180,18 @@ fn build_filter_conds(
         ));
         params.push(Box::new(tag.clone()));
     }
-    // 关键字（文件名 LIKE）
+    // 关键字：匹配**文件名 + 标签名 + 标签中文名**（BUG2 修复）。
+    //
+    // 此前只匹配 i.rel_path（文件名），导致：用户给标签设了中文名后按中文搜索无结果
+    // ——中文名只存在于 tags 表，而文件名里不会有中文。
+    // 现同时匹配标签体系，语义与 danbooru 风格搜索一致：
+    //   文件名包含 q，或该图关联了名字/中文名/中文别名包含 q 的标签。
     if let Some(q) = &filter.q {
+        // 占位符复用：先算出序号 t，再把模板里的 __P__ 全部替换为它。
+        // （Rust 的 format! 不允许同一具名参数重复出现，故用字符串替换法。）
         let t = format!("?{}", params.len() + 1);
-        conds.push(format!("i.rel_path LIKE {t}"));
+        let sql_q = "(i.rel_path LIKE __P__ OR EXISTS (SELECT 1 FROM image_tags it3 JOIN tags tg3 ON tg3.id = it3.tag_id WHERE it3.image_id = i.id AND (tg3.name LIKE __P__ OR tg3.name_cn LIKE __P__ OR EXISTS (SELECT 1 FROM tag_aliases ta3 WHERE ta3.tag_id = tg3.id AND ta3.alias LIKE __P__))))".replace("__P__", &t);
+        conds.push(sql_q);
         params.push(Box::new(format!("%{q}%")));
     }
     // 日期范围（exif_datetime 回退 file_mtime 语义：用 COALESCE）

@@ -143,6 +143,7 @@ fn read_keys(db: &moevault_db::Db) -> Result<Vec<SauceNaoKey>, moevault_db::DbEr
             name: format!("Key{i}"),
             key: k,
             tier: "free".to_string(),
+            ..Default::default()
         })
         .collect();
     Ok(keys)
@@ -230,12 +231,20 @@ async fn list_keys(
         .await
         .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
         .map_err(db_error_response)?;
-    // 实时配额：从 sauce_pool 快照合并（pool 未初始化时为 None）
+    // 实时配额：从 sauce_pool 快照合并（pool 未初始化时为 None）。
+    //
+    // 若 pool 尚未初始化（例如刚启动、还没跑过溯源任务），
+    // 则**从持久化快照文件恢复一次**——pool 每次溯源后都会 save()，
+    // 这样前端在进程重启后依然能看到真实的剩余额度，
+    // 而不是永远显示初始值 95（BUG1：额度计数不减少）。
     let live = {
         let slot = state.sauce_pool.read().await;
         match slot.as_ref() {
             Some(pool) => Some(pool.snapshot().await),
-            None => None,
+            None => {
+                let persist = state.data_dir.join("sauce_keys.json");
+                moevault_tagger::keypool::ApiKeyPool::load_snapshot(&persist)
+            }
         }
     };
     // 全局 IP 池窗口状态（免费账号 4 次 / 30 秒，跨 key 共享）
@@ -263,8 +272,17 @@ async fn list_keys(
                 "key_masked": format!("{}...{}", &k.key[..2.min(k.key.len())], &k.key[k.key.len().saturating_sub(2)..]),
                 "tier": k.tier,
                 "has_key": true,
-                "short_remaining": lr.map(|s| s.short_remaining).unwrap_or(0),
-                "long_remaining": lr.map(|s| s.long_remaining).unwrap_or(95),
+                // 实时态优先；无实时态（进程重启后 pool 重建）时**回退到持久化配置**，
+                // 而不是硬编码默认值 —— 否则前端永远显示 95，
+                // 表现为"溯源后额度计数不减少"（BUG1）。
+                "short_remaining": lr
+                    .map(|s| s.short_remaining)
+                    .or(k.short_remaining)
+                    .unwrap_or(0),
+                "long_remaining": lr
+                    .map(|s| s.long_remaining)
+                    .or(k.long_remaining)
+                    .unwrap_or(95),
                 "cooldown_secs": lr.map(|s| s.cooldown_secs()).unwrap_or(0),
                 "daily_paused": lr.map(|s| s.daily_paused).unwrap_or(false),
                 "total_requests": lr.map(|s| s.total_requests).unwrap_or(0),
@@ -352,7 +370,7 @@ async fn add_key(
                 }
             }
         };
-        keys.push(SauceNaoKey { name: name.clone(), key, tier });
+        keys.push(SauceNaoKey { name: name.clone(), key, tier, ..Default::default() });
         write_keys(&db, &keys).map_err(db_error_response)?;
         Ok::<String, (axum::http::StatusCode, Json<Value>)>(name)
     })

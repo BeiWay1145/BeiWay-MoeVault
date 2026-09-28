@@ -137,6 +137,11 @@ function resolveColumns(): number {
 function layoutWaterfall() {
   const el = containerRef.value
   if (!el || props.viewMode !== 'waterfall' || props.images.length === 0) return
+  // 容器尚未获得有效宽度（如 keep-alive 激活瞬间仍是 display:none）时不要计算：
+  // 否则会用错误宽度（0 或过小）算出偏窄的卡片 → 卡片变高 → 内容总高偏大，
+  // 返回图库后整体布局与离开时不一致（表现为"越往下偏移越大"）。
+  // 此时直接返回，等 ResizeObserver 感知到真实宽度后会再触发一次。
+  if (el.clientWidth < 50) return
   const newCols = resolveColumns()
   if (newCols !== cols.value) {
     cols.value = newCols

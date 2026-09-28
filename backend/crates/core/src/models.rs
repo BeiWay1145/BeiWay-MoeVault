@@ -137,7 +137,7 @@ pub enum SortKey {
 }
 
 /// SauceNAO API key 配置项（settings 表 saucenao_keys JSON）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SauceNaoKey {
     /// 密钥名称（默认 Key0/Key1/.../KeyN）。
     pub name: String,
@@ -146,6 +146,20 @@ pub struct SauceNaoKey {
     /// 账号等级：free / member。
     #[serde(default = "default_tier")]
     pub tier: String,
+    ///
+    /// 当日剩余额度（SauceNAO 响应头的 long_remaining，每日 95~100）。
+    ///
+    /// **为什么持久化到配置里**：配额此前只存在运行时 pool 的内存快照中，
+    /// 进程重启或 pool 重建后即丢失，表现为"溯源后额度计数不减少"（BUG1）。
+    /// 这里落库后，前端每次读取都能拿到真实剩余量。
+    #[serde(default)]
+    pub long_remaining: Option<i64>,
+    /// 30 秒窗口内的剩余额度（short_remaining），同样持久化以便展示。
+    #[serde(default)]
+    pub short_remaining: Option<i64>,
+    /// 最近一次校准时间（Unix 秒），用于判断配额是否跨日需要重置。
+    #[serde(default)]
+    pub quota_updated_at: Option<i64>,
 }
 
 fn default_tier() -> String {

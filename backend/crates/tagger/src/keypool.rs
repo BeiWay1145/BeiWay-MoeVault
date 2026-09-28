@@ -232,6 +232,24 @@ impl ApiKeyPool {
         })
     }
 
+    ///
+    /// 只读取持久化快照中的 key 状态（**不校验 key 集合**）。
+    ///
+    /// 用途：API 在运行时 pool 尚未初始化时（如应用刚启动、还没跑溯源任务）
+    /// 仍然能展示真实的剩余额度。此时不能走 `load_from`——它要求 key 集合完全一致，
+    /// 在"配置刚改过 / 尚未初始化"的场景下会返回 None，导致前端只能显示默认值。
+    ///
+    /// 读取失败（文件不存在/损坏）返回 None，调用方回退到配置里的持久化字段。
+    pub fn load_snapshot(path: &std::path::Path) -> Option<Vec<KeyState>> {
+        let data = std::fs::read_to_string(path).ok()?;
+        let snap: PoolSnapshot = serde_json::from_str(&data).ok()?;
+        if snap.keys.is_empty() {
+            None
+        } else {
+            Some(snap.keys)
+        }
+    }
+
     /// 保存快照（async 内调用）。
     async fn save(&self) {
         let guard = self.inner.lock().await;

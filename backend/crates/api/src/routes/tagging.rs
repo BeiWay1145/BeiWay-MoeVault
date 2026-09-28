@@ -344,6 +344,7 @@ pub(crate) fn read_tag_config_public(
                 name: format!("Key{i}"),
                 key: k,
                 tier: "free".to_string(),
+                ..Default::default()
             })
             .collect()
     } else {

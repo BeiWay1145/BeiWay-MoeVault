@@ -5,9 +5,11 @@ import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { ArrowDown, ArrowRight, ArrowLeft } from '@element-plus/icons-vue'
 import { displayTagName, searchTagKey } from '@/utils/tagNormalize'
 import { useLibraryStore, originalUrl } from '@/stores/library'
+import { findScrollContainer } from '@/utils/scrollTarget'
 import { useTaskStore } from '@/stores/tasks'
 import { useSettingsStore } from '@/stores/settings'
 import { get, post, put, del } from '@/api/client'
+import { reportLog } from '@/api/log'
 
 const route = useRoute()
 const router = useRouter()
@@ -52,13 +54,24 @@ function onStageImgError() {
 watch(
   () => route.params.id,
   (newId, oldId) => {
-    // 视觉改进1：切换图片时同步更新"浏览位置"里的 imageId ——
-    // 否则详情页翻了几张后返回，动画会缩到最初那张的位置（错误落点）。
-    // 缩略图矩形沿用最初记录的那张（新图此刻不在图库视口内，无法取得坐标），
-    // 但图库返回后会以真实缩略图为准，这里仅保证"缩到的图与显示的一致"。
+    // 视觉改进1：切换图片时**重算目标缩略图坐标**。
+    //
+    // 为什么必须重算：图库中每张缩略图的位置各不相同（网格/瀑布流的列位置不同），
+    // 若沿用最初那张的 thumbRect，翻页后返回会飞向错误位置
+    // ——用户反馈的"错位到左边"正是跨列时飞到了原图所在列。
+    //
+    // 可行原因：图库被 keep-alive 缓存，其 DOM 仍在文档中，
+    // 可通过 querySelector 找到对应缩略图并读取其当前坐标
+    // （此时详情页在前台，图库隐藏，但元素仍有布局坐标可读）。
     const idNum = Number(newId)
     if (library.detailPos && Number.isFinite(idNum) && library.detailPos.from !== 'imports') {
-      library.detailPos = { ...library.detailPos, imageId: idNum }
+      // 优先用布局快照纯计算（可靠，不受隐藏态影响）；算不出则保持原值
+      const computed = lookupTargetRect(idNum)
+      library.detailPos = {
+        ...library.detailPos,
+        imageId: idNum,
+        thumbRect: computed ?? library.detailPos.thumbRect,
+      }
     }
     // 已加载完成的图（loadedImgId）才是旧图；仅记住真正的已显示图
     prevSrc.value = loadedImgId.value != null ? originalUrl(loadedImgId.value) : undefined
@@ -280,6 +293,31 @@ async function recycle() {
 const zoomingOut = ref(false)
 
 /**
+ * 查表取得目标缩略图的矩形（进入详情时由图库采集的真实坐标）。
+ *
+ * 为什么查表而不计算：瀑布流各列独立堆叠、每列高度不同，
+ * 用行列公式复现会有明显偏差（曾实测偏约 1/4 卡片高度）。
+ * 采集的是渲染结果的**真实坐标**，因此逐像素准确。
+ *
+ * 注意：表中坐标是"采集时的视口坐标"，需按滚动差换算到当前视口。
+ */
+function lookupTargetRect(imageId: number): { x: number; y: number; w: number; h: number } | null {
+  const L = library.listLayout
+  if (!L) return null
+  const r = L.rects[imageId]
+  if (!r) return null
+  // **直接返回采集到的视口坐标，不做滚动换算。**
+  //
+  // 为什么：rects 存的就是 getBoundingClientRect() 的视口坐标（已含当时的滚动），
+  // 而返回时 restorePos 会把滚动**恢复到同一个值**，两者基准一致，直接用即正确。
+  //
+  // 此前的错误：这里再减了一次 (scrollNow - L.scrollTop)。
+  // 但在详情页里探测滚动容器会得到错误结果（详情页没有 .wall-container，
+  // 探测退化为 .app-main，其 scrollTop 恒为 0），于是算出 y + 1700 的严重偏移。
+  return { x: r.x, y: r.y, w: r.w, h: r.h }
+}
+
+/**
  * 视觉改进1：返回图库前，让详情页大图"缩回"它在图库缩略图中的位置。
  *
  * 设计（相比上一版的修正）：
@@ -295,7 +333,35 @@ async function goBack() {
   const from = pos?.from
   const img = image.value
   const stage = stageRef.value
-  const el = stage?.querySelector<HTMLElement>('.stage-img') ?? stage
+  // 动画载体选择（三层兜底，避免取到隐藏/零尺寸元素导致动画被静默跳过）：
+  // 1) 当前图的 <img>（.el-image__inner）—— 真正可见、有实际尺寸，动画效果最好
+  // 2) 当前图的 el-image 容器（.stage-img，排除隐藏的旧图 .prev-img）
+  // 3) 整个 .stage
+  // 注意：.stage 里同时存在旧图（v-show 隐藏）与当前图，querySelector 会返回文档顺序靠前者，
+  // 若取到隐藏的旧图则 getBoundingClientRect() 全为 0 → 动画直接跳过。
+  const stageImgs = stage ? Array.from(stage.querySelectorAll<HTMLElement>('.stage-img')) : []
+  const curWrap = stageImgs.find((n) => !n.classList.contains('prev-img')) ?? stageImgs[0] ?? null
+  const curInner = curWrap?.querySelector<HTMLElement>('.el-image__inner') ?? null
+  const el =
+    (curInner && curInner.getBoundingClientRect().width > 0 ? curInner : null) ??
+    (curWrap && curWrap.getBoundingClientRect().width > 0 ? curWrap : null) ??
+    stage
+
+  // 诊断日志（定位动画未播放的原因，确认后移除）
+  const hasThumbRectOk = !!pos?.thumbRect
+  reportLog(
+    '[flyback] goBack ' +
+      JSON.stringify({
+        from,
+        hasImg: !!img,
+        hasEl: !!el,
+        elCls: el?.className,
+        hasThumbRect: !!pos?.thumbRect,
+        rect: pos?.thumbRect,
+        zoomingOut: zoomingOut.value,
+      }),
+    hasThumbRectOk ? 'info' : 'warn',
+  )
 
   // 主目录结构不同（分组展开），暂不播放缩略回退动画
   const canAnimate =
@@ -312,34 +378,120 @@ async function goBack() {
     return
   }
 
-  // 目标矩形：进入详情时记录的缩略图视口坐标。
-  // 若期间列表滚动过，需按滚动差换算（滚动后再返回时仍能落到正确位置）。
-  const rect = pos!.thumbRect!
-  const scroller = document.querySelector('.app-main')
-  const scrollNow = scroller ? scroller.scrollTop : 0
-  const scrollThen = pos!.scrollTop
-  const toRect = {
-    x: rect.x,
-    y: rect.y - (scrollNow - scrollThen),
-    w: rect.w,
-    h: rect.h,
-  }
+  // 目标矩形：**优先查表**（进入详情时由图库采集的真实坐标）。
+  //
+  // 此前这里直接读 pos.thumbRect —— 那是**最初点开那张**的坐标，
+  // 详情页翻页后返回就会飞向错误位置（落点偏差的直接原因）。
+  // 现在统一走 lookupTargetRect：它按当前显示的图片 id 查真实坐标表，
+  // 覆盖"未翻页"与"翻页后"两种情况。
+  const looked = lookupTargetRect(img!.id)
+  const fallback = pos!.thumbRect!
+  // 同样直接使用记录的视口坐标（返回时滚动会恢复到同一位置，基准一致）
+  const toRect = looked ?? { x: fallback.x, y: fallback.y, w: fallback.w, h: fallback.h }
 
   zoomingOut.value = true
-  // transform 缩放平移（以中心点对齐目标缩略图中心）
-  const dx = toRect.x + toRect.w / 2 - (fromRect.left + fromRect.width / 2)
-  const dy = toRect.y + toRect.h / 2 - (fromRect.top + fromRect.height / 2)
-  const scale = Math.max(0.02, toRect.w / fromRect.width)
-  el!.style.transition =
-    'transform .34s cubic-bezier(.4,0,.2,1), opacity .34s ease'
-  el!.style.transformOrigin = 'center center'
-  el!.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`
-  el!.style.opacity = '0.2'
 
-  // 动画结束再导航：此时图库已处于正确滚动位置，真实缩略图接管，视觉连续
-  window.setTimeout(() => {
-    router.push('/library')
-  }, 320)
+  // ---- 时序设计（按需求）：先让详情页 UI 消失，再让图片飞向图库缩略图 ----
+  //
+  // 为什么这样：图片属于详情页，只要详情页还在，其上方就叠着导航栏/顶栏/关闭按钮等 UI，
+  // 图片一旦移出舞台范围就会被这些 UI 盖住（此前反馈的"图移到了 UI 显示层下面"）。
+  // 因此顺序改为：
+  //   1. 先把飞行层放到 body（z-index 最高，独立于任何页面）
+  //   2. 立即导航到图库 —— 详情页 UI 随之消失，露出图库
+  //   3. 等图库渲染完成（下一帧起）再启动过渡，图片边移动边缩小到缩略图位置
+  //   4. 过渡结束移除飞行层，此时真实缩略图已就位，视觉无缝
+  const src =
+    (el as HTMLImageElement).src ??
+    (el.querySelector('img') as HTMLImageElement | null)?.src ??
+    ''
+  // 计算图片在舞台容器内**实际渲染**的尺寸（contain 缩放后的内容框）。
+  // 关键：fromRect 是 el-image 元素（撑满 .stage 的容器）的尺寸，
+  // 而可见的图只占其中一部分；若用容器尺寸做缩放基准，
+  // 会导致"大图飞回后偏小、小图偏大"（用户反馈的尺寸不匹配）。
+  const stageW = fromRect.width
+  const stageH = fromRect.height
+  const natW = img!.width > 0 ? img!.width : stageW
+  const natH = img!.height > 0 ? img!.height : stageH
+  const contentScale = Math.min(stageW / natW, stageH / natH)
+  const visW = natW * contentScale
+  const visH = natH * contentScale
+  // 图片内容框在舞台中的居中偏移
+  const offX = (stageW - visW) / 2
+  const offY = (stageH - visH) / 2
+
+  const ghost = document.createElement('img')
+  ghost.src = src
+  ghost.style.cssText = [
+    'position:fixed',
+    `left:${fromRect.left + offX}px`,
+    `top:${fromRect.top + offY}px`,
+    `width:${visW}px`,
+    `height:${visH}px`,
+    'object-fit:fill',
+    'z-index:99999',
+    'pointer-events:none',
+    'border-radius:8px',
+    'will-change:transform,opacity',
+    'transition:transform .38s cubic-bezier(.4,0,.2,1),opacity .38s ease',
+    'transform-origin:center center',
+    'transform:translate(0,0) scale(1)',
+    'opacity:1',
+  ].join(';')
+  document.body.appendChild(ghost)
+
+  // 计算位移与缩放（以中心点对齐目标缩略图中心）
+  // 缩放与位移都以"图片可见内容框"为基准（而非容器）
+  const dx = toRect.x + toRect.w / 2 - (fromRect.left + offX + visW / 2)
+  const dy = toRect.y + toRect.h / 2 - (fromRect.top + offY + visH / 2)
+  const scale = Math.max(0.02, toRect.w / visW)
+
+  // 第 2 步：立即导航 —— 详情页 UI 消失，露出图库
+  router.push('/library')
+
+  // 第 3 步：等图库"滚动位置恢复完成"后再启动过渡。
+  // 图库在 onActivated 末尾派发 moevault:library-ready，此时目标缩略图已在最终位置；
+  // 若不等待而直接用固定的两帧延迟，滚动尚未完成会导致落点偏移。
+  // 另设超时兜底：事件因异常未到达时，350ms 后仍然启动，避免图片卡住不动。
+  reportLog(
+    '[flyback] 启动飞行 ' +
+      JSON.stringify({
+        imgId: img!.id,
+        fromX: Math.round(fromRect.left),
+        fromY: Math.round(fromRect.top),
+        toX: Math.round(toRect.x),
+        toY: Math.round(toRect.y),
+        toW: Math.round(toRect.w),
+        dx: Math.round(dx),
+        dy: Math.round(dy),
+        scale: Number(scale.toFixed(3)),
+        usedLookup: !!looked,
+      }),
+    'info',
+  )
+
+  let started = false
+  const startFly = () => {
+    if (started) return
+    started = true
+    window.removeEventListener('moevault:library-ready', startFly)
+    requestAnimationFrame(() => {
+      ghost.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`
+      ghost.style.opacity = '0.3'
+    })
+  }
+  window.addEventListener('moevault:library-ready', startFly, { once: true })
+  window.setTimeout(startFly, 350)
+
+  // 第 4 步：过渡结束移除飞行层（真实缩略图已就位，视觉无缝）
+  let done = false
+  const cleanup = () => {
+    if (done) return
+    done = true
+    ghost.remove()
+  }
+  ghost.addEventListener('transitionend', cleanup, { once: true })
+  // 兜底：过渡事件未触发时（元素被隐藏等）用定时器保证收尾
+  window.setTimeout(cleanup, 520)
 }
 
 // 手动打标（BUG3 任务化）：加入打标队列，进度见任务中心

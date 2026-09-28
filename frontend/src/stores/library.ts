@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
 import { get } from '@/api/client'
+import { findScrollContainer } from '@/utils/scrollTarget'
 
 /** 图库浏览状态：筛选条件、排序、视图模式、选中集合。数据来自 /api/v1/images。 */
 
@@ -87,6 +88,29 @@ export const useLibraryStore = defineStore('library', () => {
     imageId: number
     scrollTop: number
     thumbRect?: { x: number; y: number; w: number; h: number }
+} | null>(null)
+
+  /**
+   * 图库当前布局快照（供详情页在翻页后推算目标缩略图坐标）。
+   *
+   * 为什么需要：详情页翻到别的图后返回时，目标缩略图与最初那张不在同一位置，
+   * 必须重算坐标；而图库此时处于 keep-alive 隐藏态，直接读 DOM 坐标不可靠。
+   * 因此由图库在其可见时记录布局参数，详情页据「目标索引 + 参数」纯计算得出坐标。
+   */
+  /**
+   * 图库布局快照：**直接记录每张缩略图的真实视口矩形**，而非只记参数。
+   *
+   * 为什么记坐标而不是记参数：瀑布流是"各列独立堆叠"，每列高度不同，
+   * 用"行列估算"复现必然产生偏差（实测偏约 1/4 卡片高度）。
+   * 图库可见时把所有缩略图的真实矩形一次性采下来，详情页翻页时直接查表，
+   * 与渲染结果**逐像素一致**，不存在算法复现误差。
+   *
+   * rects 为 Map：imageId -> 记录时的视口矩形（相对当时滚动位置）。
+   */
+  const listLayout = ref<{
+    rects: Record<number, { x: number; y: number; w: number; h: number }>
+    /** 记录时的滚动位置（用于把"记录时坐标"换算为"返回后坐标"）。 */
+    scrollTop: number
 } | null>(null)
   try {
     const raw = localStorage.getItem('moevault-detail-pos')
@@ -227,7 +251,10 @@ export const useLibraryStore = defineStore('library', () => {
     imageId: number,
     thumbRect?: { x: number; y: number; w: number; h: number },
   ) {
-    const scroller = document.querySelector('.app-main')
+    // 用探测工具找出**真正在滚动**的容器。
+    // 此前硬编码 .app-main —— 而实际滚动的是 .wall-container（图片墙）。
+    // 结果 scrollTop 恒为 0，返回时"恢复"到 0 → 表现为回顶（长期未定位到的根因）。
+    const scroller = findScrollContainer()
     const scrollTop = scroller ? scroller.scrollTop : window.scrollY
     detailPos.value = { from, imageId, scrollTop, thumbRect }
     try {
@@ -265,6 +292,7 @@ export const useLibraryStore = defineStore('library', () => {
     clearFilter,
     removeImageById,
     toggleSelect,
+    listLayout,
     clearSelect,
     saveDetailPos,
     restoreDetailPos,
