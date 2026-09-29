@@ -238,6 +238,21 @@ async fn update_settings(
         }
     }
 
+    // 关键：出口窗口是按**出口 IP** 计的（各 4 次/30 秒），
+    // 而 keypool 的"全局窗口"原按**单一 IP** 设计（4 次/30 秒）。
+    // 启用多出口后若不放大该上限，调度仍被 4 次/30 秒 卡住，
+    // 多出口完全发挥不出来（表现为"一次还是只有 4 个"）。
+    // 故按出口数等比放宽：N 个出口 → N × 4 次 / 30 秒。
+    {
+        let slot = state.sauce_pool.read().await;
+        if let Some(kp) = slot.as_ref() {
+            let n = if enabled && !ports.is_empty() { ports.len().max(1) } else { 1 };
+            let limit = moevault_tagger::keypool::DEFAULT_GLOBAL_LIMIT * n;
+            kp.set_global_limit(limit).await;
+            tracing::info!(limit, exits = n, "已按出口数放宽 SauceNAO 全局窗口上限");
+        }
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 

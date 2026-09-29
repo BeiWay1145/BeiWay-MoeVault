@@ -470,6 +470,13 @@ async fn sauce_one(
                 }
                 other => {
                     pool.on_failure(key_idx).await;
+                    // 出口故障计数：网络/TLS 类失败很可能是**该出口**的问题
+                    // （实测个别 Clash 出口在并发下会大量失败）。
+                    // 累计到阈值后该出口被停用，调度自动改用其它出口，
+                    // 而不是让整批图反复撞在坏出口上。
+                    if let Some((p, i)) = exit_idx {
+                        p.note_failure(i).await;
+                    }
                     warn!(image_id, error = %other, "溯源失败");
                     db.put_sauce_cache(&img.md5, 0.0, None, None, None)?;
                     return Ok(None);
@@ -580,8 +587,27 @@ pub async fn run_sauce_pipeline(
         ..Default::default()
     }));
 
-    // worker 数 = 可用 key 数（至少 1）
-    let worker_count = pool.len().await.max(1);
+    // worker 数 = 可用 key 数 × 出口数（至少 1）。
+    //
+    // 为什么乘出口数：SauceNAO 的「4 次 / 30 秒」是**按出口 IP** 计的，
+    // 每个出口有独立额度；若 worker 数只按 key 数算，
+    // 多出口就无法并行，实际吞吐仍被单出口的 4 次/30 秒 卡住
+    // （用户反馈的"一次还是只有 4 个"正是此因）。
+    // 注：出口池的 acquire() 本身会按"有空闲优先"分配，
+    // 因此多起的 worker 会自然分散到不同出口，不会同时挤压同一个出口。
+    let key_count = pool.len().await.max(1);
+    let exit_count = match exits {
+        Some(e) if e.enabled() => e.count().await.max(1),
+        _ => 1,
+    };
+    // 上限保护：避免 key 或出口填得多时起过多任务（每个都要上传图片）
+    let worker_count = (key_count * exit_count).min(12);
+    tracing::info!(
+        key_count,
+        exit_count,
+        worker_count,
+        "SauceNAO 溯源并发度（key × 出口）"
+    );
     // SauceNaoClient / InferClient 无 Sync 要求但需 'static：Arc 包装
     let sauce = std::sync::Arc::new(sauce.clone());
     let infer = std::sync::Arc::new(infer.clone());

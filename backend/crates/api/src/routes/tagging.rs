@@ -402,6 +402,23 @@ pub(crate) async fn init_pool_public(
         }
     };
     pool.set_persist_path(persist_path);
+
+    // 按当前出口数放宽全局窗口上限（N 个出口 → N × 4 次 / 30 秒）。
+    // 池可能在这里首次创建（例如应用刚启动就发起打标），此时设置页的保存流程尚未跑过，
+    // 故必须在此也应用一次，否则多出口仍会被"4 次/30 秒"卡住。
+    {
+        let n = {
+            let slot = state.exit_pool.read().await;
+            match slot.as_ref() {
+                Some(p) => p.count().await.max(1),
+                None => 1,
+            }
+        };
+        let limit = moevault_tagger::keypool::DEFAULT_GLOBAL_LIMIT * n;
+        pool.set_global_limit(limit).await;
+        tracing::info!(limit, exits = n, "SauceNAO 全局窗口上限已按出口数设置");
+    }
+
     let pool = Arc::new(pool);
     let mut slot = state.sauce_pool.write().await;
     *slot = Some(pool.clone());
