@@ -134,6 +134,24 @@ impl SauceNaoClient {
             Ok(r) => r,
             Err(e) => return Err((TaggerError::Http(e), QuotaHeaders::default())),
         };
+        // **先看 HTTP 状态码**：SauceNAO 在限流时返回 429（部分情况 403）。
+        //
+        // 修复要点：此前直接 `resp.json()` —— 429 时 body 仍是合法 JSON
+        // （header.status = -2, message = "Search Rate Too High"），
+        // 于是被当成普通响应继续处理，最终归入"无命中/失败"，
+        // **既不会触发冷却、也不会换出口**，表现为"一直失败却不限流退避"。
+        // 实测：同一出口连续 4 次成功后，第 5 次起返回 429 status=-2。
+        let status_code = resp.status().as_u16();
+        if status_code == 429 || status_code == 403 {
+            // 尝试从 body 里取更精确的 retry 提示（SauceNAO 的 message 含说明）
+            let retry_secs = 30i64;
+            tracing::warn!(
+                status = status_code,
+                "SauceNAO 限流（HTTP {status_code}），进入冷却",
+            );
+            return Err((TaggerError::RateLimited(retry_secs), QuotaHeaders::default()));
+        }
+
         // 先取响应头配额（json() 会消费 resp），再解析 body
         let header_short = resp
             .headers()
