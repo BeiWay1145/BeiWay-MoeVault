@@ -21,7 +21,11 @@ walkdir = "2"
 md-5 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif"] }
 kamadak-exif = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "blocking"] }
+# rustls-tls-native-roots：使用**系统根证书**而非内置 webpki 列表。
+# 原用 rustls-tls（webpki-roots）时，经 Clash 代理做 HTTPS CONNECT 隧道会出现
+# "error sending request"（TLS 校验失败），导致多出口溯源全部失败。
+# native-roots 读取 Windows 证书存储，兼容系统代理与企业证书环境。
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-native-roots", "blocking"] }
 regex = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }

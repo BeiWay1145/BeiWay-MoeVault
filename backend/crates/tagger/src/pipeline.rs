@@ -9,6 +9,7 @@
 //! 单张失败不中断批次，记 failed 继续。
 
 use std::path::Path;
+use std::time::Duration;
 
 use moevault_db::Db;
 use serde::{Deserialize, Serialize};
@@ -599,7 +600,8 @@ pub async fn run_sauce_pipeline(
         handles.push(tokio::spawn(async move {
             // 限流重试：保存待重试的图片与已重试次数（Some 时优先继续处理该图）
             let mut current: Option<(i64, u32)> = None;
-            loop {
+            // 带标签的循环：acquire 被中断时要跳出整个 worker，而不是只跳出内层
+            'worker: loop {
                 // 中断检查：任务被取消则停止（每轮处理前查一次 DB）
                 if let Some(jid) = job_id {
                     if let Ok(Some(job)) = db.get_job(jid) {
@@ -623,8 +625,28 @@ pub async fn run_sauce_pipeline(
                     }
                 };
 
-                // acquire 会等待可用 key（含全局窗口 / 冷却结束后放行）
-                let (api_key, key_idx) = pool.acquire().await;
+                // acquire 会等待可用 key（含全局窗口 / 冷却结束后放行）。
+                // **中断修复**：acquire 可能阻塞很久（等全局限流冷却 / 出口冷却），
+                // 期间不检查中断会让"中断"按钮看起来无效（任务长时间仍是 running）。
+                // 这里用 select! 让等待与中断轮询并行，最多每 1 秒检查一次任务状态。
+                let (api_key, key_idx) = loop {
+                    let cancelled = matches!(
+                        job_id,
+                        Some(jid) if db
+                            .get_job(jid)
+                            .ok()
+                            .flatten()
+                            .map(|j| j.status == "cancelled")
+                            .unwrap_or(false)
+                    );
+                    if cancelled {
+                        break 'worker;
+                    }
+                    match tokio::time::timeout(Duration::from_secs(1), pool.acquire()).await {
+                        Ok(v) => break v,
+                        Err(_) => continue, // 1 秒超时 → 重新检查中断后继续等
+                    }
+                };
                 match sauce_one(
                     &db,
                     &sauce,
