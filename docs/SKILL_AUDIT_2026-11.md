@@ -265,3 +265,80 @@ grep -rnoE '0\.[01]\.[0-9]+(-[a-z]+\.[0-9]+)?' --include=SKILL.md . | awk -F: '{
 # 4. 宿主真实版本（asar 头解析）
 node -e "const fs=require('fs');const b=fs.readFileSync('D:/Program Files/DSH-Next/DSH NEXT/resources/app.asar');const hs=b.readUInt32LE(12);const h=JSON.parse(b.slice(16,16+hs).toString());const e=h.files['package.json'];const o=16+hs+parseInt(e.offset);console.log(b.slice(o,o+e.size).toString())"
 ```
+
+---
+
+## §7 落装结果（2026-11-14 02:05 补记）
+
+§5.2 推荐的 5 个插件里，**4 个已实装并完成运行时验证**；第 4 个（`dsh-system-monitor-plugin`）经定性后**不装**。
+
+### 7.1 dsh-system-monitor-plugin 的定性：只服务用户，不服务 Agent
+
+用户提问要确认它是「给 Agent 用还是给用户用」。结论是**给用户看，不给 Agent 用**，三条证据：
+
+1. README 特性末条原文：「**面板展示：监控数据只在插件 UI 面板展示，不暴露给 dsh 使用**」。
+2. 它确实注册了一个工具 `system_monitor_report`，但方向相反 —— 是**Agent 主动上报**插件自己认不出的外部进程句柄（标识 / 父进程 / 进程名 / 会话标识），不是让 Agent 查询资源占用。所以它给 Agent 增加的只有一个「写」口，没有「读」口。
+3. 采集与展示都在 Web UI 会话区标签栏的「系统监控」面板里，四维视图（本会话 / 全部进程 / 会话 / 子代理）；定位用途是**用户排查「DSH 吃了多少资源」「哪个子代理最耗」**。
+
+对编码任务的直接信息增益接近于零 —— Agent 想知道的「编译慢还是推理慢」用 `cargo build --timings`、进程列表、GPU 占用都能查，而该插件的数值不流向 Agent。故未安装。
+
+兼容性顺带核实（若用户后续要装）：`engines.dsh: ">=0.2.1-rc.1 <=0.2.2-rc.2"`，peer `@deepseek-ai/dsh-tools` 同区间、`@deepseek-ai/cordis ~4.0.5 || ~4.1.0`；宿主内核 **0.2.2-rc.1** 正好落在上界，**兼容**。
+
+### 7.2 已装四个包的版本与兼容判定
+
+| 包 | 装后版本 | engines.dsh | engines.node | 判定 |
+|---|---|---|---|---|
+| `dsh-sql` | 0.5.11 | `>=0.2.1-rc.3` | `^22.19.0 \|\| >=24` | ✅ 内核 0.2.2-rc.1 满足 |
+| `deepseek-computer-use` | 0.2.9 | `>=0.2.1-rc.3` | 同上 | ✅ |
+| `brooks-lint` | 1.9.1 | 未声明 | `>=20` | ✅ |
+| `aegis` | 2.15.1（GitHub 源） | 未声明 | 未声明 | ✅ 三个 `@deepseek-ai/dsh-*` peer 全 optional |
+
+node 实测 **v24.18.0**，pnpm 实测 **11.28.5**（宿主自带，路径 `D:/Program Files/DSH-Next/DSH NEXT/resources/app.asar.unpacked/node_modules/pnpm/bin/pnpm.mjs`）。
+
+### 7.3 落装过程与本机踩到的两个坑
+
+1. **`pnpm add` 只写 `dependencies`，不写 `dsh.profile.bundles`** —— 包躺在 `node_modules` 里但宿主根本不加载。四个包名必须手工追加进 `package.json` 的 `dsh.profile.bundles`，本次从 26 条变成 **30 条**。
+2. **patch 里插件行的 `id` 要用插件自报的导出名，不是包名** —— `dsh-sql` 的入口写着 `export const name = 'sql'`，所以配置行必须是 `- id: sql`；写成 `- id: dsh-sql` 会新增一行无用配置而不覆盖真实那一行。
+
+四个包串行安装（同 profile 不能并发 pnpm），全部 exit=0，都带历史遗留的 `[WARN] Issues with peer dependencies found`（非本次引入）。
+
+回退点：`~/.dsh/profiles/desktop/backup-moevault-20261114-015755/`（`package.json.bak` / `pnpm-lock.yaml.bak` / `cordis.patch.yml.bak`）。
+
+### 7.4 运行时验收（HMR 热加载，未重启宿主）
+
+- **`computer_use_health`** → `ok: true`。native helper 已用系统 `csc.exe` 自动编译并存在（`native/bin/dsh-computer-use-helper.exe`，`fresh: true`，不需要 .NET SDK）。枚举到 **11 个窗口**，policy `approval: sensitive`、`denyApps` 空、硬拒清单含终端 / Run 对话框 / 密码管理器 / 安全软件 / Agent 宿主自身。
+- **`sql_health`** → `ok: true`，连接 `moevault` 指向 `D:/Program Files/BeiWay-MoeVault/data/app.db`。真实查询验证：`SELECT COUNT(*) FROM images` → **total 283 / active 271**；`sqlite_master` 列出 **17 张表**（app_logs, dedup_groups, image_tags, images, import_batches, jobs, recycle_bin, replace_pending, sauce_cache, schema_migrations, settings, smart_views, sqlite_sequence, tag_aliases, tag_covers, tags）。
+- **brooks-lint** → 注册 6 个 skill（`brooks-review` / `brooks-audit` / `brooks-debt` / `brooks-test` / `brooks-health` / `brooks-sweep`），实测 `skill('brooks-health')` 可加载，provider `brooks-lint`。
+- **aegis** → 注册 **23 个** skill，实测 `skill('using-aegis')` 可加载，provider `aegis-method-pack`。与用户自有 `~/.dsh/skills` 无命名冲突（`domain-modeling` / `codebase-design` / `prototype` / `research` / `tdd` / `diagnosing-bugs` 是用户自有，aegis 未提供同名项）。
+
+### 7.5 dsh-sql 的连接配置取舍（重要）
+
+首次 `sql_health` 返回 `ok: false`，原因不是插件坏了，而是两个叠加：
+
+- 只有默认的 `:memory:` 连接；
+- 宿主 approval 策略是 **`never`**，而 `writeApproval` 默认 `true` → 报 `"当前策略 never 无法询问；请切换模式或由用户明确设置 writeApproval=false"`，`writeApprovalReady: false`。
+
+在 `~/.dsh/profiles/desktop/cordis.patch.yml` 追加配置时**主动选 `readOnly: true`**：
+
+```yaml
+- id: sql
+  config:
+    connections:
+      - name: moevault
+        engine: sqlite
+        file: D:/Program Files/BeiWay-MoeVault/data/app.db
+    maxRows: 500
+    queryTimeoutMs: 30000
+    readOnly: true
+    writeApproval: true
+```
+
+理由：写审批门在 `never` 策略下弹不出窗，留可写只会造成「SQL 发出去了但永远等不到审批」的假死。真要写库，把 `readOnly` 临时改 `false` 并显式处理审批，或直接走 `sql_exec` 之外的通路。
+
+另一个易误判的中间态：patch 写入后**约 11 秒**宿主才完成 HMR 重载，期间调用报 `tools.sql_health is not a function` —— 这是热重载中间态，不是安装失败。
+
+### 7.6 §6 局限的更新
+
+- 原 §6.5「§5 推荐的兼容性均为目录标注值，未在 0.2.2-rc.1 上实装验证」——**其中 4 个已实装验证通过**（见 §7.4），`dsh-system-monitor-plugin` 按 §7.1 决定不装，故其运行时兼容性仍为未验证。
+- 原 §6.7「未修改任何文件」——本次补记之外，**确实修改了 `~/.dsh` 下的 profile 配置**（`package.json` 的 bundles + `cordis.patch.yml` 追加 sql 行），并留下了回退点。
+- 仍未验证：`brooks-*` 六个 skill 与 `aegis` 二十三个 skill 只做了「能被宿主加载」的验证，**没有在本项目上真跑过一次审查**，实际输出质量与误报率未知。

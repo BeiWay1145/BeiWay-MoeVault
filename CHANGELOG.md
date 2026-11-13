@@ -4,6 +4,16 @@
 
 ## [未发布]
 
+### 开发环境
+
+- **落装 4 个 DSH 插件并完成运行时验证**（详见 `docs/SKILL_AUDIT_2026-11.md` §7）：
+  `dsh-sql@0.5.11`（连本项目 `app.db`，只读）、`deepseek-computer-use@0.2.9`
+  （Windows 桌面黑盒验收）、`brooks-lint@1.9.1`（6 个代码质量 skill）、
+  `aegis`（GitHub 源，23 个工程方法 skill）。
+  `dsh-system-monitor-plugin` 经核实只面向用户面板、监控数据不暴露给 Agent，故未装。
+  两个本机坑：`pnpm add` 不写 `dsh.profile.bundles`（需手工追加，26 → 30）；
+  patch 行 `id` 必须用插件自报导出名（`dsh-sql` → `id: sql`）。
+
 ### 重构 / 架构
 
 - **架构审查（`docs/ARCH_REVIEW_2026-11.md`）后的 P0 修复**：四个「有明确失效链条」的问题一次修完。
