@@ -59,12 +59,26 @@
 
 ## 文档
 
+**现行文档**（与当前实现一致，优先看这几份）：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/ARCH_REVIEW_2026-11.md](docs/ARCH_REVIEW_2026-11.md) | 架构审查（2026-11）：模块边界、重复代码、超长文件/函数、错误处理、前端状态、性能隐患、测试覆盖、P0–P3 分级与修复顺序 |
+| [docs/RUST_INFERENCE_FEASIBILITY.md](docs/RUST_INFERENCE_FEASIBILITY.md) | 打标/美学推理从 Python 迁到 Rust 的可行性检验：ort / candle / 混合三条路线、GPU 与部署复杂度、数值一致性验证方案 |
+| [docs/EXPLORER_STYLE_SELECTION_PLAN.md](docs/EXPLORER_STYLE_SELECTION_PLAN.md) | 图库资源管理器式交互（选择/框选/拖出/右键菜单）的方案与架构建议 |
+| [docs/MULTI_EXIT_IP_PLAN.md](docs/MULTI_EXIT_IP_PLAN.md) | SauceNAO 多出口 IP 轮换（Clash 多入站端口）方案 |
+| [docs/DESIGN_FILTER_NAVIGATION.md](docs/DESIGN_FILTER_NAVIGATION.md) | 搜索式筛选 v2 设计 |
+| [docs/SKILL_AUDIT_2026-11.md](docs/SKILL_AUDIT_2026-11.md) | 开发会话所用 Skill 的时效性审计（2026-11） |
+| [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
+
+**历史文档**（v0.1 规划期产物，保留作决策记录；架构/接口细节已有漂移，勿据此改代码）：
+
 | 文档 | 内容 |
 |---|---|
 | [docs/PLAN.md](docs/PLAN.md) | 总体规划：决策清单、功能规格、架构、数据模型、路线图、风险 |
 | [docs/UI_DESIGN.md](docs/UI_DESIGN.md) | UI 设计：布局、页面线框、组件树、交互流程、状态管理 |
 | [docs/TECH_DETAILS.md](docs/TECH_DETAILS.md) | 技术细节：DDL、REST/WS 接口契约、推理服务契约、Rust 模块边界 |
-| [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
+| [docs/ENHANCEMENTS.md](docs/ENHANCEMENTS.md) | 增强项待办清单（多数已完成） |
 
 ## 技术栈
 
@@ -72,20 +86,45 @@
 - **主后端**：Rust（axum + SQLite，workspace 见 `backend/`）
 - **推理服务**：Python FastAPI（`python/`），承载 cl_tagger 打标 + Q-Align 美学评分
 
-## 当前状态（v0.1.0 首个发行版）
+## 代码结构
 
-- [x] 规划文档（3 份 + CHANGELOG）
-- [x] 前端骨架：路由页面、布局、图片墙组件、mock 数据，`npm run build` 通过
-- [x] 推理服务骨架：`/health`、`/infer/tags`、`/infer/aesthetic`（含批量），已验证可启动
-- [x] Rust 主后端（M1）：workspace（core/db/api/app）+ SQLite 迁移 + REST/WS + 前端静态托管
-- [x] M2 导入与索引：扫描/移动复制进库（哈希分片）/MD5/pHash/清晰度/EXIF/WebP 缩略图/批量入库/去重计数，`POST /api/v1/import` + 批次查询 + WS `batch.done` 广播
-- [x] M3 查重与回收站：pHash 聚类（增量+全量）、模糊/清晰对判定（best/redundant）、查重管理 API、回收站（recycle/restore/purge）、缩略图静态托管 `/thumbs/*`
-- [x] M4 打标流水线：SauceNAO 溯源 → danbooru/gelbooru 标签爬取 → 本地 cl_tagger 回退；多 API key 轮换调度 + 配额持久化；不可溯源标记
-- [x] M5 美学评分流水线：本地 Q-Align（SIGLIP2）批量评分写库
-- [x] M6 搜索筛选：`/api/v1/images` 组合筛选 + 排序；前端图库接真实 API
-- [x] M8 Tauri 桌面壳：窗口加载后端 URL（自动拉起后端 + 推理服务 sidecar）；构建产出 MSI + NSIS 安装包
-- [x] 桌面壳拖入导入 + 搜索式筛选（danbooru 风格）+ 标签多别名 + 中文字典导入 + BUG 追踪器
+Rust 后端是 7 个 crate 的 workspace（`backend/crates/`），依赖方向单向无循环：
+
+```
+core  ← db ← ingest
+  ↑      ↑     ↑
+  └── dedup    tagger        （dedup / ingest 依赖 core+db；tagger 依赖 core+db+ingest）
+       ↑        ↑
+       └── api ┘             （api 依赖全部业务 crate）
+             ↑
+            app              （app 只依赖 core/db/api，是 bin 入口）
+```
+
+| crate | 职责 |
+|---|---|
+| `core` | 领域模型、错误类型（ErrorKind/AppError）、常量 |
+| `db` | SQLite 封装与迁移（单连接 + Mutex，WAL） |
+| `ingest` | 目录扫描、导入、去重计数、缩略图、EXIF、清晰度、特征提取 |
+| `dedup` | pHash 聚类、模糊/清晰对判定 |
+| `tagger` | 打标/溯源流水线、SauceNAO 客户端、多 key 池、多出口 IP 池、推理客户端 |
+| `api` | axum HTTP 层：17 个路由模块、AppState、WS 广播 |
+| `app` | 可执行入口：读环境变量、建库、起 axum server、托管前端 dist |
+
+前端 `frontend/`（Vue 3 + Vite + TS + Element Plus + Pinia），推理服务 `python/`（FastAPI），桌面壳 `src-tauri/`（Tauri 2，独立 workspace）。
+
+## 当前状态（v0.1.x）
+
+功能面已完整可用，迭代重心转向稳定性与可维护性：
+
+- [x] M1–M8 全部里程碑（workspace / 导入索引 / 查重回收站 / 打标流水线 / 美学评分 / 搜索筛选 / 桌面壳）
+- [x] 桌面壳拖入导入、搜索式筛选、标签多别名、中文字典缓存、BUG 追踪器
+- [x] 图库资源管理器式交互：单选 / Ctrl 加选 / Shift 连选 / 框选 / 右键批量菜单 / 原生拖出 / 复制图片
+- [x] SauceNAO 多 API key + 多出口 IP 轮换，配额与限流（429/403）识别
+- [x] 任务中心：中断/继续、失败可见、WS 实时事件 + 轮询兜底
+- [x] 内存与性能（待持续）：见 `docs/ARCH_REVIEW_2026-11.md` 的 P1/P2 清单
 - [ ] 标签管理 API（自定义标签/合并/黑名单）
+
+> 架构现状、已知技术债与修复优先级以 `docs/ARCH_REVIEW_2026-11.md` 为准 —— README 不再逐条维护里程碑勾选。
 
 ## 启动
 
@@ -126,7 +165,7 @@ cargo tauri build
 - 桌面壳启动时自动拉起后端 `moevault-app.exe`（sidecar）与推理服务（Python uvicorn，端口 8001），窗口加载 `http://127.0.0.1:9178`
 - 推理服务由桌面壳托管生命周期：应用退出自动停止；8001 已有外部实例时跳过拉起
 - 推理服务若因缺 Python/依赖启动失败，顶栏圆点显示「未启动」，设置页「本地推理」可一键启动/停止（仅桌面版），或手动运行 `python/run_server.bat`
-- 后端数据目录：生产模式为 exe 所在目录（安装后为安装目录），后续可改为用户数据目录
+- 运行时数据目录按以下优先级探测（`src-tauri/src/lib.rs` 的 `runtime_root()`）：`MOEVAULT_RUNTIME_DIR` → 安装目录下的 `runtime/`（默认，可写校验通过才采用）→ `%LOCALAPPDATA%\BeiWay-MoeVault`
 
 ## 模型目录（自动探测，不再绑定本机路径）
 

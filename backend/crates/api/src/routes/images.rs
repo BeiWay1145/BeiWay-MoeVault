@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response, join_error_response};
+use super::{db_error_response, error_response, join_error_response, ApiResult, ApiError};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -81,7 +81,7 @@ async fn similar_images(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(params): Query<ListParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let limit = params.limit.unwrap_or(12).min(50);
     let db = state.db.clone();
     let items = tokio::task::spawn_blocking(move || {
@@ -111,7 +111,7 @@ async fn similar_images(
                 }));
             }
         }
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(out)
+        Ok::<_, ApiError>(out)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -122,7 +122,7 @@ async fn similar_images(
 async fn read_ai_info(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let library_dir = state.library_dir();
     let result = tokio::task::spawn_blocking(move || {
@@ -156,7 +156,7 @@ async fn read_ai_info(
                         let _ = db.remove_ai_negative_tags(id, &neg_tags);
                     }
                 }
-                Ok::<_, (axum::http::StatusCode, Json<Value>)>(json!({
+                Ok::<_, ApiError>(json!({
                     "ok": true, "is_ai": m.is_ai, "metadata": m.raw,
                     "prompt": m.prompt, "negative_prompt": m.negative_prompt,
                     "tags": m.tags,
@@ -176,7 +176,7 @@ async fn mark_ai(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     body: Option<Json<serde_json::Value>>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let set = body
         .as_ref()
         .and_then(|j| j.get("ai"))
@@ -202,7 +202,7 @@ async fn update_source_url(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let url = req
         .get("url")
         .and_then(|v| v.as_str())
@@ -224,7 +224,7 @@ async fn update_source_url(
 async fn generate_sidecar(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let library_dir = state.library_dir();
 
@@ -243,7 +243,7 @@ async fn generate_sidecar(
         let txt_path = src_path.with_extension("txt");
         std::fs::write(&txt_path, content)
             .map_err(|e| error_response(ErrorKind::Internal, format!("写入失败: {e}")))?;
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(txt_path.display().to_string())
+        Ok::<_, ApiError>(txt_path.display().to_string())
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -257,7 +257,7 @@ async fn rename_image(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let name = req
         .get("name")
         .and_then(|v| v.as_str())
@@ -301,7 +301,7 @@ async fn rename_image(
             error_response(ErrorKind::Internal, format!("文件改名失败: {e}"))
         })?;
         db.rename_image_file(id, &new_rel).map_err(db_error_response)?;
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(new_rel)
+        Ok::<_, ApiError>(new_rel)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -323,7 +323,7 @@ pub(crate) fn strip_json_suffix(url: &str) -> String {
 async fn source_info(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let img = tokio::task::spawn_blocking(move || db.get_image_by_id(id))
         .await
@@ -560,7 +560,7 @@ async fn replace_from_url(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let url = req
         .get("url")
         .and_then(|v| v.as_str())
@@ -655,7 +655,7 @@ async fn replace_from_url(
         // 8. 更新库记录
         db.replace_image_file(id, &md5_hex, &new_rel, w, h, ext, bytes.len() as i64)
             .map_err(db_error_response)?;
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(json!({
+        Ok::<_, ApiError>(json!({
             "ok": true,
             "md5": md5_hex,
             "rel_path": new_rel,
@@ -675,7 +675,7 @@ async fn replace_from_url(
 async fn remove_image_tag(
     State(state): State<AppState>,
     Path((id, tag_id)): Path<(i64, i64)>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.remove_image_tag(id, tag_id))
         .await
@@ -690,7 +690,7 @@ async fn add_image_tag(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let name = req
         .get("name")
         .and_then(|v| v.as_str())
@@ -725,7 +725,7 @@ async fn recycle_image(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<RecycleRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let reason = req.reason.unwrap_or_else(|| "manual".to_string());
     let db = state.db.clone();
     let library = state.library_dir();
@@ -892,7 +892,7 @@ impl ListParams {
 async fn list_images(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let status = params.status.clone().unwrap_or_else(|| STATUS_ACTIVE.to_string());
     if status != "active" && status != "recycled" {
         return Err(error_response(
@@ -946,7 +946,7 @@ async fn list_images(
 
 async fn stats(
     State(state): State<AppState>,
-) -> Result<Json<Stats>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Stats> {
     let db = state.db.clone();
     let s = tokio::task::spawn_blocking(move || db.stats())
         .await
@@ -959,7 +959,7 @@ async fn stats(
 /// 重新提取尺寸/清晰度并生成缩略图。
 async fn reprocess_images(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let library = state.library_dir();
     let thumbs = state.thumbs_dir();

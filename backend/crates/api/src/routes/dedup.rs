@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response, join_error_response};
+use super::{db_error_response, error_response, join_error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -63,7 +63,7 @@ fn parse_cursor(cursor: &Option<String>) -> Result<Option<i64>, (axum::http::Sta
 
 async fn stats(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let s = tokio::task::spawn_blocking(move || db.dedup_stats())
         .await
@@ -75,7 +75,7 @@ async fn stats(
 async fn list_groups(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let limit = params.limit.unwrap_or(100);
     let cursor_id = parse_cursor(&params.cursor)?;
     let db = state.db.clone();
@@ -101,7 +101,7 @@ async fn list_groups(
 async fn get_group(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let group = tokio::task::spawn_blocking(move || db.get_dedup_group(id))
         .await
@@ -116,7 +116,7 @@ async fn get_group(
 async fn scan(
     State(state): State<AppState>,
     Json(req): Json<ScanRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let full = req.full.unwrap_or(false);
     let threshold = req.threshold.unwrap_or(DEFAULT_HAMMING_THRESHOLD);
     if threshold > 64 {
@@ -178,7 +178,7 @@ pub struct ScanScopeRequest {
 async fn scan_scope(
     State(state): State<AppState>,
     Json(req): Json<ScanScopeRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     if req.image_ids.is_empty() {
         return Err(error_response(ErrorKind::InvalidInput, "image_ids 不能为空"));
     }
@@ -222,7 +222,7 @@ async fn resolve_group(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<ResolveRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let library_dir = state.library_dir();
     let recycle_dir = state.recycle_dir();
 

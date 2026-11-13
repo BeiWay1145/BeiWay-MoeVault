@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 use crate::routes::images::{parse_remote_source_info, strip_json_suffix};
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult, ApiError};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -246,7 +246,7 @@ fn chrono_now_secs() -> u64 {
 // ---------- 待确认替换路由 ----------
 
 /// GET /api/v1/replace-pending：待确认替换列表。
-async fn list_pending(State(state): State<AppState>) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+async fn list_pending(State(state): State<AppState>) -> ApiResult<Value> {
     let db = state.db.clone();
     let items = tokio::task::spawn_blocking(move || db.list_replace_pending())
         .await
@@ -259,7 +259,7 @@ async fn list_pending(State(state): State<AppState>) -> Result<Json<Value>, (axu
 async fn confirm_pending(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let pending = st
@@ -274,7 +274,7 @@ async fn confirm_pending(
         let _ = st.db.remove_replace_pending(id);
         let _ = std::fs::remove_file(&pending.temp_path);
         let _ = st.db.add_log("info", "sauce", &format!("人工确认：图片 #{} 已替换为网络原图", pending.image_id));
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(result)
+        Ok::<_, ApiError>(result)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -285,7 +285,7 @@ async fn confirm_pending(
 async fn ignore_pending(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let pending = tokio::task::spawn_blocking(move || db.get_replace_pending(id))
         .await

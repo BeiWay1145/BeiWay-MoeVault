@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response, join_error_response};
+use super::{db_error_response, error_response, join_error_response, task_end_event, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -41,7 +41,7 @@ pub fn router() -> Router<AppState> {
 async fn list_tags(
     State(state): State<AppState>,
     Query(params): Query<ListTagsParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let q = params.q.clone();
     let offset = params.offset.unwrap_or(0).max(0);
@@ -64,7 +64,7 @@ async fn list_tags(
 async fn list_aliases(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let aliases = tokio::task::spawn_blocking(move || db.list_tag_aliases(id))
         .await
@@ -83,7 +83,7 @@ async fn add_alias(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<AddAliasBody>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let alias_id = tokio::task::spawn_blocking(move || db.add_tag_alias(id, &body.alias))
         .await
@@ -96,7 +96,7 @@ async fn add_alias(
 async fn remove_alias(
     State(state): State<AppState>,
     Path((_id, alias_id)): Path<(i64, i64)>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.remove_tag_alias(alias_id))
         .await
@@ -132,7 +132,7 @@ pub struct BrowseTagsParams {
 async fn browse_tags(
     State(state): State<AppState>,
     Query(params): Query<BrowseTagsParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let category = params.category.clone();
     let q = params.q.clone();
@@ -162,7 +162,7 @@ async fn update_tag_name_cn(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<SetNameCnBody>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let name_cn = body.name_cn.clone();
     tokio::task::spawn_blocking(move || db.set_tag_name_cn(id, name_cn.as_deref()))
@@ -180,7 +180,7 @@ async fn set_tag_cover(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<SetCoverBody>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.set_tag_cover(id, body.image_id))
         .await
@@ -194,7 +194,7 @@ async fn update_tag_category(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let Some(cat) = req.get("category").and_then(|v| v.as_str()) else {
         return Err(error_response(ErrorKind::InvalidInput, "缺少 category"));
     };
@@ -219,7 +219,7 @@ async fn update_tag_category(
 async fn delete_tag(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.delete_tag(id))
         .await
@@ -233,7 +233,7 @@ async fn set_tag_blacklist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let bl = req.get("blacklisted").and_then(|v| v.as_bool()).unwrap_or(true);
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.set_tag_blacklisted(id, bl))
@@ -247,7 +247,7 @@ async fn set_tag_blacklist(
 async fn batch_delete_tags(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let ids: Vec<i64> = req
         .get("ids")
         .and_then(|v| v.as_array())
@@ -269,7 +269,7 @@ async fn batch_delete_tags(
 async fn batch_blacklist_tags(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let ids: Vec<i64> = req
         .get("ids")
         .and_then(|v| v.as_array())
@@ -459,7 +459,7 @@ async fn sync_tagger_model(
 async fn run_tagging(
     State(state): State<AppState>,
     Json(req): Json<RunTaggingRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
     let force_ids = req.force_ids;
 
@@ -524,22 +524,15 @@ async fn run_tagging(
             Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
-        let _ = db.update_job(job_id, status, done, failed, error.as_deref());
+        // 中断保护：用户点「中断」后 job 已是 cancelled，不能被收尾覆盖成 done/failed
+        let final_status = super::final_job_status(&db, job_id, status);
+        let _ = db.update_job(job_id, final_status, done, failed, error.as_deref());
         let _ = db.add_log(
-            if status == "done" { "info" } else { "error" },
+            if final_status == "done" { "info" } else if final_status == "cancelled" { "warn" } else { "error" },
             "task",
-            &format!("打标任务 #{job_id} 完成：成功 {done} 张，失败 {failed} 张{}", error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
+            &format!("打标任务 #{job_id} 结束（状态 {final_status}）：成功 {done} 张，失败 {failed} 张{}", error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
         );
-        let event = match result {
-            Ok(progress) => json!({
-                "type": "task.done",
-                "payload": { "job_id": job_id, "kind": "tag", "done": progress.done, "failed": progress.failed, "total": progress.total },
-            }),
-            Err(e) => json!({
-                "type": "task.failed",
-                "payload": { "job_id": job_id, "kind": "tag", "error": e.to_string() },
-            }),
-        };
+        let event = task_end_event(final_status, "tag", job_id, &result);
         st.broadcast(event.to_string());
     });
 
@@ -550,7 +543,7 @@ async fn run_tagging(
 async fn run_sauce(
     State(state): State<AppState>,
     Json(req): Json<RunTaggingRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
     let force_ids = req.force_ids;
 
@@ -630,12 +623,7 @@ async fn run_sauce(
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
         // 若任务已被取消（中断），保持 cancelled 状态（不覆盖为 done）
-        let final_status =
-            if db.get_job(job_id).ok().flatten().map(|j| j.status) == Some("cancelled".into()) {
-                "cancelled"
-            } else {
-                status
-            };
+        let final_status = super::final_job_status(&db, job_id, status);
         let _ = db.update_job(job_id, final_status, done, failed, error.as_deref());
         // 增强3：溯源成功 → 智能替换检查（大小比对 + 严格查重）
         if final_status == "done" && auto_replace && !candidate_ids.is_empty() {
@@ -655,16 +643,7 @@ async fn run_sauce(
             "task",
             &format!("溯源任务 #{job_id} 结束（状态 {}）：成功 {done} 张，失败 {failed} 张{}", final_status, error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
         );
-        let event = match result {
-            Ok(progress) => json!({
-                "type": "task.done",
-                "payload": { "job_id": job_id, "kind": "sauce", "done": progress.done, "failed": progress.failed, "total": progress.total },
-            }),
-            Err(e) => json!({
-                "type": "task.failed",
-                "payload": { "job_id": job_id, "kind": "sauce", "error": e.to_string() },
-            }),
-        };
+        let event = super::task_end_event(final_status, "sauce", job_id, &result);
         st.broadcast(event.to_string());
     });
 
@@ -702,7 +681,7 @@ async fn run_tag_pipeline_async(
 
 async fn tagging_stats(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let (untagged, total, tagged) = tokio::task::spawn_blocking(move || {
         let untagged = db.untagged_active_images(100000).unwrap_or_default().len();
@@ -722,7 +701,7 @@ async fn tagging_stats(
 /// 查看 SauceNAO key 状态（配额/冷却/预警）。
 async fn key_status(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let slot = state.sauce_pool.read().await;
     let Some(pool) = slot.as_ref() else {
         return Ok(Json(json!({ "keys": [], "message": "尚未初始化（首次打标后可见）" })));
@@ -751,7 +730,7 @@ async fn key_status(
 async fn image_tags(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let tags = tokio::task::spawn_blocking(move || db.image_tags(id))
         .await
@@ -764,7 +743,7 @@ async fn retag_image(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(_req): Json<RetagRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
     // 配置
     let db_for_config = state.db.clone();
@@ -819,17 +798,10 @@ async fn retag_image(
             Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
-        let _ = st.db.update_job(job_id, status, done, failed, error.as_deref());
-        let event = match result {
-            Ok(progress) => json!({
-                "type": "task.done",
-                "payload": { "job_id": job_id, "kind": "tag", "done": progress.done, "failed": progress.failed, "total": progress.total },
-            }),
-            Err(e) => json!({
-                "type": "task.failed",
-                "payload": { "job_id": job_id, "kind": "tag", "error": e.to_string() },
-            }),
-        };
+        // 中断保护：见 final_job_status
+        let final_status = super::final_job_status(&st.db, job_id, status);
+        let _ = st.db.update_job(job_id, final_status, done, failed, error.as_deref());
+        let event = super::task_end_event(final_status, "tag", job_id, &result);
         st.broadcast(event.to_string());
     });
 

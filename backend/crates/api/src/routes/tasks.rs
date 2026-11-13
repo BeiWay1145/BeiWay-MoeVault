@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response, join_error_response};
+use super::{db_error_response, error_response, join_error_response, ApiResult, ApiError};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -45,7 +45,7 @@ pub fn task_type_label(ty: &str) -> &'static str {
 async fn list_tasks(
     State(state): State<AppState>,
     Query(params): Query<ListTasksParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let db = state.db.clone();
     let jobs = tokio::task::spawn_blocking(move || db.list_jobs(limit))
@@ -76,7 +76,7 @@ async fn list_tasks(
 async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let job = tokio::task::spawn_blocking(move || db.get_job(id))
         .await
@@ -128,7 +128,7 @@ async fn get_task(
 /// DELETE /api/v1/tasks：清空历史任务（保留进行中）。
 async fn clear_tasks(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let n = tokio::task::spawn_blocking(move || db.clear_jobs())
         .await
@@ -141,7 +141,7 @@ async fn clear_tasks(
 async fn cancel_task(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         // 校验任务存在
@@ -151,7 +151,7 @@ async fn cancel_task(
         db.cancel_job(id).map_err(db_error_response)?;
         db.add_log("warn", "task", &format!("任务 #{id} 已中断（用户操作）"))
             .map_err(db_error_response)?;
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+        Ok::<_, ApiError>(())
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -163,7 +163,7 @@ async fn cancel_task(
 async fn resume_task(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
     let job = tokio::task::spawn_blocking({
         let db = state.db.clone();
@@ -254,23 +254,10 @@ async fn resume_task(
             Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
-        let final_status =
-            if db.get_job(id).ok().flatten().map(|j| j.status) == Some("cancelled".into()) {
-                "cancelled"
-            } else {
-                status
-            };
+        // 若任务已被取消（中断），保持 cancelled 状态（不覆盖为 done）
+        let final_status = super::final_job_status(&db, id, status);
         let _ = db.update_job(id, final_status, done, failed, error.as_deref());
-        let event = match result {
-            Ok(progress) => json!({
-                "type": "task.done",
-                "payload": { "job_id": id, "kind": "sauce", "done": progress.done, "failed": progress.failed, "total": progress.total },
-            }),
-            Err(e) => json!({
-                "type": "task.failed",
-                "payload": { "job_id": id, "kind": "sauce", "error": e.to_string() },
-            }),
-        };
+        let event = super::task_end_event(final_status, "sauce", id, &result);
         st.broadcast(event.to_string());
     });
 

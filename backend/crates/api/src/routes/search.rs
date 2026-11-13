@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/api/v1/search/suggest", get(search_suggest))
@@ -41,7 +41,7 @@ struct StatusSuggest {
 async fn search_suggest(
     State(state): State<AppState>,
     Query(params): Query<SuggestParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let q = params.q.clone().unwrap_or_default();
     let q_trim = q.trim().to_string();

@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::error_response;
+use super::{error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -35,7 +35,7 @@ pub struct RunAestheticRequest {
 async fn run_aesthetic(
     State(state): State<AppState>,
     Json(req): Json<RunAestheticRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
     let force_ids = req.force_ids;
     let force = req.force;
@@ -84,22 +84,15 @@ async fn run_aesthetic(
             Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
-        let _ = db.update_job(job_id, status, done, failed, error.as_deref());
+        // 中断保护：用户点「中断」后 job 已是 cancelled，不能被收尾覆盖成 done/failed
+        let final_status = super::final_job_status(&db, job_id, status);
+        let _ = db.update_job(job_id, final_status, done, failed, error.as_deref());
         let _ = db.add_log(
-            if status == "done" { "info" } else { "error" },
+            if final_status == "done" { "info" } else if final_status == "cancelled" { "warn" } else { "error" },
             "aesthetic",
-            &format!("美学任务 #{job_id} 完成：成功 {done} 张，失败 {failed} 张{}", error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
+            &format!("美学任务 #{job_id} 结束（状态 {final_status}）：成功 {done} 张，失败 {failed} 张{}", error.as_deref().map(|e| format!("，错误：{e}")).unwrap_or_default()),
         );
-        let event = match result {
-            Ok(progress) => json!({
-                "type": "task.done",
-                "payload": { "job_id": job_id, "kind": "aesthetic", "done": progress.done, "failed": progress.failed, "total": progress.total },
-            }),
-            Err(e) => json!({
-                "type": "task.failed",
-                "payload": { "job_id": job_id, "kind": "aesthetic", "error": e.to_string() },
-            }),
-        };
+        let event = super::task_end_event(final_status, "aesthetic", job_id, &result);
         st.broadcast(event.to_string());
     });
 
@@ -108,7 +101,7 @@ async fn run_aesthetic(
 
 async fn aesthetic_stats(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let (unscored, total, scored) = tokio::task::spawn_blocking(move || {
         let unscored = db.unscored_active_images(100000).unwrap_or_default().len();
@@ -129,7 +122,7 @@ async fn rescore_image(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(_req): Json<RunAestheticRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let st = state.clone();
 
     // 创建任务记录
@@ -169,17 +162,10 @@ async fn rescore_image(
             Ok(progress) => ("done", progress.done as i64, progress.failed as i64, None),
             Err(e) => ("failed", 0, 0, Some(e.to_string())),
         };
-        let _ = st.db.update_job(job_id, status, done, failed, error.as_deref());
-        let event = match result {
-            Ok(progress) => json!({
-                "type": "task.done",
-                "payload": { "job_id": job_id, "kind": "aesthetic", "done": progress.done, "failed": progress.failed, "total": progress.total },
-            }),
-            Err(e) => json!({
-                "type": "task.failed",
-                "payload": { "job_id": job_id, "kind": "aesthetic", "error": e.to_string() },
-            }),
-        };
+        // 中断保护：见 final_job_status
+        let final_status = super::final_job_status(&st.db, job_id, status);
+        let _ = st.db.update_job(job_id, final_status, done, failed, error.as_deref());
+        let event = super::task_end_event(final_status, "aesthetic", job_id, &result);
         st.broadcast(event.to_string());
     });
 

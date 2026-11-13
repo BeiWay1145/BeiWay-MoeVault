@@ -65,7 +65,9 @@ function isBlankTarget(target: EventTarget | null): boolean {
   if (!el) return true
   if (el.closest('[data-image-id]')) return false
   // 交互控件上不起框（避免与输入/点击冲突）
-  if (el.closest('input, textarea, select, button, a, .el-select, .el-input, .el-checkbox, .el-dropdown, .ctx-menu, .el-dialog, .el-tabs, .side-nav, aside')) {
+  // .toolbar / .batch-bar：工具栏与批量操作条自身是交互区，
+  // 从它们上面按下不应起框（此前漏掉 .toolbar，实测从工具栏按下会画出选框）。
+  if (el.closest('input, textarea, select, button, a, .el-select, .el-input, .el-checkbox, .el-dropdown, .ctx-menu, .el-dialog, .el-tabs, .side-nav, aside, .toolbar, .batch-bar')) {
     return false
   }
   return true

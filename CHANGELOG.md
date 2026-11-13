@@ -4,6 +4,44 @@
 
 ## [未发布]
 
+### 重构 / 架构
+
+- **架构审查（`docs/ARCH_REVIEW_2026-11.md`）后的 P0 修复**：四个「有明确失效链条」的问题一次修完。
+
+  - **任务中断后状态被覆盖成 done/failed**。根因比报告描述的更深一层：
+    收尾处加保护还不够——worker 每处理几张图会写一次 `running` 进度，
+    把 `cancel_job` 写下的 `cancelled` **覆盖回 running**，收尾时再读已读不到 cancelled。
+    修复分两处：`Db::update_job` 的 SQL 增加「终态不可被 running 进度拉回」条件；
+    各任务入口收尾统一走 `final_job_status()` 回读保护。
+  - **选择态双真源**：`stores/library.ts` 的 `selected`/`toggleSelect`/`clearSelect`
+    与 `useSelection` 并存且互相 watch 双写，导致批量面板显示过期选中数。
+    已删除 store 侧副本，选择态唯一真源为各视图的 `useSelection`。
+  - **离开任务中心后全局轮询永久停止**：`tasks.ts` 的 `stop()` 无条件清 timer，
+    而 `AppLayout` 与 `TaskCenterView` 都会调 start/stop。改为**订阅者引用计数**，
+    最后一个订阅者离开才真正停表。
+  - **WS 事件被丢弃**：前端只认 `batch.*`，`task.done`/`task.failed` 全丢；
+    后端 `broadcast` 的 `Lagged` 分支静默 `continue`。现在前端消费任务事件并派发
+    `moevault:task-event`，后端溢出时下发 `resync` 让各视图重拉权威状态。
+
+- **任务事件统一构造**：新增 `routes::task_end_event()` + `ProgressLike` trait，
+  替换此前散落在 5 处、各抄一份的 `json!` 模板。被中断的任务现在发 `task.cancelled`
+  而不是 `task.done`，前端用警告色提示「已中断」，不再假装成功。
+
+- **API 响应类型统一**：新增 `ApiResult<T>` / `ApiError` 别名，
+  替换 77 处手写的 `Result<Json<Value>, (StatusCode, Json<Value>)>`。
+
+- **出口池配置单一解析入口**：`state::exit_config()` 统一了此前 `state.rs` 与
+  `routes/settings.rs` 两份重复的端口/开关解析。
+
+- **推理服务代理改用 reqwest**：`settings.rs` 原有一段手写裸 TCP HTTP 客户端
+  （自己拼请求行、按 `\r\n\r\n` 切 body，注释还写着"api crate 无 reqwest 依赖"——
+  该依赖其实早已存在）。改后自动支持 chunked/gzip/非 200 状态，并复用连接池。
+
+- **文档整理**：README 的文档索引按「现行 / 历史」分组，补全三份新报告；
+  当前状态一节重写为 7 crate 结构说明；五份 v0.1 期旧文档加时效性横幅
+  （`PLAN` / `UI_DESIGN` / `TECH_DETAILS` / `ENHANCEMENTS` / `DESIGN_FILTER_NAVIGATION`）；
+  `.gitignore` 里 GBK 误解码的中文注释修正为 UTF-8。
+
 ### 新增
 
 - **详情页返回时的"缩回缩略图"过渡**（视觉改进1）：退出详情页时，当前大图就地缩小并平移到

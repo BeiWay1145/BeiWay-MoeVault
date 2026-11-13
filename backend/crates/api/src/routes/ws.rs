@@ -61,7 +61,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // 落后：broadcast 缓冲区（256）被写满，本连接丢掉了若干事件。
+                    // 以前是静默 continue —— 前端永远等不到那些 task.done，界面卡在"运行中"。
+                    // 现在显式下发一条 resync，让前端立即重拉状态，而不是等用户手动刷新。
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        let warn = json!({
+                            "type": "resync",
+                            "ts": now_secs(),
+                            "payload": { "dropped": n, "reason": "lagged" },
+                        })
+                        .to_string();
+                        if socket.send(Message::Text(warn.into())).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }

@@ -9,6 +9,10 @@
  * - batch.done / batch.failed → 派发 window 事件：
  *   - 'moevault:import-done'   payload = { batch_id, done, failed, duplicate }
  *   - 'moevault:import-failed' payload = { batch_id, error }
+ * - resync（服务端缓冲溢出）→ 派发 'moevault:resync'，各视图重拉状态
+ * - task.done / task.failed / task.cancelled → 立即刷新任务列表（'moevault:task-event'）：
+ *   以前这里只认 batch.*，任务事件全丢，任务中心只能靠 3s 轮询，
+ *   且轮询被停掉后（离开任务中心）再也收不到任何完成通知。
  * 各视图监听对应事件刷新自身数据；全局通知在 AppLayout 统一弹出。
  */
 import { ref } from 'vue'
@@ -51,6 +55,17 @@ function handleMessage(raw: MessageEvent) {
     }
     const name = msg.type === 'batch.done' ? 'moevault:import-done' : 'moevault:import-failed'
     window.dispatchEvent(new CustomEvent(name, { detail: p }))
+    return
+  }
+  if (msg.type === 'task.done' || msg.type === 'task.failed' || msg.type === 'task.cancelled') {
+    window.dispatchEvent(
+      new CustomEvent('moevault:task-event', { detail: { type: msg.type, ...(msg.payload ?? {}) } }),
+    )
+    return
+  }
+  // 服务端告诉我们中间有事件被丢弃（订阅缓冲溢出）→ 通知各视图重新拉一次真实状态
+  if (msg.type === 'resync') {
+    window.dispatchEvent(new CustomEvent('moevault:resync', { detail: msg.payload ?? {} }))
   }
 }
 

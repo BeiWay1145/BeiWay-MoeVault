@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -40,7 +40,7 @@ fn parse_cursor(cursor: &Option<String>) -> Result<Option<i64>, (axum::http::Sta
 async fn list_trash(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let limit = params.limit.unwrap_or(100);
     let cursor_id = parse_cursor(&params.cursor)?;
     let db = state.db.clone();
@@ -65,7 +65,7 @@ async fn list_trash(
 async fn restore(
     State(state): State<AppState>,
     Path(image_id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let library = state.library_dir();
     let recycle = state.recycle_dir();
@@ -81,7 +81,7 @@ async fn restore(
 async fn purge(
     State(state): State<AppState>,
     Path(image_id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let library = state.library_dir();
     let recycle = state.recycle_dir();
@@ -97,7 +97,7 @@ async fn purge(
 
 async fn purge_all(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let library = state.library_dir();
     let recycle = state.recycle_dir();

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,7 +38,7 @@ pub struct ImportRequest {
 async fn create_import(
     State(state): State<AppState>,
     Json(req): Json<ImportRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     // 解析导入模式：move（默认）/ copy。
     // move = 移动进库（源文件移入库目录）；copy = 复制进库（保留源文件）。
     let mode = match req.mode.as_deref() {
@@ -126,7 +126,7 @@ async fn create_import(
 
 async fn list_batches(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let batches = tokio::task::spawn_blocking(move || db.list_import_batches(100))
         .await
@@ -138,7 +138,7 @@ async fn list_batches(
 async fn get_batch(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let batch = tokio::task::spawn_blocking(move || db.get_import_batch(id))
         .await
@@ -161,7 +161,7 @@ pub struct TreeQuery {
 async fn import_tree(
     State(state): State<AppState>,
     Query(q): Query<TreeQuery>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let sauce = q.sauce.clone();
     let tag = q.tag.clone();
@@ -207,7 +207,7 @@ pub struct DirImagesQuery {
 async fn import_dir_images(
     State(state): State<AppState>,
     Query(q): Query<DirImagesQuery>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let limit = q.limit.unwrap_or(60).clamp(1, 200);
     let cursor = q.cursor.as_deref().and_then(|c| c.parse::<i64>().ok());

@@ -307,8 +307,8 @@ const sortOptions = [
   { key: 'random', label: '随机' },
 ]
 
-// 选中计数
-const selectedCount = computed(() => library.selected.size)
+// 选中计数（唯一真源 = useSelection，不再读 store 副本）
+const selectedCount = computed(() => sel.count.value)
 
 // 预览弹窗
 const previewVisible = ref(false)
@@ -398,7 +398,6 @@ function onCardClick(img: ImageItem) {
  */
 function onSelect(img: ImageItem, mods: { ctrl: boolean; shift: boolean }) {
   sel.applySelection(img.id, mods)
-  library.selected = sel.selected.value
 }
 
 /** 右键：已在选中集里 → 作用于整个选择集；否则仅作用于该图（不改变现有选择）。 */
@@ -424,14 +423,6 @@ async function onDragOut() {
     ElMessage.error(`拖出失败：${(e as Error).message ?? e}`)
   }
 }
-
-/** 同步选择集到 library store（保持既有读取 path 兼容：library.selected）。 */
-watch(
-  () => sel.selected.value,
-  (s) => {
-    library.selected = new Set(s)
-  },
-)
 
 /**
  * 当前"可见"的图片 id（Ctrl+A 与范围选择的实际范围）。
@@ -622,7 +613,7 @@ function openExportDialog(ids: number[]) {
 /** 导出完成回调：回收则清空选择并刷新。 */
 function onExportDone(info: { count: number; recycled: number }) {
   if (info.recycled > 0) {
-    library.clearSelect()
+    sel.clear()
     fetchPage().catch(() => {})
   }
 }

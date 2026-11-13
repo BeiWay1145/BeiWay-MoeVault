@@ -30,6 +30,34 @@ pub struct AppState {
     pub started_at: Instant,
 }
 
+/// 从 settings 读取 SauceNAO 多出口配置，返回（端口列表, 是否启用）。
+///
+/// 这里是**唯一**的解析入口。此前 state.rs（构建出口池）与 routes/settings.rs
+/// （设置页读写）各写了一份同样的解析，字段格式一改就要改两处、极易漂移。
+///
+/// 存储格式：逗号/分号/空格/换行分隔的端口号，如 `7901,7902`。
+/// 只接受端口号（应用固定拼 http://127.0.0.1:{port}），不允许填任意外部代理。
+pub fn exit_config(db: &Db) -> (Vec<u16>, bool) {
+    let ports = db
+        .get_setting("sauce_proxy_ports")
+        .ok()
+        .flatten()
+        .map(|s| {
+            s.split([',', ';', ' ', '\n'])
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
+                .collect::<Vec<u16>>()
+        })
+        .unwrap_or_default();
+    let enabled = db
+        .get_setting("sauce_proxy_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    (ports, enabled)
+}
+
 impl AppState {
     pub fn new(db: Db, data_dir: PathBuf, infer_base_url: String) -> Self {
         let (ws_tx, _) = broadcast::channel(256);
@@ -38,23 +66,7 @@ impl AppState {
         // 放在这里（而非 app 的 main）是因为 app crate 不直接依赖 tagger，
         // 而 api crate 已依赖 —— 内聚到此可避免为一个初始化引入新的 crate 依赖。
         let exit_pool = {
-            let ports = db
-                .get_setting("sauce_proxy_ports")
-                .ok()
-                .flatten()
-                .map(|s| {
-                    s.split([',', ';', ' ', '\n'])
-                        .filter_map(|p| p.trim().parse::<u16>().ok())
-                        .filter(|p| *p > 0)
-                        .collect::<Vec<u16>>()
-                })
-                .unwrap_or_default();
-            let enabled = db
-                .get_setting("sauce_proxy_enabled")
-                .ok()
-                .flatten()
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false);
+            let (ports, enabled) = exit_config(&db);
             if enabled && !ports.is_empty() {
                 tracing::info!(?ports, "SauceNAO 多出口已启用，构建出口池");
                 Some(Arc::new(ExitPool::new(&ports, true)))

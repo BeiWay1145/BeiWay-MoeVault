@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -95,7 +95,7 @@ struct ImportParams {
 /// GET /api/v1/dict/status：返回本地缓存是否可用及其信息（供设置页展示）。
 async fn dict_status(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let dir = state.data_dir.clone();
     let cache = dict_cache_path(&dir);
     let meta = read_meta(&dir);
@@ -120,7 +120,7 @@ async fn dict_status(
 async fn import_dict(
     State(state): State<AppState>,
     body: Option<Json<ImportParams>>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let force = body.map(|b| b.0.force).unwrap_or(false);
     let data_dir = state.data_dir.clone();
     let cache_path = dict_cache_path(&data_dir);
@@ -134,18 +134,17 @@ async fn import_dict(
 
     // ---- 第 1 步：判断能否直接使用本地缓存 ----
     let mut use_cache = false;
-    let mut upstream_lm: Option<String> = None;
-    let mut upstream_etag: Option<String> = None;
     if !force && cache_path.is_file() {
         // 探测上游指纹（失败不致命，仅表示无法确认是否最新）
         match client.head(DICT_URL).send().await {
             Ok(r) if r.status().is_success() => {
-                upstream_lm = r
+                // 探测用指纹只在本次比对内使用，不带到第 2 步（否则会与下载响应串味）
+                let upstream_lm = r
                     .headers()
                     .get(reqwest::header::LAST_MODIFIED)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                upstream_etag = r
+                let upstream_etag = r
                     .headers()
                     .get(reqwest::header::ETAG)
                     .and_then(|v| v.to_str().ok())
@@ -185,12 +184,12 @@ async fn import_dict(
             ));
         }
         // 记录本次响应的指纹（供下次比对）
-        upstream_lm = resp
+        let upstream_lm = resp
             .headers()
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        upstream_etag = resp
+        let upstream_etag = resp
             .headers()
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())

@@ -80,6 +80,22 @@ export const useTaskStore = defineStore('tasks', () => {
   let initialized = false
   let timer: number | undefined
 
+  // 架构修复：WS 任务的完成/失败事件到达时立刻刷新，不再只依赖 3s 轮询。
+  // 轮询一旦被意外停掉（曾经离开任务中心就会发生），这里仍能收到通知。
+  let wsBound = false
+  function bindWsEvents() {
+    if (wsBound) return
+    wsBound = true
+    window.addEventListener('moevault:task-event', () => {
+      load().catch(() => {})
+    })
+    // 服务端丢过事件 → 状态可能已不一致，重拉一次权威数据
+    window.addEventListener('moevault:resync', () => {
+      initialized = false
+      load().catch(() => {})
+    })
+  }
+
   async function load() {
     try {
       const d = await get<{ items: RawTask[] }>('/tasks?limit=100')
@@ -90,14 +106,17 @@ export const useTaskStore = defineStore('tasks', () => {
         // 首次加载：把现有完成/失败任务记入已通知集合（历史任务不再重复提示），
         // 之后轮询只提示本会话新出现的完成/失败任务。
         for (const t of items) {
-          if (t.status === 'done' || t.status === 'failed') notified.value.add(t.id)
+          if (t.status === 'done' || t.status === 'failed' || t.status === 'cancelled') notified.value.add(t.id)
         }
         initialized = true
         return
       }
-      // 检测新完成的任务 → 顶部通知
+      // 检测新完成/中断的任务 → 顶部通知
       for (const t of items) {
-        if ((t.status === 'done' || t.status === 'failed') && !notified.value.has(t.id)) {
+        if (
+          (t.status === 'done' || t.status === 'failed' || t.status === 'cancelled') &&
+          !notified.value.has(t.id)
+        ) {
           notified.value.add(t.id)
           notifyFinished(t)
           const cb = doneCallbacks.get(t.id)
@@ -112,15 +131,27 @@ export const useTaskStore = defineStore('tasks', () => {
     }
   }
 
-  /** 立即加载一次并启动轮询（页面挂载时调用）。 */
+  // 轮询订阅者计数。
+  //
+  // 为什么需要它：轮询是**全局**的（AppLayout 常驻），但任务中心自己也调 start/stop。
+  // 之前 stop() 无条件清 timer，于是「进任务中心 → 离开」就把全局轮询永久掐死了，
+  // 之后任何页面都不会再收到任务完成通知。
+  // 改成引用计数：谁 start 谁来 stop，最后一个订阅者走了才真正停。
+  let subscribers = 0
+
+  /** 立即加载一次并启动轮询（页面挂载时调用，可重入）。 */
   function start() {
+    subscribers += 1
+    bindWsEvents()
     load()
     if (timer !== undefined) return
     timer = window.setInterval(load, 3000)
   }
 
-  /** 停止轮询（页面卸载时调用）。 */
+  /** 释放一个订阅者；全部释放后才停止轮询。 */
   function stop() {
+    subscribers = Math.max(0, subscribers - 1)
+    if (subscribers > 0) return
     if (timer !== undefined) {
       window.clearInterval(timer)
       timer = undefined
@@ -144,6 +175,15 @@ export const useTaskStore = defineStore('tasks', () => {
       ElMessage({
         message: `${label}任务 #${t.id} 已完成：成功 ${t.done} 张${t.failed > 0 ? `，失败 ${t.failed} 张` : ''}`,
         type: 'success',
+        duration: 5000,
+        showClose: true,
+      })
+    } else if (t.status === 'cancelled') {
+      // 中断是用户主动行为，用警告色而不是错误色——
+      // 之前被中断的任务最终会被写成 done，用户根本看不出中断生没生效。
+      ElMessage({
+        message: `${label}任务 #${t.id} 已中断：成功 ${t.done} 张，失败 ${t.failed} 张`,
+        type: 'warning',
         duration: 5000,
         showClose: true,
       })

@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult, ApiError};
 
 /// 可写设置白名单（避免任意 key 写入）。
 const SETTINGS_WHITELIST: &[&str] = &[
@@ -65,48 +65,39 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/infer/health", get(proxy_infer_health))
 }
 
-/// 转发一个 GET 请求到 Python 推理服务并返回 JSON body（备/admin 用途的轻量代理）。
-/// 手动 TCP 实现（api crate 无 reqwest 依赖），超时 3s。
-fn proxy_python_get(base: &str, path: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    // base 形如 http://127.0.0.1:8001
-    let base2 = base.trim_end_matches('/');
-    let rest = base2
-        .strip_prefix("http://")
-        .or_else(|| base2.strip_prefix("https://"))
-        .unwrap_or(base2);
-    let (host_port, _path) = match rest.split_once('/') {
-        Some((hp, _)) => (hp, true),
-        None => (rest, false),
-    };
-    let (host, port) = match host_port.split_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(8001)),
-        None => (host_port.to_string(), 8001),
-    };
-    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
-        .map_err(|e| format!("推理服务不可达: {e}"))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-        .ok();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buf);
-    Ok(text.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+/// 转发一个 GET 请求到 Python 推理服务并返回响应 body（/health、/devices 用）。
+///
+/// 这里曾是一段手写裸 TCP 客户端（自己拼 HTTP/1.1 请求行、按 \r\n\r\n 切 body），
+/// 理由是「api crate 无 reqwest 依赖」—— 那条注释早就过时了，Cargo.toml 里 reqwest
+/// 从多出口功能起就在依赖里。手写实现不处理 chunked、gzip、非 200 状态、
+/// 响应头大小写，改用 reqwest 后这些问题自然消失，也能复用连接池。
+async fn proxy_python_get(base: &str, path: &str) -> Result<String, String> {
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| format!("推理服务不可达（{url}）: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("读取推理服务响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("推理服务返回 HTTP {status}: {body}"));
+    }
+    Ok(body)
 }
 
 /// GET /api/v1/infer/health：转发到 Python 推理服务 /health（模型加载状态 + 当前模型路径）。
 async fn proxy_infer_health(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     proxy_json(&state, "/health").await
 }
 
 /// GET /api/v1/devices：转发到 Python 推理服务 /devices（获取可用推理设备）。
 async fn proxy_devices(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     proxy_json(&state, "/devices").await
 }
 
@@ -114,12 +105,11 @@ async fn proxy_devices(
 async fn proxy_json(
     state: &AppState,
     path: &str,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let base = state.infer_base_url.clone();
     let path = path.to_string();
-    let body = tokio::task::spawn_blocking(move || proxy_python_get(&base, &path))
+    let body = proxy_python_get(&base, &path)
         .await
-        .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
         .map_err(|e| error_response(ErrorKind::Internal, e))?;
     let parsed: Value = serde_json::from_str(&body)
         .map_err(|e| error_response(ErrorKind::Internal, format!("推理服务响应解析失败: {e}")))?;
@@ -160,7 +150,7 @@ fn write_keys(db: &moevault_db::Db, keys: &[SauceNaoKey]) -> Result<(), moevault
 
 async fn get_settings(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut map = serde_json::Map::new();
@@ -196,7 +186,7 @@ pub struct UpdateSettingsRequest {
 async fn update_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSettingsRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let fields = req.fields;
     tokio::task::spawn_blocking(move || {
@@ -213,7 +203,7 @@ async fn update_settings(
             db.put_setting(k, &val)
                 .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
         }
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+        Ok::<_, ApiError>(())
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -222,11 +212,9 @@ async fn update_settings(
     // 重建是廉价操作（只是构造几个绑定代理的 Client），故每次保存都做，
     // 保证运行中的溯源任务立即使用新配置，无需重启。
     let db2 = state.db.clone();
-    let (ports, enabled) = tokio::task::spawn_blocking(move || {
-        (read_exit_ports(&db2), exits_enabled(&db2))
-    })
-    .await
-    .unwrap_or_default();
+    let (ports, enabled) = tokio::task::spawn_blocking(move || crate::state::exit_config(&db2))
+        .await
+        .unwrap_or_default();
     let pool = moevault_tagger::ExitPool::new(&ports, enabled);
     {
         let mut slot = state.exit_pool.write().await;
@@ -265,7 +253,7 @@ pub struct AddKeyRequest {
 
 async fn list_keys(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let keys = tokio::task::spawn_blocking(move || read_keys(&db))
         .await
@@ -342,7 +330,7 @@ async fn set_key_quota(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let Some(v) = req.get("long_remaining").and_then(|v| v.as_i64()) else {
         return Err(error_response(ErrorKind::InvalidInput, "缺少 long_remaining"));
     };
@@ -358,7 +346,7 @@ async fn set_key_quota(
         } else {
             return Err(error_response(ErrorKind::NotFound, format!("密钥 {name2} 不存在")));
         }
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+        Ok::<_, ApiError>(())
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -383,7 +371,7 @@ async fn set_key_quota(
 async fn add_key(
     State(state): State<AppState>,
     Json(req): Json<AddKeyRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let key = req.key.trim().to_string();
     if key.is_empty() {
         return Err(error_response(ErrorKind::InvalidInput, "API key 不能为空"));
@@ -412,7 +400,7 @@ async fn add_key(
         };
         keys.push(SauceNaoKey { name: name.clone(), key, tier, ..Default::default() });
         write_keys(&db, &keys).map_err(db_error_response)?;
-        Ok::<String, (axum::http::StatusCode, Json<Value>)>(name)
+        Ok::<String, ApiError>(name)
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -422,13 +410,13 @@ async fn add_key(
 async fn delete_key(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         let mut keys = read_keys(&db).map_err(db_error_response)?;
         keys.retain(|k| k.name != name);
         write_keys(&db, &keys).map_err(db_error_response)?;
-        Ok::<_, (axum::http::StatusCode, Json<Value>)>(())
+        Ok::<_, ApiError>(())
     })
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))??;
@@ -437,43 +425,12 @@ async fn delete_key(
 
 // ---------- 增强2：SauceNAO 多出口 IP 轮换（Clash 多入站端口）----------
 
-///
-/// 从 settings 读取出口端口列表。
-///
-/// 存储格式：逗号分隔的端口号字符串（如 `7901,7902,7903`）。
-/// 只允许端口号（应用固定拼 `http://127.0.0.1:{port}`），避免用户填入任意外部代理。
-fn read_exit_ports(db: &moevault_db::Db) -> Vec<u16> {
-    db.get_setting("sauce_proxy_ports")
-        .ok()
-        .flatten()
-        .map(|s| {
-            s.split([',', ';', ' ', '\n'])
-                .filter_map(|p| p.trim().parse::<u16>().ok())
-                .filter(|p| *p > 0)
-                .collect::<Vec<u16>>()
-        })
-        .unwrap_or_default()
-}
-
-/// 出口开关是否开启。
-fn exits_enabled(db: &moevault_db::Db) -> bool {
-    db.get_setting("sauce_proxy_enabled")
-        .ok()
-        .flatten()
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-}
-
 /// GET /api/v1/settings/sauce-exits：返回出口配置与各出口的实时状态。
 async fn list_exits(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
-    let (ports, enabled) = tokio::task::spawn_blocking(move || {
-        let p = read_exit_ports(&db);
-        let e = exits_enabled(&db);
-        (p, e)
-    })
+    let (ports, enabled) = tokio::task::spawn_blocking(move || crate::state::exit_config(&db))
     .await
     .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
 
@@ -527,9 +484,9 @@ async fn list_exits(
 /// 此时轮换无意义 —— 前端据此给出明确警告。
 async fn test_exits(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
-    let ports = tokio::task::spawn_blocking(move || read_exit_ports(&db))
+    let (ports, _) = tokio::task::spawn_blocking(move || crate::state::exit_config(&db))
         .await
         .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
     if ports.is_empty() {

@@ -18,7 +18,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -35,7 +35,7 @@ pub struct OpenExplorerReq {
 
 async fn open_explorer(
     Json(req): Json<OpenExplorerReq>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let path = req.path.trim();
     if path.is_empty() {
         return Err(error_response(ErrorKind::InvalidInput, "path 不能为空"));
@@ -142,7 +142,7 @@ fn default_format() -> String {
 async fn export_images(
     State(state): State<AppState>,
     Json(req): Json<ExportRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     if req.ids.is_empty() {
         return Err(error_response(ErrorKind::InvalidInput, "ids 不能为空"));
     }

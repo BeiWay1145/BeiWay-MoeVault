@@ -71,7 +71,6 @@ export const useLibraryStore = defineStore('library', () => {
   const viewMode = ref<ViewMode>(savedMode === 'grid' || savedMode === 'waterfall' || savedMode === 'list' ? savedMode : 'grid')
   const sortKey = ref<SortKey>('imported')
   const sortAsc = ref(false)
-  const selected = ref<Set<number>>(new Set())
   const filter = ref<LibraryFilter>({})
   /**
    * 详情位置记忆：{from, imageId, scrollTop, thumbRect}。
@@ -118,9 +117,9 @@ export const useLibraryStore = defineStore('library', () => {
   } catch {
     /* 忽略 */
   }
-  // 架构重构：移除 multiSelect（"多选模式"）概念。
-  // 选择改为资源管理器式无模式交互，由 composables/useSelection.ts 统一管理；
-  // selected 仍保留供视图读取（由 useSelection 同步写入）。
+  // 架构重构：选择状态**不放在 store 里**。
+  // 资源管理器式无模式选择由各视图的 composables/useSelection.ts 持有唯一真源，
+  // 避免此前 selected 与 useSelection 双写、清空错位的问题。
 
   /**
    * 详情页浏览上下文（增强2）：来源视图的有序图片 id 列表。
@@ -228,18 +227,6 @@ export const useLibraryStore = defineStore('library', () => {
     }
   }
 
-  function toggleSelect(id: number) {
-    const s = new Set(selected.value)
-    if (s.has(id)) s.delete(id)
-    else s.add(id)
-    selected.value = s
-  }
-
-  function clearSelect() {
-    selected.value = new Set()
-  }
-
-
   /**
    * 记录进入详情页时的位置（来源页 + 图片 id + 滚动位置 + 缩略图矩形），
    * 供返回还原与"缩回缩略图"动画使用。
@@ -276,7 +263,6 @@ export const useLibraryStore = defineStore('library', () => {
     viewMode,
     sortKey,
     sortAsc,
-    selected,
     filter,
     detailPos,
     viewerContext,
@@ -291,9 +277,7 @@ export const useLibraryStore = defineStore('library', () => {
     applyFilter,
     clearFilter,
     removeImageById,
-    toggleSelect,
     listLayout,
-    clearSelect,
     saveDetailPos,
     restoreDetailPos,
   }

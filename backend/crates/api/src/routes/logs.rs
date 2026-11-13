@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-use super::{db_error_response, error_response};
+use super::{db_error_response, error_response, ApiResult};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -50,7 +50,7 @@ fn split_csv(raw: &Option<String>) -> Vec<String> {
 async fn list_logs(
     State(state): State<AppState>,
     Query(q): Query<LogQuery>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     // 上限 5000：BUG 追踪器可配置显示条数，且过滤在 SQL 层完成
     let limit = q.limit.unwrap_or(200).clamp(1, 5000);
@@ -89,7 +89,7 @@ pub struct AddLogRequest {
 async fn add_log(
     State(state): State<AppState>,
     Json(req): Json<AddLogRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let level = req.level.clone().unwrap_or_else(|| "info".to_string());
     let category = req.category.clone().unwrap_or_else(|| "system".to_string());
     let db = state.db.clone();
@@ -106,7 +106,7 @@ async fn add_log(
 
 async fn clear_logs(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let n = tokio::task::spawn_blocking(move || db.clear_logs())
         .await
@@ -119,7 +119,7 @@ async fn clear_logs(
 /// 文件写到数据目录下 logs/ 子目录，返回路径。
 async fn export_logs(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+) -> ApiResult<Value> {
     let db = state.db.clone();
     let data_dir = state.data_dir.clone();
     // 分页拉取全量（单页上限 5000，最多 4 页 = 20000 条，与 DB 保留量一致）

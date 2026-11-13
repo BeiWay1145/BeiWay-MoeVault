@@ -1,5 +1,9 @@
 # BeiWay-MoeVault — UI 设计文档（v0.1）
 
+> **状态：历史文档（v0.1 规划期，2026-08-11）。** 保留作设计意图记录，界面以实现为准。
+> 交互模型已演化为资源管理器风格（单选/Ctrl 加选/Shift 连选/框选/右键批量/原生拖出），
+> 见 [`EXPLORER_STYLE_SELECTION_PLAN.md`](EXPLORER_STYLE_SELECTION_PLAN.md)。
+>
 > 配套规划文档：`docs/PLAN.md`。本文档细化前端（Vue 3 + Element Plus）的布局、页面、组件与交互。
 > 线框为 ASCII 示意，最终以实现为准。
 

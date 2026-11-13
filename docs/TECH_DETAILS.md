@@ -1,5 +1,10 @@
 # BeiWay-MoeVault — 技术细节文档（v0.1）
 
+> **状态：历史文档（v0.1 规划期，2026-08-28）。** DDL 与接口契约已与实现漂移
+> （缺 tag 黑白名单、字典缓存、出口池配置等新表/新键），勿直接作为接口依据。
+> 现行实际接口以 `backend/crates/api/src/routes/` 源码为准，
+> 架构现状见 [`ARCH_REVIEW_2026-11.md`](ARCH_REVIEW_2026-11.md)。
+>
 > 配套：`docs/PLAN.md`（规划）、`docs/UI_DESIGN.md`（UI）。本文档定义数据库、API、模块边界，是搭建骨架的契约基准。
 
 ---

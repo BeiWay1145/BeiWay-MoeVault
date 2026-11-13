@@ -1976,7 +1976,12 @@ impl Db {
         };
         conn.execute(
             "UPDATE jobs SET status = ?2, done = ?3, failed = ?4, error = ?5, updated_at = ?6, finished_at = COALESCE(?7, finished_at)
-             WHERE id = ?1",
+             WHERE id = ?1
+               -- 终态不可被进度更新拉回 running。
+               -- 场景：用户在任务跑动中点了「中断」，cancel_job 把状态写成 cancelled；
+               -- 但 worker 每处理几张图就会写一次 running 进度，
+               -- 把 cancelled 覆盖回 running，最后收尾再写成 done —— 表现为「中断无效，任务自己变成已完成」。
+               AND NOT (?2 = 'running' AND status IN ('done', 'failed', 'cancelled'))",
             params![job_id, status, done, failed, error, now, finished],
         )?;
         Ok(())
