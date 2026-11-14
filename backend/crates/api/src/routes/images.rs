@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use moevault_core::models::{ImageFilter, Page, SortKey, Stats, STATUS_ACTIVE};
+use moevault_core::models::{ImageCursor, ImageFilter, Page, SortKey, Stats, STATUS_ACTIVE};
 use moevault_core::ErrorKind;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -745,7 +745,7 @@ pub struct ListParams {
     pub status: Option<String>,
     /// 每页条数，默认 100，最大 500。
     pub limit: Option<i64>,
-    /// 游标：上一页返回的 next_cursor（数字 id 字符串）。
+    /// 游标：上一页返回的 next_cursor（keyset 编码串，对前端不透明）。
     pub cursor: Option<String>,
     /// 关键字（文件名 LIKE）。
     pub q: Option<String>,
@@ -901,10 +901,11 @@ async fn list_images(
         ));
     }
     let limit = params.limit.unwrap_or(100);
-    let cursor_id = match &params.cursor {
-        Some(c) => match c.parse::<i64>() {
-            Ok(v) => Some(v),
-            Err(_) => {
+    // 游标是 keyset 双列游标（排序值 + id），对前端不透明，只做透传。
+    let cursor = match &params.cursor {
+        Some(c) => match ImageCursor::parse(c) {
+            Some(v) => Some(v),
+            None => {
                 return Err(error_response(
                     moevault_core::ErrorKind::InvalidInput,
                     format!("cursor 格式错误: {c}"),
@@ -920,8 +921,8 @@ async fn list_images(
     let filter_for_total = filter.clone();
     let sort = params.parse_sort()?;
     let sort_asc = params.order.as_deref() == Some("asc");
-    let (items, next_id) = tokio::task::spawn_blocking(move || {
-        db.list_images_filtered(&status_for_query, &filter, sort, sort_asc, limit, cursor_id)
+    let (items, next) = tokio::task::spawn_blocking(move || {
+        db.list_images_filtered(&status_for_query, &filter, sort, sort_asc, limit, cursor)
     })
     .await
     .map_err(join_error_response)?
@@ -938,7 +939,7 @@ async fn list_images(
 
     let page = Page {
         items,
-        next_cursor: next_id.map(|id| id.to_string()),
+        next_cursor: next.map(|c| c.encode()),
         total,
     };
     Ok(Json(json!(page)))

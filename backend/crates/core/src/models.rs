@@ -180,6 +180,63 @@ impl SortKey {
     }
 }
 
+/// 图库分页游标（keyset 分页）。
+///
+/// **为什么不用 id 偏移**：列表的 ORDER BY 主键是排序字段（imported_at /
+/// aesthetic_score / size_bytes ...），而 id 的先后与这些字段无关。用
+/// `i.id > 游标` 当翻页条件时，第一页取的是"按排序取前 N 条"，第二页却
+/// 变成"id 大于第一页最后一条"——两者交集很小，于是翻页会漏图、重图，
+/// 降序时甚至可能一页都翻不出来。
+///
+/// 这里改成 keyset：记住上一页最后一行的**排序值 + id**，下一页条件为
+/// `(排序值 更靠后) OR (排序值相同 AND id > 上一页末 id)`，与
+/// `ORDER BY 排序字段 <方向>, i.id ASC` 完全对齐。
+///
+/// 编码为 `v=<排序值|~>;i=<id>`，`~` 表示该行排序列为 NULL
+/// （exif_datetime 与 aesthetic_score 可空）。前端只做字符串透传。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageCursor {
+    /// 上一页最后一行的排序值（None 表示该行排序列为 NULL）。
+    pub sort_val: Option<f64>,
+    /// 上一页最后一行的 id（同排序值内的稳定 tie-break）。
+    pub id: i64,
+}
+
+impl ImageCursor {
+    /// 编码成对前端不透明的字符串。
+    pub fn encode(&self) -> String {
+        let v = match self.sort_val {
+            Some(v) => format!("{v}"),
+            None => "~".to_string(),
+        };
+        format!("v={v};i={}", self.id)
+    }
+
+    /// 解析游标；格式不合法返回 None（调用方据此回 400）。
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut sort_val: Option<Option<f64>> = None;
+        let mut id: Option<i64> = None;
+        for part in s.split(';') {
+            if let Some(raw) = part.strip_prefix("v=") {
+                let v = if raw == "~" {
+                    None
+                } else {
+                    Some(raw.parse::<f64>().ok()?)
+                };
+                sort_val = Some(v);
+            } else if let Some(raw) = part.strip_prefix("i=") {
+                id = Some(raw.parse::<i64>().ok()?);
+            } else {
+                return None;
+            }
+        }
+        Some(ImageCursor {
+            sort_val: sort_val?,
+            id: id?,
+        })
+    }
+}
+
 /// 总览统计（/api/v1/stats）。
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Stats {

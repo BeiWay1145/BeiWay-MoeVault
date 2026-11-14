@@ -4,6 +4,32 @@
 
 ## [未发布]
 
+### 修复
+
+- **图库翻页会漏图/重图**（BUG-A）。列表的 ORDER BY 主键是排序字段
+  （`imported_at` / `aesthetic_score` / `size_bytes` …），而翻页条件写的是
+  `i.id > 游标` —— id 的先后与排序字段无关，于是第 2 页起就跳过了大量本该
+  出现的图，降序时甚至一页都翻不出来。
+  - 后端改为 **keyset 双列游标**：新增 `ImageCursor { sort_val, id }`
+    （`backend/crates/core/src/models.rs`），编码成 `v=<值|~>;i=<id>`
+    （`~` 表示该行排序列为 NULL），对前端完全不透明、只做字符串透传。
+    续接条件按 ASC/DESC × 排序值是否 NULL 分四支，与
+    `ORDER BY <列> <方向>, i.id ASC` 严格对齐。
+  - 随机排序没有「可续接的位置」，明确返回 `next_cursor = null`，
+    前端把翻页器换成一句说明，而不是给个坏掉的翻页器让人反复翻同一页。
+  - 前端 `LibraryView.vue` 的 `fetchPage` 原来还有一个独立缺陷：取游标用的是
+    `pageCursors[page]` 而非 `pageCursors[page-1]`，第 2 页永远拿不到游标、
+    反复显示第 1 页数据。改为**链式取页**：跳到第 N 页时顺序走完中间页，
+    把每页结束游标记进 `pageCursors`；数据中途到底就停在实际最后一页。
+  - 排序/筛选一旦变化，旧游标全部失效（它们绑的是上一套结果集）。新增
+    `resetPaging()`，`onSortChange` 与所有筛选入口统一走
+    `applyFilterAndReset()`，回到第 1 页再拉；升降序按钮改为先翻转再请求
+    （原顺序相反，点一下拿到的是上一次的方向）。`onRecycle` 由裸
+    `fetchImages()` 改走 `fetchPage()`，避免分页开启时退化成一次性 200 张。
+  - 回归测试 `keyset_cursor_pagination_has_no_gaps_or_dups`：12 张图、id 与
+    排序值刻意错开、美学分含并列与 NULL，对 5 种「排序 × 方向」组合断言
+    「逐页拼接结果 == 一次取全的顺序」，并断言 Random 不返回游标。
+
 ### 开发环境
 
 - **落装 4 个 DSH 插件并完成运行时验证**（详见 `docs/SKILL_AUDIT_2026-11.md` §7）：

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use moevault_core::models::{
-    DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageFilter,
+    DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageCursor, ImageFilter,
     ImageListItem, ImageTagView, ImportBatch, RecycledItem, ReplacePendingItem, SortKey, Stats,
     TagAlias, TagBrowseItem, TagWithCount, TaggingState,
 };
@@ -104,9 +104,10 @@ impl Db {
         migration::run(&conn)
     }
 
-    /// 图库列表（组合筛选 + 排序 + 游标分页）。
+    /// 图库列表（组合筛选 + 排序 + keyset 游标分页）。
     ///
-    /// 返回 `(items, next_cursor_id)`；next_cursor_id 为 None 表示没有更多。
+    /// 返回 `(items, next_cursor)`；next_cursor 为 None 表示没有更多
+    /// （也是 Random 排序的唯一取值——随机序没有可续接的位置）。
     /// 筛选/排序字段均为白名单列名 + 参数绑定，无 SQL 注入风险。
     #[allow(clippy::too_many_arguments)]
     pub fn list_images_filtered(
@@ -116,8 +117,8 @@ impl Db {
         sort: SortKey,
         sort_asc: bool,
         limit: i64,
-        cursor_id: Option<i64>,
-    ) -> Result<(Vec<ImageListItem>, Option<i64>), DbError> {
+        cursor: Option<ImageCursor>,
+    ) -> Result<(Vec<ImageListItem>, Option<ImageCursor>), DbError> {
         let conn = self.conn.lock();
         let limit = limit.clamp(1, 500);
 
@@ -129,11 +130,47 @@ impl Db {
              FROM images i",
         );
         let (mut conds, mut params) = build_filter_conds(status, filter);
-        // 游标（id 偏移，配合排序保证稳定分页）
-        if let Some(c) = cursor_id {
-            let t = format!("?{}", params.len() + 1);
-            conds.push(format!("i.id > {t}"));
-            params.push(Box::new(c));
+
+        // keyset 游标：条件必须与下面的 ORDER BY 严格对齐，否则会漏图/重图。
+        // ORDER BY 恒定是「排序列 <dir>, i.id ASC」，因此续接条件为
+        //   (排序列 更靠后) OR (排序列相等 AND i.id > 上一页末 id)
+        // NULL 排在 ASC 的最前 / DESC 的最后，需要单独分支。
+        if let Some(c) = cursor {
+            let col = sort.sql_col();
+            let push_val = |params: &mut Vec<Box<dyn rusqlite::types::ToSql>>, v: f64| -> String {
+                let idx = params.len() + 1;
+                params.push(Box::new(v));
+                format!("?{idx}")
+            };
+            let id_idx = params.len() + 1;
+            params.push(Box::new(c.id));
+            let id_ph = format!("?{id_idx}");
+            match (sort_asc, c.sort_val) {
+                // 升序：值更大者更靠后
+                (true, Some(v)) => {
+                    let ph = push_val(&mut params, v);
+                    conds.push(format!(
+                        "({col} > {ph} OR ({col} = {ph} AND i.id > {id_ph}))"
+                    ));
+                }
+                // 升序 + 游标行排序列为 NULL：NULL 段之后是全部非 NULL 行
+                (true, None) => {
+                    conds.push(format!(
+                        "({col} IS NOT NULL OR ({col} IS NULL AND i.id > {id_ph}))"
+                    ));
+                }
+                // 降序：值更小者更靠后；NULL 段整体排在所有非 NULL 之后
+                (false, Some(v)) => {
+                    let ph = push_val(&mut params, v);
+                    conds.push(format!(
+                        "({col} < {ph} OR ({col} = {ph} AND i.id > {id_ph}) OR {col} IS NULL)"
+                    ));
+                }
+                // 降序 + 游标行排序列为 NULL：只剩 NULL 段内 id 更大的
+                (false, None) => {
+                    conds.push(format!("({col} IS NULL AND i.id > {id_ph})"));
+                }
+            }
         }
 
         sql.push_str(&format!(" WHERE {}", conds.join(" AND ")));
@@ -162,8 +199,12 @@ impl Db {
             items.push(row_to_item(row)?);
         }
 
-        let next = if items.len() as i64 == limit {
-            items.last().map(|i| i.id)
+        // 只有"取满了"才可能还有下一页；Random 序没有可续接的位置。
+        let next = if items.len() as i64 == limit && sort != SortKey::Random {
+            items.last().map(|it| ImageCursor {
+                sort_val: item_sort_value(it, sort),
+                id: it.id,
+            })
         } else {
             None
         };
@@ -2323,6 +2364,21 @@ fn month_start_secs(now_epoch: i64) -> i64 {
     month_start_days * 86400
 }
 
+/// 取一行的排序值，用于构造 keyset 游标。
+///
+/// 必须与 `SortKey::sql_col()` 指向的列一一对应：游标里的值与 ORDER BY 的列
+/// 若不是同一个东西，续接条件就会错位。
+fn item_sort_value(it: &ImageListItem, sort: SortKey) -> Option<f64> {
+    match sort {
+        SortKey::Imported => Some(it.imported_at as f64),
+        SortKey::Date => it.exif_datetime.map(|v| v as f64),
+        SortKey::Aesthetic => it.aesthetic_score,
+        SortKey::Clarity => Some(it.clarity_score),
+        SortKey::Size => Some(it.size_bytes as f64),
+        SortKey::Random => None,
+    }
+}
+
 fn row_to_item(r: &Row) -> rusqlite::Result<ImageListItem> {
     Ok(ImageListItem {
         id: r.get(0)?,
@@ -2825,5 +2881,87 @@ mod tests {
         assert!(bh.iter().any(|t| t.name == "black_hair"), "black_hair 应可经中文联想");
         let onegirl = db.suggest_tags("已有别", 10).unwrap();
         assert!(onegirl.iter().any(|t| t.name == "1girl"), "1girl 应保留已有别名");
+    }
+
+    /// 回归：keyset 游标分页必须「顺序翻到底 == 一次取全」，不重不漏。
+    ///
+    /// 曾用 `i.id > 游标` 当翻页条件，而 ORDER BY 的主键是 imported_at /
+    /// aesthetic_score 等排序字段，id 的先后与它们无关 —— 第 2 页起就会跳过
+    /// 大量本该出现的图，降序时甚至一页都翻不出来。
+    #[test]
+    fn keyset_cursor_pagination_has_no_gaps_or_dups() {
+        let db = test_db();
+        // 12 张图：imported_at 与 id 顺序刻意错开；美学分含并列值与 NULL
+        let mut imgs = Vec::new();
+        for i in 0..12i64 {
+            imgs.push(Image {
+                id: 0,
+                md5: format!("md5_{i}"),
+                phash: 0,
+                rel_path: format!("p{i}.png"),
+                width: 10,
+                height: 10,
+                format: "png".into(),
+                size_bytes: 100 + i,
+                file_mtime: 0,
+                exif_datetime: None,
+                clarity_score: 1.0,
+                aesthetic_score: if i % 4 == 0 { None } else { Some((i / 2) as f64) },
+                dedup_group: None,
+                is_redundant: false,
+                status: STATUS_ACTIVE.into(),
+                source: SOURCE_LOCAL.into(),
+                source_url: None,
+                no_auto_sauce: false,
+                ai_metadata: None,
+                source_dir: None,
+                thumb_rel: format!("p{i}.png"),
+                imported_at: (i * 7) % 12,
+            });
+        }
+        db.insert_images(&imgs).unwrap();
+
+        // 覆盖四类：默认降序、升序、可空列降序、可空列升序、另一种数值列
+        for (sort, asc) in [
+            (SortKey::Imported, false),
+            (SortKey::Imported, true),
+            (SortKey::Aesthetic, false),
+            (SortKey::Aesthetic, true),
+            (SortKey::Size, false),
+        ] {
+            let (all, _) = db
+                .list_images_filtered("active", &ImageFilter::default(), sort, asc, 500, None)
+                .unwrap();
+            assert_eq!(all.len(), 12, "整表应有 12 张");
+
+            let mut seen: Vec<i64> = Vec::new();
+            let mut cursor = None;
+            loop {
+                let (page, next) = db
+                    .list_images_filtered("active", &ImageFilter::default(), sort, asc, 5, cursor)
+                    .unwrap();
+                assert!(page.len() <= 5, "单页不得超过 limit");
+                if page.is_empty() {
+                    break;
+                }
+                seen.extend(page.iter().map(|i| i.id));
+                match next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            let expect: Vec<i64> = all.iter().map(|i| i.id).collect();
+            assert_eq!(
+                seen, expect,
+                "排序 {sort:?} asc={asc}：分页拼接结果必须与整表顺序完全一致"
+            );
+        }
+
+        // Random 序无法续接，必须明确返回 None 而不是给一个会漏图的游标
+        let (page, next) = db
+            .list_images_filtered("active", &ImageFilter::default(), SortKey::Random, false, 5, None)
+            .unwrap();
+        assert_eq!(page.len(), 5);
+        assert!(next.is_none(), "随机排序不应返回游标");
     }
 }

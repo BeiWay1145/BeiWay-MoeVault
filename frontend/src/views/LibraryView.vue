@@ -94,21 +94,35 @@ async function playAppearAnimation() {
   }, 1000)
 }
 
-/** 按当前分页状态拉取（分页开启→cursor 翻页；关闭→一次拉取）。 */
-async function fetchPage() {
-  if (paginationOn.value) {
-    const cursor = page.value === 1 ? null : pageCursors.value[page.value]
-    await library.fetchImages(pageSize.value, { cursor })
-    // 记录本页结束游标，供下一页使用
-    if (library.nextCursor) pageCursors.value[page.value] = library.nextCursor
-  } else {
+/**
+ * 按目标页拉取（分页开启→keyset 游标翻页；关闭→一次拉取）。
+ *
+ * 游标是「链式」的：第 N 页的游标只能由第 N-1 页的结果得到，无法凭空算出。
+ * 所以跳页时必须先把中间页顺序走一遍，把每页结束游标记进 pageCursors。
+ * pageCursors[n] = 拉第 n 页所需的游标，第 1 页为 undefined（即 null）。
+ */
+async function fetchPage(target = page.value) {
+  if (!paginationOn.value) {
     await library.fetchImages()
+    return
   }
+  for (let n = 1; n < target; n++) {
+    if (pageCursors.value[n + 1]) continue // 第 n+1 页游标已知，跳过铺垫
+    await library.fetchImages(pageSize.value, { cursor: pageCursors.value[n] ?? null })
+    if (!library.nextCursor) {
+      // 数据在中途就到底了，目标页不存在 → 停在实际最后一页
+      page.value = n
+      return
+    }
+    pageCursors.value[n + 1] = library.nextCursor
+  }
+  await library.fetchImages(pageSize.value, { cursor: pageCursors.value[target] ?? null })
+  if (library.nextCursor) pageCursors.value[target + 1] = library.nextCursor
 }
 
 async function onPageChange(p: number) {
   page.value = p
-  await fetchPage()
+  await fetchPage(p)
   const scroller = findScrollContainer()
   if (scroller) scroller.scrollTop = 0
 }
@@ -525,7 +539,9 @@ async function onRecycle(img: ImageItem) {
     await post(`/images/${img.id}/recycle`, { reason: 'manual' })
     ElMessage.success('已移入回收站')
     reportLog(`回收图片 #${img.id} 到回收站`)
-    await library.fetchImages()
+    // 走 fetchPage 而不是裸 fetchImages：分页开启时要保持每页条数与游标链，
+    // 裸拉会退化成一次性 200 张、且 nextCursor 与当前页错位。
+    await fetchPage()
   } catch (e) {
     ElMessage.error((e as Error).message)
   }
@@ -620,16 +636,47 @@ function onExportDone(info: { count: number; recycled: number }) {
 
 
 
+/**
+ * 回到第 1 页并丢弃所有已记录的游标。
+ * 排序或筛选一变，旧的游标就全部失效（它们绑的是上一套排序值/结果集），
+ * 若不重置，第 2 页会带着新条件下的旧游标去查，直接跳过一大段数据。
+ */
+function resetPaging() {
+  page.value = 1
+  pageCursors.value = {}
+}
+
 /** 排序变化时重新拉取（后端排序）。 */
 async function onSortChange() {
-  await library.fetchImages().catch((e: Error) => ElMessage.error(e.message))
+  resetPaging()
+  await fetchPage().catch((e: Error) => ElMessage.error(e.message))
+}
+
+/** 升降序切换：必须先翻转再拉取，否则拿到的是上一次的方向。 */
+async function onToggleSortAsc() {
+  library.sortAsc = !library.sortAsc
+  await onSortChange()
+}
+
+/**
+ * 改筛选条件并刷新。
+ *
+ * 必须重置分页：筛选条件变了，结果集也就换了，旧的 keyset 游标指向的
+ * 那一行可能已经不在结果里，照旧游标续接会莫名跳过或重复数据。
+ */
+async function applyFilterAndReset(patch: Record<string, unknown>) {
+  resetPaging()
+  // 直接改 filter 再走 fetchPage，才能保住分页开关下的每页条数与游标链；
+  // store 的 applyFilter 内部固定拉一次不带游标的列表，会绕过分页。
+  library.filter = { ...library.filter, ...patch } as typeof library.filter
+  await fetchPage()
 }
 
 /** 切换"AI 生成显示"筛选：勾选=只显示 AI 图，不勾=排除 AI 图只显示正常图。 */
 async function onToggleAiFilter(val: boolean | string | number) {
-  await library
-    .applyFilter({ isAi: val === true || val === 'true' ? true : false })
-    .catch((e: Error) => ElMessage.error(e.message))
+  await applyFilterAndReset({
+    isAi: val === true || val === 'true' ? true : false,
+  }).catch((e: Error) => ElMessage.error(e.message))
   reportLog(val === true || val === 'true' ? '切换筛选：仅显示 AI 生成图' : '切换筛选：排除 AI 生成图')
 }
 
@@ -641,13 +688,11 @@ const aestheticIncludeUnscored = ref(false)
 /** 滑块松手后自动查询（拖动中仅实时显示数值）。 */
 function onAestheticChange() {
   if (aestheticActive.value) {
-    library
-      .applyFilter({
-        aestheticMin: aestheticRange.value[0],
-        aestheticMax: aestheticRange.value[1],
-        aestheticIncludeUnscored: aestheticIncludeUnscored.value,
-      })
-      .catch((e: Error) => ElMessage.error(e.message))
+    applyFilterAndReset({
+      aestheticMin: aestheticRange.value[0],
+      aestheticMax: aestheticRange.value[1],
+      aestheticIncludeUnscored: aestheticIncludeUnscored.value,
+    }).catch((e: Error) => ElMessage.error(e.message))
   }
 }
 
@@ -657,9 +702,11 @@ function onToggleAesthetic(val: boolean | string | number) {
   if (aestheticActive.value) {
     onAestheticChange()
   } else {
-    library
-      .applyFilter({ aestheticMin: undefined, aestheticMax: undefined, aestheticIncludeUnscored: undefined })
-      .catch((e: Error) => ElMessage.error(e.message))
+    applyFilterAndReset({
+      aestheticMin: undefined,
+      aestheticMax: undefined,
+      aestheticIncludeUnscored: undefined,
+    }).catch((e: Error) => ElMessage.error(e.message))
   }
 }
 
@@ -689,7 +736,7 @@ async function onSearchChange() {
     else if (v.startsWith('s:source_')) source = v.slice('s:source_'.length)
   }
   try {
-    await library.applyFilter({
+    await applyFilterAndReset({
       tags: tags.length > 0 ? tags : undefined,
       isAi,
       sauceStatus,
@@ -733,7 +780,7 @@ watch(
       <el-select v-model="library.sortKey" style="width: 140px" @change="onSortChange">
         <el-option v-for="s in sortOptions" :key="s.key" :value="s.key" :label="s.label" />
       </el-select>
-      <el-button @click="onSortChange(); library.sortAsc = !library.sortAsc">
+      <el-button @click="onToggleSortAsc">
         {{ library.sortAsc ? '升序 ↑' : '降序 ↓' }}
       </el-button>
 
@@ -766,7 +813,7 @@ watch(
         v-if="SHOW_LIBRARY_FILTERS"
         :model-value="library.filter.sauceStatus ?? ''"
         style="width: 130px"
-        @change="(v: string) => library.applyFilter({ sauceStatus: v || undefined })"
+        @change="(v: string) => applyFilterAndReset({ sauceStatus: v || undefined })"
       >
         <el-option label="溯源：全部" value="" />
         <el-option label="已溯源" value="sauced" />
@@ -801,7 +848,7 @@ watch(
     </div>
 
     <!-- E6: 分页模式（通用设置开启时显示） -->
-    <div v-if="paginationOn" class="pager">
+    <div v-if="paginationOn && library.sortKey !== 'random'" class="pager">
       <el-pagination
         layout="total, prev, pager, next, sizes"
         :total="library.total"
@@ -811,6 +858,10 @@ watch(
         @current-change="onPageChange"
         @size-change="onLibraryPageSizeChange"
       />
+    </div>
+    <!-- 随机排序没有"续接位置"，翻页无从谈起，明确告知而不是给个坏掉的翻页器 -->
+    <div v-else-if="paginationOn && library.sortKey === 'random'" class="pager pager-tip">
+      随机排序下不提供翻页（每次查询顺序都不同）
     </div>
 
     <!-- 大图预览 -->
@@ -876,5 +927,9 @@ watch(
   display: flex;
   justify-content: center;
   margin-top: 12px;
+}
+.pager-tip {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 </style>
