@@ -88,6 +88,42 @@
   §2.4 的 `thumbUrl` 也只剩 2 份而非 4 份。剩余项中只有「内部错误原文回传前端」
   有实际的用户可见影响，其余属可选优化。
 
+### 性能 / 打标流程
+
+- **打标链路三项优化落地**（来自 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md` 的 P0/P1）。
+  **结论先说：打标任务的 90% 以上时间原先花在「等 SauceNAO 网络往返」，不是本地推理**；
+  这三项改动后「标签可见」从 8–16 秒降到**亚秒级**，本地推理吞吐从 6.5 张/秒提到 **9.6 张/秒**。
+
+  - **P0-2 Python 侧只锁 GPU 段**（`python/server/models/tagger_model.py`、`python/server/main.py`）。
+    原先 `/infer/tags` 用一把全局 `_infer_lock` 把「解码 + 预处理 + 推理」整段包住，
+    多请求只能排队。把 `infer()` 拆成 `prepare()`（解码 + 预处理，**不碰显存**）
+    与 `run_prepared()`（只 `session.run` 时持锁），端点改为
+    「锁内 load → 锁外 prepare → 锁内 run」。
+    实测 12 张真实图：串行 154.7 ms/张（6.46 张/秒）→ **2 路并发 9.86 张/秒**；
+    4 路无增益（9.2 张/秒），故并发上限取 2 附近。
+    `run_prepared` 会在持锁后校验 kind 是否被切换，避免 prepare 与 run 之间换模型导致形状不匹配。
+    **美学两个端点保持整段持锁**——torch 链路解码也参与构图，且调用频率低。
+  - **P0-1 后端打标管线并发化**（`backend/crates/tagger/src/pipeline.rs`）。
+    `run_tag_pipeline` 原是按序 `for` 逐张处理，照 `run_sauce_pipeline` 的 worker 池重写：
+    共享 `VecDeque` 队列 + `Arc<Mutex<TagProgress>>`，
+    **`worker_count = (key_count * exit_count).clamp(2, 8)`**——下限 2 是为了「只有 1 个 API key 时
+    本地推理也能双路并行」，上限 8 防解码大图时内存爆。worker 内的
+    `pool.acquire()` 用 1 秒 timeout 包住，以便中断检查能及时生效。
+  - **P1 打标与溯源解耦**（本轮用户可见收益最大的一项）。
+    原流程「先溯源、未命中才本地打标」意味着每张图都要等一次 8–16 秒的网络往返才看到任何标签。
+    改为 **先本地打标落库（`auto_local`，亚秒可见）→ 再溯源 → 命中则用 booru 标签替换**。
+    替换靠新方法 `Db::delete_image_tags_by_source(image_id, "auto_local")`，
+    避免两套自动标签并存把筛选结果污染成「既有本地词又有 booru 词」。
+    溯源失败或限流**不再把整张图算作失败**，只记一条 warn 并保留已写入的本地标签。
+    `tag_one` 因此改为返回 `TagOutcome { local_written, sauce_source, cancelled }`。
+
+  **实测佐证**：
+  - 图 2162 先清空自动标签与缓存再强制打标：T+0.50s 出现 50 条 `auto_local`，
+    T+3.03s 变为 38 条 `auto_danbooru`，`source` 同步为 `danbooru`，`auto_local` 完全消失。
+  - 16 张混合批次：T+8.42s 完成 15 张（全部走本地），最后一张等 SauceNAO 到 T+37.96s。
+    日志逐条区分「打标成功（本地 → 溯源 danbooru）」与「（本地，溯源未命中）」。
+  - 纯本地批次：18 张 / 1.88 s = **9.58 张/秒**。
+
 ### 文档
 
 - **`docs/RUST_INFERENCE_FEASIBILITY.md` 打标结论二次翻转**（625 行）。

@@ -1067,6 +1067,19 @@ impl Db {
         Ok(out)
     }
 
+    /// 删除某张图指定来源的全部标签，返回删除行数。
+    ///
+    /// 用途：打标改为「先本地、再溯源」后，溯源命中时要用 booru 标签
+    /// **替换**先行写入的本地标签（source = auto_local），而不是两者并存。
+    pub fn delete_image_tags_by_source(&self, image_id: i64, source: &str) -> Result<usize, DbError> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM image_tags WHERE image_id = ?1 AND source = ?2",
+            params![image_id, source],
+        )?;
+        Ok(n)
+    }
+
     /// 更新图片来源与溯源 URL。
     pub fn set_image_source(&self, image_id: i64, source: &str, source_url: Option<&str>) -> Result<(), DbError> {
         let conn = self.conn.lock();

@@ -293,27 +293,62 @@ class TaggerModel:
         arr = arr.transpose(2, 0, 1)[None]
         return {"input": arr}
 
-    def infer(self, image_path, threshold=None, kind=None) -> dict:
-        """返回 {tag: confidence}，按置信度降序。kind 与当前加载一致（默认 None 用当前）。"""
+    def _resolve_threshold(self, threshold):
+        """按当前模型种类决定默认阈值（调用方显式传入时不覆盖）。"""
+        if threshold is not None:
+            return threshold
+        if self._kind == config.MODEL_KIND_WD14:
+            # wd14 默认阈值更低（0.35）
+            return config.TAGGER_WD14_THRESHOLD
+        return config.TAGGER_DEFAULT_THRESHOLD
+
+    def prepare(self, image_path, threshold=None) -> dict:
+        """解码 + 预处理，**不触碰 GPU**。
+
+        拆出这一步是为了把耗时大头（Image.open 解码约 35~65 ms、预处理约 14 ms）
+        从推理锁里移出去：锁只包真正的 session.run，多个请求就能并行解码、
+        串行推理，而不必整条链路排队。
+
+        返回 {"inputs": {输入名: ndarray}, "threshold": float}；
+        调用方拿它去 run_prepared()，或直接交给自己的锁。
+        """
         self.load()
         image = Image.open(image_path).convert("RGB")
-
+        threshold = self._resolve_threshold(threshold)
         if self._kind == config.MODEL_KIND_WD14:
-            # wd14 默认阈值更低（0.35）；调用方显式传 threshold 时不覆盖
-            if threshold is None:
-                threshold = config.TAGGER_WD14_THRESHOLD
             inputs = self._preprocess_wd14(image)
         else:
-            if threshold is None:
-                threshold = config.TAGGER_DEFAULT_THRESHOLD
             inputs = self._preprocess_cl_tagger(image)
+        return {"inputs": inputs, "threshold": threshold, "kind": self._kind}
 
-        outputs = self._session.run(["logits"], inputs)
+    def run_prepared(self, prepared: dict) -> dict:
+        """只做 session.run + sigmoid + 阈值过滤 + 降序（GPU 段）。
+
+        **调用方必须保证同一时刻只有一个线程进入这里**（共用同一 session 实例）。
+        这里再取一次模型锁：防止 prepare 与 run 之间有人切了模型/设备，
+        导致拿旧输入喂新 session（形状不对会直接崩）。
+        """
+        with self._lock:
+            if prepared.get("kind") != self._kind:
+                raise RuntimeError("模型在解码与推理之间被切换，本次打标作废，请重试")
+            session = self._session
+            if session is None:
+                raise RuntimeError("模型尚未加载")
+            outputs = session.run(["logits"], prepared["inputs"])
         logits = outputs[0][0]
         probs = 1.0 / (1.0 + np.exp(-logits))
+        threshold = prepared["threshold"]
         result = {}
         for idx, prob in enumerate(probs):
             if prob >= threshold:
                 tag = self._idx_to_tag.get(int(idx), f"class_{idx}")
                 result[tag] = float(prob)
         return dict(sorted(result.items(), key=lambda kv: kv[1], reverse=True))
+
+    def infer(self, image_path, threshold=None, kind=None) -> dict:
+        """单次完整打标（解码+预处理+推理）。返回 {tag: confidence}，按置信度降序。
+
+        进程内串行调用（不经 HTTP）时用这个；HTTP 端点应改用
+        prepare() + 进程级 GPU 锁 + run_prepared()，避免把解码也锁在里面。
+        """
+        return self.run_prepared(self.prepare(image_path, threshold))

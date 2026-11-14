@@ -219,7 +219,78 @@ pub(crate) fn filter_eligible(
     Ok(out)
 }
 
-/// 执行打标流水线。
+/// 单张图的打标结果。
+struct TagOutcome {
+    /// 本次是否真的写入了新的本地标签
+    local_written: bool,
+    /// 溯源命中的来源（danbooru / gelbooru）；None = 未命中或未尝试
+    sauce_source: Option<String>,
+    /// 处理途中任务被取消（不计入完成/失败，worker 应直接退出）
+    cancelled: bool,
+}
+
+impl TagOutcome {
+    fn done(local_written: bool, sauce_source: Option<String>) -> Self {
+        Self {
+            local_written,
+            sauce_source,
+            cancelled: false,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            local_written: false,
+            sauce_source: None,
+            cancelled: true,
+        }
+    }
+}
+
+/// 任务是否已被取消（每处理一张前查一次 DB）。
+fn job_cancelled(db: &Db, job_id: Option<i64>) -> bool {
+    matches!(
+        job_id,
+        Some(jid) if db
+            .get_job(jid)
+            .ok()
+            .flatten()
+            .map(|j| j.status == "cancelled")
+            .unwrap_or(false)
+    )
+}
+
+/// 等待可用 API key，同时每秒检查一次任务是否被取消。
+///
+/// `pool.acquire()` 可能阻塞很久（等全局窗口 / 冷却结束），期间不查中断会让
+/// 「中断」按钮看起来无效（任务长时间仍是 running）。返回 `Ok(None)` 表示已被取消。
+async fn acquire_key_or_cancelled(
+    db: &Db,
+    pool: &ApiKeyPool,
+    job_id: Option<i64>,
+) -> Result<Option<(String, usize)>, TaggerError> {
+    loop {
+        if job_cancelled(db, job_id) {
+            return Ok(None);
+        }
+        match tokio::time::timeout(Duration::from_secs(1), pool.acquire()).await {
+            Ok(v) => return Ok(Some(v)),
+            Err(_) => continue, // 1 秒超时 → 重新检查中断后继续等
+        }
+    }
+}
+
+/// 执行打标流水线（并发 worker 池）。
+///
+/// **处理顺序（P1 起：本地优先、溯源补充）**：
+/// 1. AI 生成图 → 提取 prompt 标签（source=ai），无则本地打标；不溯源
+/// 2. 其余图 → **先本地打标**（标签亚秒级入库，界面立刻可见）
+/// 3. 允许溯源的图 → 再走 SauceNAO；命中则用 booru 标签**替换**本地标签
+///    （`auto_local` → `auto_danbooru` / `auto_gelbooru`）
+///
+/// 这样做的原因：单次 SauceNAO 往返实测 8~16 秒，而本地推理实测 0.13~0.2 秒。
+/// 旧实现「先溯源、未命中才本地打标」会让每张图的白等时间全部压在最前面，
+/// 用户点完打标后十几秒看不到任何标签。
 ///
 /// - `db`：SQLite
 /// - `sauce`：SauceNAO 客户端（无状态）
@@ -265,39 +336,150 @@ pub async fn run_tag_pipeline(
             db.set_no_auto_sauce(*id, false)?;
         }
     }
-    let mut progress = TagProgress {
+
+    // 共享工作队列 + 进度（并发 worker 共同消费）
+    let queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i64>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(ids.iter().copied().collect()));
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(TagProgress {
         total: ids.len(),
         ..Default::default()
-    };
+    }));
 
-    for image_id in &ids {
-        let result = tag_one(db, sauce, pool, exits, infer, library_dir, min_sim, tag_threshold, *image_id).await;
-        match result {
-            Ok(()) => {
-                progress.done += 1;
-                let _ = db.add_log("info", "tag", &format!("图片 #{image_id} 打标成功"));
+    // worker 数：本地推理的实测拐点在 2 路并发（2 路 11.5 张/秒，4 路无增益），
+    // 但同时要等 SauceNAO 网络往返（单张 8~16 秒），所以按「key × 出口」取值。
+    // 下限 2 保证即使只有 1 个 key，本地推理也能双路并行；
+    // 上限 8 避免太多 worker 同时解码图片把内存顶上去（每张解码后约 4~12 MB）。
+    let key_count = pool.len().await.max(1);
+    let exit_count = match exits {
+        Some(e) if e.enabled() => e.count().await.max(1),
+        _ => 1,
+    };
+    let worker_count = (key_count * exit_count).clamp(2, 8);
+    info!(key_count, exit_count, worker_count, "打标并发度");
+
+    let sauce = std::sync::Arc::new(sauce.clone());
+    let infer = std::sync::Arc::new(infer.clone());
+    let exits_shared: Option<crate::ExitPool> = exits.cloned();
+
+    let mut handles = Vec::new();
+    for _ in 0..worker_count {
+        let queue = queue.clone();
+        let progress = progress.clone();
+        let db = db.clone();
+        let sauce = sauce.clone();
+        let pool = pool.clone();
+        let exits = exits_shared.clone();
+        let infer = infer.clone();
+        let library_dir = library_dir.to_path_buf();
+        handles.push(tokio::spawn(async move {
+            loop {
+                // 中断检查：任务被取消则停止（每处理一张前查一次 DB）
+                if job_cancelled(&db, job_id) {
+                    break;
+                }
+                let next = {
+                    let mut q = queue.lock().unwrap();
+                    q.pop_front()
+                };
+                let image_id = match next {
+                    Some(id) => id,
+                    None => break,
+                };
+                let outcome = tag_one(
+                    &db,
+                    &sauce,
+                    &pool,
+                    exits.as_ref(),
+                    &infer,
+                    &library_dir,
+                    min_sim,
+                    tag_threshold,
+                    image_id,
+                    job_id,
+                )
+                .await;
+                // 被取消：不计完成也不计失败，直接退出本 worker
+                if matches!(&outcome, Ok(o) if o.cancelled) {
+                    break;
+                }
+                match &outcome {
+                    Ok(o) => {
+                        let msg = match (&o.sauce_source, o.local_written) {
+                            (Some(src), true) => {
+                                format!("图片 #{image_id} 打标成功（本地 → 溯源 {src}）")
+                            }
+                            (Some(src), false) => format!("图片 #{image_id} 打标成功（溯源 {src}）"),
+                            (None, true) => format!("图片 #{image_id} 打标成功（本地，溯源未命中）"),
+                            (None, false) => {
+                                format!("图片 #{image_id} 无新增标签（已有标签或无标签超阈值）")
+                            }
+                        };
+                        let _ = db.add_log("info", "tag", &msg);
+                        let mut p = progress.lock().unwrap();
+                        p.done += 1;
+                        let (d, f) = (p.done, p.failed);
+                        drop(p);
+                        if let Some(jid) = job_id {
+                            let _ = db.update_job(jid, "running", d as i64, f as i64, None);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(image_id, error = %e, "打标失败");
+                        let rel = db
+                            .get_image_by_id(image_id)
+                            .ok()
+                            .flatten()
+                            .map(|i| i.rel_path)
+                            .unwrap_or_default();
+                        let _ = db.add_log(
+                            "error",
+                            "tag",
+                            &format!("图片 #{image_id}（{rel}）打标失败：{e}"),
+                        );
+                        let mut p = progress.lock().unwrap();
+                        p.failed += 1;
+                        let (d, f) = (p.done, p.failed);
+                        drop(p);
+                        if let Some(jid) = job_id {
+                            let _ = db.update_job(jid, "running", d as i64, f as i64, None);
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                warn!(image_id, error = %e, "打标失败");
-                progress.failed += 1;
-                let rel = db
-                    .get_image_by_id(*image_id)
-                    .ok()
-                    .flatten()
-                    .map(|i| i.rel_path)
-                    .unwrap_or_default();
-                let _ = db.add_log("error", "tag", &format!("图片 #{image_id}（{rel}）打标失败：{e}"));
+            Ok::<(), TaggerError>(())
+        }));
+    }
+
+    let mut first_err: Option<TaggerError> = None;
+    for h in handles {
+        if let Err(e) = h.await {
+            let msg = if e.is_panic() {
+                "打标 worker panic".to_string()
+            } else {
+                format!("打标 worker 失败: {e}")
+            };
+            if first_err.is_none() {
+                first_err = Some(TaggerError::Invalid(msg));
             }
-        }
-        // 实时写回 job 进度（任务中心进度条可见推进）
-        if let Some(jid) = job_id {
-            let _ = db.update_job(jid, "running", progress.done as i64, progress.failed as i64, None);
         }
     }
-    info!(done = progress.done, failed = progress.failed, "打标流水线完成");
-    Ok(progress)
+    // 中断：剩余未处理数 = 队列剩余
+    let remaining = queue.lock().unwrap().len();
+    let progress = progress.lock().unwrap();
+    info!(
+        done = progress.done,
+        failed = progress.failed,
+        remaining,
+        worker_count,
+        "打标流水线完成"
+    );
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(*progress)
 }
 
+/// 单张图打标：AI 图 → 本地打标 → （可选）溯源替换。
 #[allow(clippy::too_many_arguments)]
 async fn tag_one(
     db: &Db,
@@ -309,22 +491,24 @@ async fn tag_one(
     min_sim: f64,
     tag_threshold: f64,
     image_id: i64,
-) -> Result<(), TaggerError> {
+    job_id: Option<i64>,
+) -> Result<TagOutcome, TaggerError> {
     let img = db
         .get_image_by_id(image_id)?
         .ok_or_else(|| TaggerError::Invalid(format!("图片 {image_id} 不存在")))?;
     let file_path = library_dir.join(&img.rel_path);
 
-    // AI 生成图：参与打标——已有非 AI 来源的内容标签才跳过；
-    // 否则提取 prompt 标签（source=ai）或本地模型打标，AI 标记不再导致打标被跳过。
+    // —— 阶段 A：AI 生成图 ——
+    // 已有非 AI 来源的内容标签才跳过；否则提取 prompt 标签（source=ai）或本地模型打标。
+    // AI 图没有来源可查，不参与溯源。
     let tags_now = db.image_tags(image_id)?;
     let has_content_tag = tags_now.iter().any(|t| t.source != "ai");
     if img.ai_metadata.is_some() || tags_now.iter().any(|t| t.source == "ai") {
         if has_content_tag {
             info!(image_id, "AI 图已用 prompt 内容标签，无需打标");
-            return Ok(());
+            return Ok(TagOutcome::done(false, None));
         }
-        // 无内容标签：先尝试提取 prompt 标签（仅当尚无 source=ai 标签时，避免重复）
+        // 仅当尚无 source=ai 标签时提取 prompt，避免重复
         if !tags_now.iter().any(|t| t.source == "ai") {
             if let Some(meta) = moevault_ingest::features::read_ai_metadata(&file_path) {
                 if !meta.tags.is_empty() {
@@ -335,68 +519,124 @@ async fn tag_one(
                         .collect::<Result<_, _>>()?;
                     db.insert_image_tags(image_id, &tag_ids, "ai")?;
                     info!(image_id, tag_count = meta.tags.len(), "AI 图提取 prompt 标签");
-                    return Ok(());
+                    return Ok(TagOutcome::done(false, None));
                 }
             }
         }
-        // 无 prompt 内容标签（或仅有 source=ai 标记）：本地模型打标，真正执行
-        info!(image_id, "AI 图本地模型打标");
-        return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+        let written =
+            apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await?;
+        return Ok(TagOutcome::done(written > 0, None));
     }
 
-    // 不可溯源标记：跳过「溯源」环节，但**继续本地模型打标**。
-    // BUG1 修复：此前直接返回 Err，导致溯源没命中的图连本地打标也做不了
-    // （表现为整批 53 张图提交打标任务后被全部跳过）。
-    if img.no_auto_sauce {
-        info!(image_id, "图片已标记不可溯源，跳过溯源，改用本地模型打标");
-        return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+    // —— 阶段 B：已有自动标签 + 溯源缓存命中 → 无需任何动作 ——
+    let has_auto = db.image_has_auto_tags(image_id)?;
+    if has_auto && db.get_sauce_cache(&img.md5)?.is_some() {
+        info!(image_id, "已有自动标签且溯源缓存命中，跳过");
+        return Ok(TagOutcome::done(false, None));
     }
 
-    // 1. 溯源缓存命中（仅用于避免重复溯源；标签结果以实际入库为准）
-    if db.get_sauce_cache(&img.md5)?.is_some() {
-        // 缓存存在说明之前已溯源过（无论成败）——这里仍允许重新尝试爬取，
-        // 但为简化：缓存命中且图片已有自动标签则跳过；否则继续溯源流程。
-        if db.image_has_auto_tags(image_id)? {
-            return Ok(());
+    // —— 阶段 C：本地打标（P1 解耦核心）——
+    // 先把本地标签写进库：界面在亚秒级就能看到标签，不必等 SauceNAO 的 8~16 秒往返。
+    // 本地打标失败不算致命——溯源仍可能命中并给出标签。
+    let mut local_written = false;
+    let mut local_err: Option<TaggerError> = None;
+    if !has_auto {
+        match apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await {
+            Ok(n) => local_written = n > 0,
+            Err(e) => {
+                warn!(image_id, error = %e, "本地打标失败，继续尝试溯源");
+                local_err = Some(e);
+            }
         }
     }
 
-    // 2. 溯源（SauceNAO + booru 爬标签）；None = 未命中/失败（回退本地打标）
-    //    限流时等待后重试同一张图（全局窗口+冷却由 pool 接管），避免误判为失败
+    // —— 阶段 D：标记为不可溯源的图，本地标签就是最终结果 ——
+    if img.no_auto_sauce {
+        if let Some(e) = local_err {
+            return Err(e);
+        }
+        info!(image_id, "图片已标记不可溯源，仅本地打标");
+        return Ok(TagOutcome::done(local_written, None));
+    }
+
+    // —— 阶段 E：溯源；命中则用 booru 标签替换本地标签 ——
     let mut hit: Option<SauceHit> = None;
     for attempt in 0..=MAX_RATE_RETRIES {
-        let (api_key, key_idx) = pool.acquire().await;
-        match sauce_one(db, sauce, pool, exits, infer, library_dir, min_sim, image_id, api_key, key_idx).await {
+        if job_cancelled(db, job_id) {
+            return Ok(TagOutcome::cancelled());
+        }
+        let (api_key, key_idx) = match acquire_key_or_cancelled(db, pool, job_id).await? {
+            Some(v) => v,
+            None => return Ok(TagOutcome::cancelled()),
+        };
+        match sauce_one(
+            db, sauce, pool, exits, infer, library_dir, min_sim, image_id, api_key, key_idx,
+        )
+        .await
+        {
             Ok(h) => {
                 hit = h;
                 break;
             }
             Err(TaggerError::RateLimited(secs)) => {
                 if attempt == MAX_RATE_RETRIES {
-                    warn!(image_id, "打标溯源：限流重试次数耗尽，回退本地打标");
+                    warn!(image_id, "打标溯源：限流重试次数耗尽，保留本地标签");
+                    let _ = db.add_log(
+                        "warn",
+                        "tag",
+                        &format!(
+                            "图片 #{image_id} 溯源限流重试 {MAX_RATE_RETRIES} 次仍未成功，已保留本地标签"
+                        ),
+                    );
                     break;
                 }
                 let wait = secs.clamp(1, 120) as u64;
                 warn!(image_id, retry_secs = wait, attempt = attempt + 1, "打标溯源限流，等待后重试");
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // P1：溯源失败不再让整张图算失败——本地标签已经入库，
+                // 这里只留一条警告，用户的标签不会因为网络问题而丢失。
+                warn!(image_id, error = %e, "溯源失败，保留本地标签");
+                let _ = db.add_log(
+                    "warn",
+                    "tag",
+                    &format!("图片 #{image_id} 溯源失败（已保留本地标签）：{e}"),
+                );
+                break;
+            }
         }
     }
+
     let hit = match hit {
         Some(h) => h,
         None => {
-            return apply_local_tags(db, infer, file_path.as_path(), tag_threshold, image_id).await;
+            // 溯源未命中：本地标签就是最终结果
+            if let Some(e) = local_err {
+                return Err(e);
+            }
+            return Ok(TagOutcome::done(local_written, None));
         }
     };
 
-    // 存标签
+    // 用 booru 标签替换先行写入的本地标签：同一张图两套自动标签并存会互相污染
+    // 后续的筛选与权重（例如既算「画师 A」又算本地模型的近似名）。
+    if local_written {
+        match db.delete_image_tags_by_source(image_id, "auto_local") {
+            Ok(removed) if removed > 0 => {
+                info!(image_id, removed, "溯源命中，移除先行写入的本地标签");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(image_id, error = %e, "移除本地标签失败，将与溯源标签并存"),
+        }
+    }
     save_tags(db, image_id, &hit.source, Some(&hit.source_url), &hit.tags, hit.similarity)?;
     db.put_sauce_cache(&img.md5, hit.similarity, Some(&hit.source), Some(&hit.source_url), None)?;
     db.set_image_source(image_id, &hit.source, Some(&hit.source_url))?;
     info!(image_id, source = %hit.source, tag_count = hit.tags.len(), "溯源打标成功");
-    Ok(())
+    Ok(TagOutcome::done(local_written, Some(hit.source)))
 }
+
 
 /// 单图 SauceNAO 溯源 + booru 爬标签（key 由调用方传入——并发调度器已 acquire）。
 /// 返回 Some(命中) 或 None（未命中/失败，已写缓存与不可溯源标记；调用方决定回退策略）。
@@ -824,14 +1064,18 @@ fn save_tags(
     Ok(())
 }
 
-/// 本地推理打标（回退路径）。
+/// 本地推理打标。
+///
+/// 返回写入的标签数（0 在实现里不可达，因为无标签会走 NoSource 错误）：
+/// 调用方据此判断「是否已经给这张图落过本地标签」，从而决定溯源命中后
+/// 要不要把 auto_local 标签删掉。
 async fn apply_local_tags(
     db: &Db,
     infer: &InferClient,
     path: &Path,
     threshold: f64,
     image_id: i64,
-) -> Result<(), TaggerError> {
+) -> Result<usize, TaggerError> {
     let tags = match infer.infer_tags(path, threshold).await {
         Ok(t) => t,
         Err(e) => {
@@ -849,8 +1093,9 @@ async fn apply_local_tags(
     }
     db.insert_image_tags(image_id, &tag_ids, "auto_local")?;
     db.set_image_source(image_id, "local", None)?;
-    info!(image_id, tag_count = tags.len(), "本地打标成功");
-    Ok(())
+    let n = tags.len();
+    info!(image_id, tag_count = n, "本地打标成功");
+    Ok(n)
 }
 
 /// 把路径转为绝对路径（用于传给推理服务等跨进程消费方）。
