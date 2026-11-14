@@ -52,6 +52,69 @@
   （`PLAN` / `UI_DESIGN` / `TECH_DETAILS` / `ENHANCEMENTS` / `DESIGN_FILTER_NAVIGATION`）；
   `.gitignore` 里 GBK 误解码的中文注释修正为 UTF-8。
 
+- **架构审查 P1 六项一次修完**（`docs/ARCH_REVIEW_2026-11.md` §9.1 记录落地结果）：
+
+  - **筛选 SQL 三份 → 收敛为一份**（报告 §2.1）。`sauce` / `tag` / `ai` 三组条件此前在
+    `import_tree`、`import_dir_images`、`build_filter_conds` 里**各手写一遍**（逐字相同的
+    三分支 + 二分支），改一处必漏两处。现抽出唯一实现 `fn sauce_tag_ai_conds(...)`，
+    三个入口共用；三组谓词提为 `IS_SAUCED` / `IS_AI` / `HAS_AUTO_TAG` 常量。
+    新增回归测试 `sauce_tag_ai_filter_consistent_across_entrypoints`：
+    插入「有溯源 / 只有 AI 元数据 / 都没有 / 标了无需溯源」四张图，对 8 种筛选组合
+    交叉断言「图库计数 == 主目录树合计 == 来源组明细合计」，防止再次发散。
+  - **`std::sync::Mutex` → `parking_lot::Mutex`**（报告 §4.3）。`db` 层 90 处
+    `self.conn.lock().unwrap()` 的失效链条是：任一请求持锁 panic → Mutex 中毒 →
+    此后**每次** db 调用都 panic → 后端事实上死亡但进程还活着（表现为「界面能点，数据全空」）。
+    `parking_lot` 无中毒概念，`.unwrap()` 全部删除。
+    （顺带更正报告：实测是 90 处，不是报告写的 141 处。）
+  - **Tauri 壳层清零 unwrap/expect**（报告 §4.6）。7 处 `slot.lock().unwrap()`
+    在子线程 panic 时会让主进程**永久不可用**，现统一走 `child_slot()` 辅助函数
+    （中毒时 `into_inner()` 继续用）；4 处 `parse().unwrap()` 改为
+    `SocketAddr::from(([127,0,0,1], BACKEND_PORT))`；
+    `generate_context!()` 构建失败改为打印原因并 `exit(1)`，不再 panic 出栈。
+    现在 `src-tauri/src/` 下 `unwrap`/`expect` **0 命中**。
+  - **`ImageDetailView.vue` 1895 → 1326 行**（报告 §3.3）。抽出
+    `components/detail/TagEditPanel.vue`（标签编辑状态机，445 行）、
+    `components/detail/SauceCompareDialog.vue`（溯源对比，242 行）、
+    `constants/tagGroups.ts`（分组规则，被标签栏与编辑弹窗共用）、`utils/format.ts`。
+    保存后由子组件 `emit("saved")` 交父组件重拉详情，**保持单一数据源**。
+  - **`SettingsView.vue` 1587 → 154 行**（报告 §3.4）。6 个 tab 各拆为独立组件
+    （`views/settings/*.vue`），宿主只留 tab 状态、保存、脏检查与离开确认。
+    关键坑：原 `.hint` 是 `scoped` 样式，拆出去的子组件内部**收不到**这份样式
+    （模板里 37 处引用会全部失去样式），故提升为带 `.settings-page` 前缀的全局块。
+    日志面板改为受控 `active` prop 驱动定时器，避免拆出后后台继续轮询。
+
+- **P2 八项经复查只剩 5 项**（记录在 `docs/ARCH_REVIEW_2026-11.md` §9.2）。
+  报告里的 §1.6（出口池双源）与 §2.6（手写裸 TCP 客户端）**在 P0 阶段已被修掉**，
+  §2.4 的 `thumbUrl` 也只剩 2 份而非 4 份。剩余项中只有「内部错误原文回传前端」
+  有实际的用户可见影响，其余属可选优化。
+
+### 文档
+
+- **`docs/RUST_INFERENCE_FEASIBILITY.md` 打标结论二次翻转**（625 行）。
+  初稿判定「cl_tagger 预处理依赖 `transformers` 的 `AutoProcessor`，无法离线复现，不建议迁」。
+  用户提供模型实机位置（`E:\Game\AI\cl_tagger\models`）后做了实测，结论推翻：
+
+  - ONNX 签名只有 1 个输入 `pixel_values [N,3,384,384]`、1 个输出 `logits [N,108139]`，
+    `model_metadata.json` 的 `is_naflex: false` —— 报告担忧的 NaFlex 三输入**根本不存在**。
+  - `preprocessor_config.json` 是 slow 版 `SiglipImageProcessor`：`mean/std = 0.5`、
+    `resample = 2`（BILINEAR）、384×384。手写预处理（`resize` → `/255` → `(x-0.5)/0.5`）
+    与之逐图对拍：40 张图 **prob_maxdiff 0.0133**，2487 个标签中**阈值翻转仅 8 处**
+    （全部落在 0.5±0.005 的模型边界带内）。差异来源是 u8 量化级，不是实现错误。
+  - **resize 内核选错会静默改结果**：BILINEAR 翻转 2 处 / BICUBIC 41 处 / LANCZOS 55 处。
+    这条已写进风险表（R9），因为 Rust 侧很容易随手用 lanczos3。
+  - 迁移工作量从「400–700 行 / 高风险」下调为「**250–450 行 / 中风险**」，
+    排序改为「先迁美学，打标排后」——唯一真障碍只剩 `ort` 的 CUDA 部署门槛。
+
+  教训已写进文档：「把『仓库里没有』当成『系统里不存在』是错误推断」。
+
+### 工作区清理
+
+- **`scripts/` 瘦身**：`scripts/` 从 111 文件 / 7.7 MB 降到 **22 文件 / 516 KB**。
+  清掉的是 2026-08～09 期间的一次性调试脚本（`test_*` / `probe_*` / `diag_*` / `verify_*`）
+  与本轮已消费的截图。保留的是有复用价值的验证脚本（含新增的 `scripts/verify_round.py`，
+  安装后四项检查：后端 health / 推理 health / 真实打标 / 图库数据）。
+  `scripts/` 本来就在 `.gitignore` 内，清理只影响本地。
+
 ### 新增
 
 - **详情页返回时的"缩回缩略图"过渡**（视觉改进1）：退出详情页时，当前大图就地缩小并平移到

@@ -16,6 +16,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "f
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# parking_lot：互斥锁无「中毒」语义。std::sync::Mutex 在持锁线程 panic 后
+# 永久中毒，导致数据库层此后每个请求都 panic（进程还活着、界面全空）。
+parking_lot = "0.12"
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 walkdir = "2"
 md-5 = "0.10"

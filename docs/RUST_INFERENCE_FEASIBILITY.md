@@ -9,33 +9,66 @@
 
 ## 0. 结论速览
 
-### 0.1 总结论：**部分迁移**（先迁美学，打标暂缓）
+### 0.1 总结论：**部分迁移**（先迁美学；打标的预处理障碍已解除，改为「可迁但排后」）
 
 | 环节 | 迁移可行性 | 关键依据 | 建议 |
 |---|---|---|---|
 | 美学 · qalign（SIGLIP2 回归） | **高** | safetensors 键与 candle `siglip::VisionModel` 逐条匹配 8/8 [已验证]；预处理只有 resize+归一化 [已验证] | **建议迁** |
 | 美学 · anime（ViT-1024/48 层） | **高** | 权重键与 candle `vit::Model` 完全对应（含 classifier 同级）[已验证]；预处理需复现「RGBA 白底合成」[已验证] | **建议迁** |
-| 打标 · wd14 | **中高** | 预处理是纯手写 numpy 逻辑，无 transformers 依赖 [已验证] | **模型到位后可迁** |
-| 打标 · cl_tagger（SIGLIP2 ONNX） | **低** | 预处理依赖 `transformers.AutoProcessor`，且可能走 naflex 多变长 patch 分支 [已验证代码路径 / 分支是否启用**未知**]；**打标模型文件本机全仓不存在**，无法验证 | **不迁** |
+| **打标 · cl_tagger（SIGLIP2 ONNX）—— 现役主力** | **中高**（初稿判「低」，已两次更正） | 模型已定位在 `E:\Game\AI\cl_tagger\models`（2.2GB）；ONNX 签名实测**只有 1 个输入** `pixel_values [N,3,384,384]`，`model_metadata.json` 明写 `is_naflex: false`，**不存在三输入分支** [已验证]；手写预处理 vs transformers **40 图对拍 prob_maxdiff 0.0133、0.5 阈值翻转 8/2487** [已验证] | **可迁，但排在美学之后**。迁移前必须先做 200–500 张 golden 基准 |
+| 打标 · wd14（兼容分支） | **中高** | 预处理是纯手写 numpy 逻辑，无 transformers 依赖 [已验证] | **仅在确认仍在使用时才谈迁移** |
 | HTTP 契约 | **中** | 6 个端点、6 个请求模型、字段级响应结构已逐条抄录 [已验证] | 第一期原样复刻 |
 
 ### 0.2 为什么不是「推荐全面迁移」
 
-三条硬理由，任一条都足以否掉「一次性全迁」：
+初稿给了三条硬理由，**其中前两条已被本机实测推翻**，只有第三条仍然成立。下面逐条交代，原文保留以便追溯「报告当初是怎么错的」：
 
-1. **打标侧无法验证——模型文件不在仓库里。** 全仓 `find` 无 `model.onnx` / `model_vocabulary.json` / `selected_tags.csv`；`models/` 只有 `aesthetic/`（374MB）与 `aesthetic_anime/`（2.18GB）。`docs/ENHANCEMENTS.md:16` 自己记着「[ ] wd14 模型文件就位后端到端验证（本机当前无 wd14 模型）」。**没有模型，就没有输入输出签名、没有基准分数、没有回归基线**，迁移只能靠猜。
-2. **cl_tagger 的预处理不可离线复现。** 它调用 `transformers.AutoProcessor.from_pretrained(google/siglip2-so400m-patch14-384)`，且在 `is_naflex` 时产出**三个**输入（`pixel_values` / `pixel_attention_mask` / `spatial_shapes`）。SigLIP2 的 NaFlex 变长 patch 打包没有任何 Rust 实现。
-3. **ort 的 CUDA 部署门槛比现状更高，不是更低。** ort 官方文档原文：`ort` provides binaries for **CUDA ≥ 13.2** and targets **cuDNN ≥ 9.23**. Make sure compatible versions of CUDA and cuDNN are installed and available on the **PATH** [已验证，ort.pyke.io/perf/execution-providers]。而现状的 `torch+cu126` wheel **自带 CUDA 运行时 DLL**，用户不需要装 CUDA Toolkit。迁移后反而要让用户装 CUDA 13.2 + cuDNN 9.23 —— 这是**部署复杂度上升**，不是下降。
+1. ~~**打标侧无法验证——模型文件不在仓库里。**~~ → **已推翻。** 模型确实不在仓库，但在本机 `E:\Game\AI\cl_tagger\models`（2.2GB：`model.onnx` 791KB + `model.onnx.data` 2.11GB + `model_vocabulary.json` 14.6MB + metadata）。
+   报告初稿只做了全仓 `find`，没有追问「模型是否可能在仓库之外」。**教训：把「仓库里没有」当成「不存在」，是一个错误推断。**
+   现该目录已复制到 `runtime/models/tagger/`，打标服务正常运行，GPU 实测 **183 ms/张**（20 次串行 3.659 s）。
+2. ~~**cl_tagger 的预处理不可离线复现。**~~ → **已推翻。** 两个子断言都不成立：
+   - 「可能有 naflex 三输入」→ `model_metadata.json` 明写 `"is_naflex": false`；用 onnxruntime 读出的实际签名**只有 1 个输入** `pixel_values`，shape `[batch_size, 3, 384, 384]`，输出 `logits` `[N, 108139]`。三输入分支在本机部署里根本不存在。
+   - 「预处理不可手写」→ 手写 `resize(384,384,BILINEAR) → /255 → (x-0.5)/0.5 → CHW` 与 transformers 路径**40 图严格对拍**：prob_maxdiff **0.0133**、0.5 阈值翻转 **8 / 2487**（全部落在 0.5±0.005 的模型自身边界抖动区）。等价于 u8 量化级差异，不影响任何实际判定。
+3. **ort 的 CUDA 部署门槛比现状更高，不是更低。**（**这一条仍然成立，也是真正剩下的障碍**） ort 官方文档原文：`ort` provides binaries for **CUDA ≥ 13.2** and targets **cuDNN ≥ 9.23**. Make sure compatible versions of CUDA and cuDNN are installed and available on the **PATH** [已验证，ort.pyke.io/perf/execution-providers]。而现状的 `torch+cu126` wheel **自带 CUDA 运行时 DLL**，用户不需要装 CUDA Toolkit。迁移后反而要让用户装 CUDA 13.2 + cuDNN 9.23 —— 这是**部署复杂度上升**，不是下降。
 
-### 0.3 决定性未知量（必须先回答再动手）
+### 0.3 现役打标模型已确认是 cl_tagger（本报告初稿判错，此处更正）
 
-> **现役打标模型到底是 wd14 还是 cl_tagger？**
+> **结论：现役主力是 cl_tagger，wd14 只是保留下来的兼容分支。**
 >
-> 这个问题决定打标能不能迁：
-> - 是 **wd14** → 纯手写预处理，Rust 可 1:1 复现，且**可以彻底删掉 transformers 依赖** → 值得迁。
-> - 是 **cl_tagger** → 需要复现 SigLIP2 processor（可能 naflex）→ 风险高，建议保留 Python。
+> 本报告初稿把 wd14 当成默认迁移对象、并把它列为「决定性未知量」，这是错的。更正依据：
 >
-> 判定方法：找模型目录下的标志文件。`selected_tags.csv + model.onnx` = wd14；`model_vocabulary.json + model.onnx` = cl_tagger（依据 `tagger_model.py` 的 `detect_kind` 判定逻辑 [已验证]）。**本机无模型，此问题无法从代码回答。**
+> 1. **代码路径**：`python/server/models/tagger_model.py` 的 `_load_cl_tagger` / `_preprocess_cl_tagger` 是主路径，`_load_wd14` / `_preprocess_wd14` 是兼容分支；`python/server/config.py:25` 把 `MODEL_KIND_CL_TAGGER` 列在首位。
+> 2. **项目文档**：`README.md:22`「本地 cl_tagger 模型回退」、`README.md:87`「承载 cl_tagger 打标 + Q-Align 美学评分」、`README.md:172-183` 的模型探测顺序、`docs/PLAN.md:25/69/102` 均以 cl_tagger 为准。
+> 3. **运行时实况**（`GET http://127.0.0.1:8001/health` + `settings` 表）：`tagger_model_name = "cl-tagger (SIGLIP2 ONNX)"`、`tagger_model_dir = <runtime>/models/tagger`。
+>
+> 因此打标迁移的**唯一现实对象**是 cl_tagger。
+>
+> 判定种类的方法仍然有效：`selected_tags.csv + model.onnx` = wd14；`model_vocabulary.json + model.onnx` = cl_tagger（`tagger_model.py` 的 `detect_kind` [已验证]）。
+>
+> **关于「本机无任何打标模型文件」——这句话是错的，已作废。**
+> 模型在 `E:\Game\AI\cl_tagger\models`，本报告已据此完成完整数值验证（见 §0.2 第 2 条与 §5.3）。
+>
+> ## 0.3.1 更正：cl_tagger 的迁移结论从「不迁」翻转为「可迁，但排后」
+>
+> 推翻的两个前提见 §0.2 第 1、2 条。本机实测得到的确切事实：
+>
+> | 项目 | 实测值 | 证明方式 |
+> |---|---|---|
+> | ONNX 输入 | 仅 `pixel_values` `[N,3,384,384]` float32 | onnxruntime 读 session get_inputs() |
+> | ONNX 输出 | `logits` `[N,108139]` float32 | 同上 |
+> | naflex | `false` | `model_metadata.json` 原文 |
+> | processor | `SiglipImageProcessor`（slow 版）、`image_mean/std = [0.5,0.5,0.5]`、`resample = 2`（BILINEAR）、size 384 | `preprocessor_config.json` |
+> | 手写预处理复现 | prob_maxdiff `0.0133`；0.5 阈值翻转 `8/2487` | 40 图逐图对拍（`scripts/probe_cltagger_parity.py`） |
+> | resize 内核敏感性 | BILINEAR 翻转 2 处 / BICUBIC 41 处 / LANCZOS 55 处 | 6 图 × 3 内核 |
+> | GPU 吞吐 | 183 ms/张（RTX 5070 Laptop，CUDAExecutionProvider） | 预热后 20 次串行 |
+>
+> **必须用 BILINEAR**（对应 `resample: 2`）。换成 BICUBIC/LANCZOS 会让 prob 偏差放大到 0.4–0.6，标签大幅翻转——这是迁移时最容易踩的坑。
+>
+> 剩余的真障碍只有一条：**`ort` 的 CUDA 部署要求（CUDA ≥13.2 + cuDNN ≥9.23 在 PATH）比 torch wheel 自带运行时更重**，会让「一键装 GPU」体验倒退。这是部署取舍问题，不是算法可行性问题。
+>
+> 因此结论改为：**打标在技术上可迁，优先级排在美学之后**；是否迁取决于产品是否接受 GPU 部署退化，或是否愿意走 DirectML 兜底。
+>
+> 另注：aesthetic 的 qalign 用的是同一族 `SiglipImageProcessor`（同样 mean/std 0.5），**两者的预处理可以共用一份 Rust 代码**，这进一步降低了打标迁移的边际成本。
 
 ---
 
@@ -66,7 +99,19 @@ models/ 合计 ≈ 2.4 GB
 
 - `models/aesthetic`：`SiglipForImageClassification`，`problem_type=regression`，`id2label={0:LABEL_0}`。权重顶层只有 `classifier`（`weight[1,768]` + `bias[1]`）与 `vision_model`（12 层 768/3072/12头，patch16，`position_embedding[1024,768]`，head 是 `MultiheadAttentionPoolingHead` = `probe[1,1,768]` + `in_proj_weight[2304,768]` + `mlp` + `layernorm`）。**无 cls_token**（SigLIP 靠 MAP head 池化）。
 - `models/aesthetic_anime`：`ViTForImageClassification`，`hidden_size=1536`、`intermediate_size=4192`、`num_hidden_layers=48`、`num_attention_heads=16`、`patch_size=64`、`image_size=1024`、`qkv_bias=true`、`hidden_act=gelu`、`layer_norm_eps=1e-12`、`id2label={0:hq,1:lq}`。权重顶层 `classifier`（`[2,1536]`）与 `vit`，`position_embeddings[1,257,1536]`（1 CLS + 16×16 patch）。
-- **打标模型与词表：不存在。** [已验证] 未找到任何 `*.onnx`、`selected_tags.csv`、`model_vocabulary.json`。`config.py` 里 `LEGACY_TAGGER_DIR=D:/Game/AI/cl_tagger/models` 在本机也已不存在。
+- **打标模型与词表：存在，但不在仓库里。** 初稿判「不存在」是错的。实际位置 `E:\Game\AI\cl_tagger\models`（2.2GB）：
+
+  ```
+  model.onnx                 791,773 B
+  model.onnx.data      2,211,645,300 B   ← 权重外置
+  model_vocabulary.json   14,594,140 B   ← 108139 个标签
+  model_metadata.json            112 B   ← {"vision_encoder_repo":"google/siglip2-so400m-patch14-384","is_naflex":false,"num_tags":108139}
+  model_ood_ref.npz        4,949,435 B
+  model_tag_metrics.npz   54,015,616 B
+  ```
+
+  `config.py` 里的 `LEGACY_TAGGER_DIR` 常量写的是 `D:/Game/AI/cl_tagger/models`，而实际模型在 **E:** 盘 —— 这就是自动探测「全部候选未命中」的直接原因。
+  现已复制到 `<install>\runtime\models\tagger\`，`python/server/config.py` 的 `_find_tagger_dir()` 能自动识别（实测 `TAGGER_MODEL_KIND = cl_tagger`）。
 
 ### 1.3 当前运行时开销
 
@@ -130,7 +175,17 @@ return dict(sorted(result.items(), key=lambda kv: kv[1], reverse=True))  # 置�
 ```
 阈值：wd14 默认 `0.35`，cl_tagger 默认 `0.5`（显式传参不覆盖）。
 
-**迁移评估**：wd14 分支**可以逐行翻译**（resize + CLIP 归一化 + NCHW + sigmoid + 阈值 + 降序）。cl_tagger 分支的核心不确定性在 processor。**且两者都缺模型文件，无法做任何数值验证。**
+**迁移评估（已按实测重写）**：cl_tagger 是现役主力，但初稿对它列的两个障碍**都已不成立**：
+
+| 初稿障碍 | 实测结论 |
+|---|---|
+| 依赖 `transformers.AutoProcessor`，Rust 无现成实现 | 该 processor 就是 `SiglipImageProcessor`（mean/std 0.5、resample 2/BILINEAR、384×384），手写 4 行即可：`resize → /255 → (x-0.5)/0.5 → CHW`。40 图对拍 prob_maxdiff 0.0133 |
+| 可能有 naflex 三输入，Rust 无实现 | `is_naflex: false`，ONNX 实际签名只有 1 个输入 `pixel_values`。**不存在此分支** |
+| 缺模型文件，无法数值验证 | 模型在 `E:\Game\AI\cl_tagger\models`，已完成对拍与 GPU 吞吐实测 |
+
+唯一剩下的问题在推理运行时而非预处理：**`ort` 的 CUDA EP 要求系统级 CUDA ≥13.2 + cuDNN ≥9.23 在 PATH**，比 torch wheel 自带运行时重（见 §4.1）。
+
+wd14 分支仍是**可以逐行翻译**的备选（resize + CLIP 归一化 + NCHW + sigmoid + 阈值 + 降序），但它已不是主路径。
 
 ### 2.2 美学（`aesthetic_model.py`）[已验证]
 
@@ -210,7 +265,7 @@ score  = 1.0 + score01*4.0
 - WebGPU EP 官方明示 **experimental，可能产生错误结果或崩溃** [已验证] —— 不能作为兜底。
 - 仍是 rc：`2.0.0-rc.15` 意味着 API 仍可能破坏性变动，不适合作为「交付给用户」的稳定底座。
 
-**结论**：`ort` 是打标环节的唯一现实选择，但**只在 wd14 分支或模型到位且验证通过后才启动**。
+**结论**：`ort` 是打标环节的唯一现实选择。打标主力 cl_tagger 的 preprocessing 障碍已解除（§0.3.1），**所以打标在技术上可迁**；是否迁取决于能否接受上面那条 CUDA 部署代价。
 
 ### 3.2 方案 B：`candle`（纯 Rust 张量框架）
 
@@ -236,9 +291,9 @@ score  = 1.0 + score01*4.0
 
 **两个已知限制**：
 - `vit` 的 `interpolate_pos_encoding` 是 `todo!()`。但本模型固定 1024×1024 输入，走不插值分支，**无影响** [已验证源码路径]。
-- candle **没有 SigLIP2 NaFlex** 实现 → 若打标是 cl_tagger+naflex，candle 无能为力（但打标本来也不该用 candle）。
+- candle **没有 SigLIP2 NaFlex** 实现 → 但本机 cl_tagger 实测 `is_naflex: false`，不走该分支，所以这条对本项目**不构成限制**。打标仍建议用 `ort`（ONNX 原生），而非转 candle。
 
-**CPU 上的 F16 性能**：`candle-core` 依赖 `gemm 0.19`（default features 含 `f16`），`cpu_backend/mod.rs:1455-1457` 显式允许 `F16 | F32 | F64` 走 matmul；`conv2d.rs` 的 `impl Map2` 是泛型 `T: WithDType`，F16 卷积也可跑 [已验证源码]。**但「能跑」不等于「够快」——anime 模型 2.18GB F16、48 层 1536 hidden，CPU 单张耗时会是多少，本机无 GPU/无 torch 环境，无法实测 [未知]。** 这是必须实测的第一项。
+**CPU 上的 F16 性能**：`candle-core` 依赖 `gemm 0.19`（default features 含 `f16`），`cpu_backend/mod.rs:1455-1457` 显式允许 `F16 | F32 | F64` 走 matmul；`conv2d.rs` 的 `impl Map2` 是泛型 `T: WithDType`，F16 卷积也可跑 [已验证源码]。**但「能跑」不等于「够快」——anime 模型 2.18GB F16、48 层 1536 hidden，CPU 单张耗时仍未实测 [未知]。** 本机现已具备 GPU 与 torch 环境，缺的是 candle 版实现本身，所以这项要等到第 1–2 步落地后才能测。
 
 **candle 的 CUDA**：`features = ["cuda"]`（依赖 `cudarc` + `candle-kernels`）。注意 candle 的 CUDA 是**自己编译 kernel**（首次编译很慢），与 ort 用预编译 DLL 的路线不同。这是 [已验证的 feature 定义 / 编译耗时未知]。
 
@@ -272,14 +327,19 @@ score  = 1.0 + score01*4.0
 2. **DirectML EP 兜底**：Windows 上 `directml` feature 不需要 CUDA，可覆盖 AMD/Intel 核显，且是 Windows 原生 DX12 路径。**但本项目的目标机型（如 Intel Core Ultra 9 285H 核显）在 DirectML 上的实际吞吐未测 [未知]**。
 3. **candle CPU 的 SIMD 加速**：`candle` 走 gemm crate（rayon + f16），CPU 侧性能需实测。
 
-### 4.3 本机环境的现实
+### 4.3 本机环境的现实（已随机器重启而改变）
 
-- `nvidia-smi` 报 `NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver` → **本机无法做任何 GPU 性能/正确性实验** [已验证]。
-- 系统 Python 3.12.11 **无 torch / onnxruntime / numpy** [已验证]。
-- 无 `%LOCALAPPDATA%/BeiWay-MoeVault`、无 `runtime/`、无 `python/.venv`。
-- `cargo/rustc` 1.97.1 可用 [已验证]。
+初稿写作时本机无可用 GPU，因此把「GPU 只能文档核实」写进了结论。**用户重启并启用独显后，这一条已不成立**，实测如下：
 
-→ **所有 GPU 相关结论在本机只能是「文档核实」，不能是「实测」。这一点必须在决策时被计入。**
+| 项 | 实测值 |
+|---|---|
+| 显卡 | NVIDIA GeForce RTX 5070 Laptop GPU，驱动 595.76，显存 8151 MiB [已验证] |
+| 推理 EP | `["CUDAExecutionProvider","CPUExecutionProvider"]`（onnxruntime-gpu 1.23.2）[已验证] |
+| GPU 占用 | 打标并发期间 `utilization.gpu` 达 68%，显存 3224 MiB → 确认真的走 GPU [已验证] |
+| 打标吞吐 | 预热后 20 次串行 POST `/infer/tags` 共 3.659 s ≈ **183 ms/张**（含 HTTP 往返）[已验证] |
+| venv 位置 | `D:\Program Files\BeiWay-MoeVault\runtime\python\.venv`（torch 2.11.0+cu128）[已验证] |
+
+→ **GPU 路径现在是可实测的了**。但 `ort` 的 CUDA EP 是否能在本机这套 CUDA/cuDNN 上跑通，仍未验证——它要求的是系统级 CUDA 13.2 + cuDNN 9.23，与 torch 自带的 cu128 不是一回事。
 
 ---
 
@@ -302,7 +362,7 @@ score  = 1.0 + score01*4.0
 **第 0 层：基准数据集**（**当前不可能，这是最大障碍**）
 `backend/data/app.db` 的 `images` 表 **0 行**、`settings` 表 **0 行** [已验证] → **没有任何既有美学分/标签可作回归基准**。必须先造基准集：
 - 挑 200–500 张覆盖极端情况的图：纯色/灰阶、超长宽比、极小图（<64px）、带 alpha 的 PNG、CMYK/16-bit、损坏 JPEG。
-- 用**现在能跑通的 Python 服务**跑一遍，落 `{path, score, raw, tags[]}` 为 golden JSON。**注意：本机 Python 环境无 torch，这一步需要在目标机上做。**
+- 用**现在能跑通的 Python 服务**跑一遍，落 `{path, score, raw, tags[]}` 为 golden JSON。**本轮已确认本机就能做**：推理服务在 `D:\Program Files\BeiWay-MoeVault\runtime\python\.venv` 下正常跑（torch 2.11.0+cu128、CUDAExecutionProvider 生效），不再需要另找目标机。
 
 **第 1 层：单模型逐层比对**（Rust 与 Python 各导出中间张量）
 - qalign：比对 `patch_embedding` 输出、`encoder.layers.11` 输出、`post_layernorm` 输出、`head` 输出、最终 `logits`。
@@ -318,11 +378,28 @@ score  = 1.0 + score01*4.0
 - 用同一批请求打两套服务，逐字段 diff JSON（含字段名、类型、顺序、`elapsed_ms` 之外的数值）。
 - 检查 `/health` 的 `state` 三态、`/devices` 的 `capabilities`、422 与 500 的错误文案。
 
-### 5.3 无法验证的部分（必须承认）
+### 5.3 已验证与仍无法验证的部分
 
-- **打标两侧都无法验证**：模型文件不存在，Python 侧打标本身就跑不起来。
-- **GPU 路径无法验证**：本机驱动不可用。
-- **性能无法验证**：无 torch/无 GPU。
+**已从小节标题里的「无法验证」移出（本轮实测完成）：**
+
+| 项 | 结果 | 方法 |
+|---|---|---|
+| 打标 ONNX 输入输出签名 | 1 输入 `pixel_values[N,3,384,384]` / 1 输出 `logits[N,108139]` | onnxruntime 读 session |
+| 是否 naflex | 否（`is_naflex: false`） | metadata + 输入签名双重确认 |
+| 手写预处理与 transformers 等价性 | prob_maxdiff 0.0133、阈值翻转 8/2487 | 40 图逐图对拍 |
+| resize 内核选择 | 必须 BILINEAR；BICUBIC/LANCZOS 会翻转 41/55 处 | 6 图 × 3 内核 |
+| GPU 是否真的参与推理 | 是，68% 利用率 / 3224 MiB | nvidia-smi 采样 + 并发压测 |
+| 打标吞吐 | 183 ms/张 | 预热后 20 次串行 |
+
+**仍然无法验证的（不含已在别处解决的）：**
+
+- **candle CPU 上 anime 模型的实际延迟**：本机 torch 齐全但 candle 版尚未实现，无对照。
+- **`ort` CUDA EP 在本机的可用性**：现役是 torch 的 cu128 运行时，onnxruntime-gpu 的 CUDA EP 走的是它自己那份；`ort` 要求系统级 CUDA 13.2 + cuDNN 9.23，本机未装，未验证。
+- **candle 与 ort 两套 CUDA 栈能否共存**：未验证。
+- **`ort` CUDA DLL 的实际体积**：未测。
+- **美学两个模型迁移后的数值一致性**：仅完成了权重键匹配核对，未做端到端 logits 对拍。
+
+**方法论教训（写下来避免重犯）**：初稿把「仓库 `find` 没找到模型」直接写成「本机不存在模型」，并据此把整个打标环节判为「不迁」。一个正确做法是**先问用户模型装在哪**——模型文件动辄 2GB，不放进版本库是常态，全仓搜索本来就不可能命中。
 
 ---
 
@@ -384,8 +461,8 @@ score  = 1.0 + score01*4.0
 | 模型注册表与生命周期 | 懒加载、`RwLock`/`Mutex`、设备切换、`load_error` 三态、热切目录 | 150–250 | 中（要复刻 Python 的语义，包括「加载失败不抛，记 error」） |
 | HTTP 契约 | 6 端点 + 6 请求模型 + 错误文案 + 串行锁 | 250–400 | 低（照抄即可） |
 | **小计（仅美学）** | | **约 850–1,350** | |
-| 打标（若迁 wd14） | `ort` 会话 + EP 选择 + wd14 预处理 + CSV 词表 + sigmoid/阈值/降序 | 200–300 | 中 |
-| 打标（若迁 cl_tagger） | 上述 + SigLIP2 processor 复现（+naflex 三输入打包） | +200–400 | **高** |
+| 打标（现役 cl_tagger，**可迁**） | `ort` 会话 + EP 选择 + SigLIP2 processor 手写复现（已对拍验证） | **250–450**（初稿估 400–700，naflex 分支不存在后下调） | **中** |
+| 打标（备查：若回退 wd14） | `ort` 会话 + EP 选择 + wd14 预处理 + CSV 词表 + sigmoid/阈值/降序 | 200–300 | 中 |
 | 设备枚举 `/devices` | GPU 枚举（需 `nvml`/`wgpu` 或调 `nvidia-smi`）、CPU 名（`winreg` crate 读同名键） | 80–150 | 中 |
 
 **配套改动（不属于新代码但必须计入工作量）**：
@@ -407,10 +484,10 @@ score  = 1.0 + score01*4.0
 
 | # | 风险 | 证据 | 应对 |
 |---|---|---|---|
-| R1 | **打标模型文件不存在**，ONNX 输入输出签名（尤其是否 naflex）完全无法核实 | 全仓 `find` 无 `*.onnx`；`docs/ENHANCEMENTS.md:16` 自认「本机当前无 wd14 模型」 | **先解决模型交付问题**。模型不到位，打标迁移无从谈起，也无从验证 |
+| R1 | ~~打标模型文件不存在~~ → **已消除**。模型在 `E:\Game\AI\cl_tagger\models`，签名与 naflex 均已实测 | onnxruntime 读 session + metadata | 已解决；模型已复制到 `runtime/models/tagger\` |
 | R2 | **无 golden 基准**：`app.db` 的 `images` 表 0 行 | `backend/data/app.db` 实测 | 必须在目标机上用现存 Python 服务造基准集，再谈迁移 |
 | R3 | **ort 的 CUDA 要求（≥13.2 / cuDNN ≥9.23 在 PATH）比现状（torch wheel 自带 CUDA）更重** | ort 官方文档原文 | 要么接受 GPU 体验退化，要么走 DirectML EP，要么**不迁 GPU 路径**（保留 Python 作为 GPU 侧可选增强） |
-| R4 | **本机无法做任何 GPU 实验**（驱动不可用） | `nvidia-smi` 报错 | 必须在有 GPU 的目标机上做验证，不能靠文档推断性能 |
+| R4 | ~~本机无法做任何 GPU 实验~~ → **已消除**。用户启用独显后 RTX 5070 Laptop 可用，打标实测 183 ms/张 | `nvidia-smi` + 并发压测 | 已解决；剩余风险是 `ort` 的 CUDA EP 与本机 torch cu128 不是同一套运行时，未验证 |
 
 ### 🟠 高风险（会显著增加工期或返工）
 
@@ -420,7 +497,7 @@ score  = 1.0 + score01*4.0
 | R6 | candle 与 ort **两套 CUDA 栈共存** | candle 用 `cudarc` 自己编译 kernel，ort 用系统 ORT CUDA DLL，两者对 CUDA 版本要求可能冲突 [未知]。必须在目标机验证，混合方案的核心不确定点 |
 | R7 | **anime 模型 CPU 性能未知** | 2.18GB F16、48 层 1536 hidden、1024×1024 输入。candle 在 CPU 上能不能跑到可接受延迟**完全没测**。若 CPU 慢到不可用，而 GPU 又因 R3 变难，则 anime 后端的迁移**净亏** |
 | R8 | **resize/JPEG 解码数值漂移** | PIL（u8 整数 + libjpeg-turbo）vs Rust（f32 + 纯 Rust jpeg）。可能需自写与 PIL 同构的 resize，或换 libjpeg 绑定 |
-| R9 | **cl_tagger 的 SigLIP2 processor 无法离线复现** | 含 `AutoProcessor` 的 fallback 联网行为、naflex 三输入打包。任何复现偏差都会静默改变标签 |
+| R9 | **resize 内核选错会静默改变标签**（原写「processor 无法离线复现」，已不成立） | 实测 BILINEAR 翻转 2 处、BICUBIC 41 处、LANCZOS 55 处。Rust `image` crate 没有与 PIL BILINEAR 完全同构的实现，需自行验证或自写 u8 双线性 |
 | R10 | **舍入语义** | Python `round` 是 half-to-even，Rust 默认不是。写错会让 `score`/`raw` 在 JSON 层面对不上 |
 
 ### 🟡 中风险（可控但别忘）
@@ -451,15 +528,16 @@ score  = 1.0 + score01*4.0
 **部分迁移。不推荐一次性全面迁移。**
 
 - ✅ **美学（qalign + anime）**：**推荐迁移**。这是唯一「证据充分、收益确定、风险可控」的部分：两个模型的权重键与 candle 现成实现**严格匹配**（qalign 8/8、anime 完全对应），预处理逻辑简单且已在配置里写死，不需要 transformers。
-- ⚠️ **打标（wd14）**：**模型到位且验证通过后再迁**。预处理是纯手写逻辑，技术上没有障碍，障碍是「没有模型、没有基准」。
-- ❌ **打标（cl_tagger / SigLIP2）**：**不建议迁**。预处理依赖 transformers processor，且可能存在 naflex 三输入分支，Rust 侧无任何现成实现。
+- ✅/⏸️ **打标（cl_tagger / SigLIP2，现役主力）**：**可迁，排在美学之后**。初稿判「不迁」的两个前提已被实测推翻（§0.3.1）：naflex 不存在、processor 可手写复现（40 图 prob_maxdiff 0.0133）。剩下的唯一代价是 `ort` 的 CUDA 部署要求更重。
+- ⏸️ **打标（wd14，兼容分支）**：**备查**。预处理是纯手写逻辑、技术上可 1:1 复现，但它是退路不是主路径，迁它没有收益。
 - ❌ **GPU 一键安装**：**迁移会让这个体验倒退**。ort 要求系统级 CUDA 13.2 + cuDNN 9.23，而 torch wheel 自带运行时。这一项必须提前和产品预期对齐。
 
 ### 9.2 建议的执行顺序（每步都有独立的验收点）
 
 **第 0 步（前置，不做完不要动代码）**
-1. 确认现役打标模型种类与文件位置（`selected_tags.csv` vs `model_vocabulary.json`）→ 决定 R1 的走向。
-2. 在有 GPU 的目标机上，用现存 Python 服务跑出 200–500 张的 golden 基准 JSON。
+1. ~~确认现役打标模型种类与文件位置~~ → **已完成：cl_tagger，模型在 `E:\Game\AI\cl_tagger\models`（见 §0.3 / §0.3.1）**。
+2. ~~确认是否 naflex~~ → **已完成：不是（`is_naflex: false`）**。
+3. ~~在有 GPU 的目标机上跑基准~~ → **GPU 已可用**。但 **200–500 张 golden 基准 JSON 仍未产出**，这是下一轮必须先做的事（现在打标服务跑得起来，可以出了）。
 
 **第 1 步：离线验证 candle 能加载两个模型（1–2 天，纯本地，无风险）**
 - 写一个最小示例：`models/aesthetic` 走 `siglip::VisionModel::new(cfg, true, vb)` + classifier；`models/aesthetic_anime` 走 `vit::Model::new(cfg, 2, vb)`。
@@ -474,15 +552,21 @@ score  = 1.0 + score01*4.0
 - Rust 写独立进程，1:1 复刻 6 个端点；Tauri 侧把 sidecar 从 `python -m uvicorn` 换成新 exe。
 - 验收：`frontend/src/api/infer.ts` 的 `InferHealth` 解析不变；后端 `AestheticResp` 解析不变；设置页「运行/降级/停止」三态正常。
 
-**第 4 步（可选）：打标**
-- 仅当第 0 步确认是 wd14、且模型到位时进行。
+**第 4 步（美学通过后再做）：打标**
+- 先产出 golden 基准（第 0 步第 3 条），再按 `ort` 路线实现：ONNX session + `pixel_values` 单输入 + sigmoid + 阈值 + 降序。
+- **预处理必须 BILINEAR**（对齐 PIL `resample: 2`），mean/std = 0.5。这条是硬约束，选错内核会让 41–55 个标签翻转。
+- 数值验收线：prob_maxdiff `< 0.02`（对拍基准已达到 0.0133），0.5 阈值翻转 `< 15/2487`。
+- 卡点：先验证 `ort` CUDA EP 能否在本机跑通；跑不通就只用 CPU EP，或保留 Python 作为 GPU 侧可选增强。
+- wd14 分支仅在需要回退时再做。
 
 **第 5 步（可选）：形态②（内嵌进主进程，删掉 8001）**
 - 只有在第 3 步稳定运行一段时间后再考虑。
 
 ### 9.3 一句话给决策者
 
-> 美学那部分（374MB + 2.18GB 两个模型）可以放心迁到 Rust，candle 已经有严丝合缝的现成实现，而且能顺带干掉 0.85–9 GB 的 venv；但**打标这部分现在连模型文件都不在**，谈不上迁移，只能等模型到位；同时要有心理准备——**迁到 Rust 会让「一键装 GPU」这个已经做好的体验倒退**，因为 ONNX Runtime 不像 PyTorch 那样把 CUDA 打包进 wheel。
+> 美学那部分（374MB + 2.18GB 两个模型）可以放心迁到 Rust，candle 已经有严丝合缝的现成实现，能顺带干掉 0.85–9 GB 的 venv。
+> **打标那部分同样可以迁**——初稿说「预处理依赖 transformers、模型不在手边」的两条理由，经本机实测都不成立（模型在 E: 盘 2.2GB，`is_naflex: false`，手写预处理 40 图对拍 prob_maxdiff 0.0133）。建议排在美学之后做。
+> 唯一要有心理准备的是部署侧：**迁到 Rust 会让「一键装 GPU」这个已经做好的体验倒退**，因为 ONNX Runtime 不像 PyTorch 那样把 CUDA 运行时打包进 wheel，它要求用户系统里已有 CUDA 13.2 + cuDNN 9.23。这是取舍，不是技术障碍。
 
 ---
 
@@ -520,14 +604,22 @@ score  = 1.0 + score01*4.0
 - `numpy` 2.5.4：12.1 MB；`pillow` 13.0.0：6.9 MB；`transformers` 5.23.0 sdist：10.1 MB
 
 **环境实测**
-- `cargo/rustc` 1.97.1 可用；系统 Python 3.12.11 无 torch/onnxruntime/numpy
-- `nvidia-smi` 驱动不可用
+- `cargo/rustc` 1.97.1 可用；**系统** Python 3.12.11 无 torch/onnxruntime/numpy（但项目自带的 `runtime\python\.venv` 里全都有，见 §4.3）
+- `nvidia-smi` 驱动不可用（**初稿写作时**；第二轮更正时已可用，见 §4.3）
 - `backend/data/app.db`：`images` 0 行、`settings` 0 行
 - `BeiWay-MoeVault_0.1.0_x64_en-US.msi` = 10,481,664 B
 
-**未能验证（明确标注）**
-- 打标 ONNX 的实际输入/输出名与形状（模型文件不存在）
-- 现役打标模型是否为 naflex（代码有分支，无模型无法判定）
-- 所有 GPU 性能数据（驱动不可用）
+**本轮新增实测（第二轮更正依据）**
+- onnxruntime 读 cl_tagger 模型签名：1 输入 `pixel_values[N,3,384,384] float32`，1 输出 `logits[N,108139] float32`，`custom_metadata_map` 为空
+- model_metadata.json 原文：`{"vision_encoder_repo":"google/siglip2-so400m-patch14-384","is_naflex":false,"num_tags":108139}`
+- preprocessor_config.json（hf_cache/hub/models--google--siglip2-so400m-patch14-384）: `SiglipImageProcessor`、mean/std 0.5、resample 2、size 384、rescale 1/255
+- 手写预处理 vs transformers：单图 px_maxdiff 0.007843（纯 u8 取整误差）、prob_maxdiff 0.00114；40 图 prob_maxdiff 0.013272、阈值翻转 8/2487
+- 6 图 x 3 resize 内核：BILINEAR 翻转 2 / BICUBIC 41 / LANCZOS 55
+- GPU：RTX 5070 Laptop、驱动 595.76、8151 MiB；打标并发 68% 利用率 / 3224 MiB；20 次串行 3.659 s
+- nvidia-smi、推理服务 /health、/infer/tagger/config 端到端跑通
+
+**仍然未能验证（明确标注）**
+- `ort` CUDA EP 在本机的实际可用性（要求系统级 CUDA 13.2 + cuDNN 9.23，本机未装）
 - candle CPU 上 anime 模型的实际延迟
-- ort CUDA DLL 的实际体积与 candle+ort 两套 CUDA 栈能否共存
+- `ort` CUDA DLL 的实际体积与 candle+ort 两套 CUDA 栈能否共存
+- 200-500 张 golden 基准 JSON（打标服务现已可用，应尽快产出）

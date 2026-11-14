@@ -812,3 +812,61 @@ SELECT id, phash, clarity_score FROM images WHERE status='active' ORDER BY id
 - 逐 `Cargo.toml` 核对依赖图
 - 全文件精读：`api/src/state.rs`、`api/src/routes/mod.rs`、`core/src/error.rs`、`stores/dedup.ts`、`useSelection.ts`、`constants/batchActions.ts`、`api/ws.ts`、`pipeline.rs:183-803`
 - **未执行**：`cargo build`/`cargo test`/`npm run build`（只读审查，未验证编译状态）
+
+---
+
+## 9. 后续跟进记录（2026-11-14）
+
+> 本节由后续会话补写，**不属于原审查结论**，只记录「按 §8 建议动手之后实际发生了什么」，供下一次审查对账。原报告的 P0/P1/P2 定性保持原样，未回改。
+
+### 9.1 P1 六项的落地结果
+
+| 编号 | 原条目 | 实际状态 | 说明 |
+|---|---|---|---|
+| P1-1 | §2.1 筛选 SQL 手写三份 | ✅ 已完成 | 收敛为唯一 `fn sauce_tag_ai_conds(sauce, tag, ai) -> Vec<String>`，3 个调用点（`import_tree` / `import_dir_images` / `build_filter_conds`）全部改为调用。新增回归测试 `sauce_tag_ai_filter_consistent_across_entrypoints` 做三入口对拍 |
+| P1-2 | §3.3 ImageDetailView 拆分 | ✅ 已完成 | 1895 → 1326 行；抽出 `constants/tagGroups.ts`、`utils/format.ts`、`components/detail/TagEditPanel.vue`（445 行）、`components/detail/SauceCompareDialog.vue`（242 行） |
+| P1-3 | §3.4 SettingsView 拆分 | ✅ 已完成 | 1587 → 154 行；拆成 `views/settings/` 下 6 个面板。**关键坑**：原 `.hint` 是 scoped 样式，拆出去的子组件拿不到，必须改成带 `.settings-page` 前缀的非 scoped 块 |
+| P1-4 | §4.2 手写 `Result<Json<Value>, …>` 77 次 | ✅ 早已完成 | 复核时 `routes/mod.rs:30` 已有 `pub type ApiResult<T> = Result<Json<T>, ApiError>;`，全 routes 命中 92 处。**本报告估的「77 次待改」在写作时就已经不是现状** |
+| P1-5 | §4.3 `lock().unwrap()` 141 处 | ✅ 已完成 | 实测是 **90 处**（不是 141）。改 `parking_lot::Mutex` 后 90 处 `.unwrap()` 全部删除，锁中毒语义从根上消失 |
+| P1-6 | §4.6 Tauri 壳层 16 处 unwrap/expect | ✅ 已完成 | `src-tauri/src/` 下 `unwrap()/expect(` 现已 **0 命中**。新增 `child_slot()` / `infer_start_guard()` 两个辅助函数收敛 7 处 `slot.lock()`；4 处 `parse().unwrap()` 改 `SocketAddr::from(([127,0,0,1], PORT))`；`tauri::Builder::build` 失败改为打印原因后 `exit(1)` |
+
+### 9.2 P2 评估结论（只核实，未动手）
+
+按「评估 P2 部分」的要求逐条核了现状，**其中两项已经不存在了**：
+
+| 编号 | 原条目 | 现状核实 | 建议 |
+|---|---|---|---|
+| P2-§1.3 | `app_error_response` 零调用 | 仍零调用，仅定义在 `api/src/routes/mod.rs:43` | 保留观察。删它或接通它都只改 1–2 行，收益极小，**不值得单独开一轮** |
+| P2-§2.4 | `thumbUrl` 4 份 | **只剩 2 份**（`stores/dedup.ts:33`、`stores/library.ts:39`）。另 2 份在 P0 清理时已删 | 可以合，但两个 store 域不同（图库 vs 查重），合并要处理 props 传递。**收益小，暂缓** |
+| P2-§2.6 | 手写裸 TCP 的 `proxy_python_get` | **已不存在** —— 已改用 `reqwest`（`api/src/routes/settings.rs:74`），且 doc 注释明确写了「这里曾是一段手写裸 TCP 客户端…那条注释早就过时了」 | **无需处理** |
+| P2-§1.6 | 出口池配置两份真源 | **已不存在** —— 上一轮 P0 已收敛成 `state::exit_config(db) -> (Vec<u16>, bool)`（`api/src/state.rs:40`），`routes/settings.rs` 三处调用点（`:215` / `:433` / `:489`）全部走它，全 crate 已无第二份端口解析 | **无需处理** |
+| P2-§3.2 | `db/src/lib.rs` 单 impl 2064 行 | 现 **2816 行**，单 impl 从 `:81` 起 | 拆分（`images/dedup/recycle/settings/tags/jobs/logs`）风险低但**收益也是纯组织性的**。建议等到下次真要改 db 时顺手做，不要专门开一轮 |
+| P2-§3.5 | `run_sauce_pipeline` 267 行 | 仍在 `tagger/src/pipeline.rs:537` | **建议做**，但必须先在 §9.3 的「补测试」之后 —— 它零测试，直接改无法验证 |
+| P2-§2.3 | 抽 `api/src/task_runner.rs` | 仍无该文件 | 依赖 §2.2（六个任务启动点），§2.2 已部分做了。**可做，排在 §3.5 之后** |
+| P2-§4.5 | 内部错误原文回前端 | 仍在（`routes/tagging.rs` 多处 `error_response(ErrorKind::Internal, e.to_string())`） | **建议做**，且成本极低：加一个 `internal_error(e)` 只回「内部错误，详见日志」+ 服务端打日志。这是安全/体验双收益 |
+
+**P2 总结**：8 项里 **3 项已消失**（§2.6 裸 TCP、§1.6 出口池双源，以及 §2.4 的 2 份副本），剩 5 项。按「收益/成本」排序，**只有 §4.5 内部错误脱敏值得单独做**（改 1 个辅助函数 + 替换调用点，安全与体验双收益）；其余 4 项（§1.3 / §2.4 / §3.2 / §3.5 / §2.3）都要等「正好改到那块代码」时顺手做，不专门开轮。
+
+### 9.3 原报告结论的偏差修正
+
+动手过程中发现原报告有 **3 处数字/事实与现状不符**，记录在此以免下次引用时被误导：
+
+1. **§4.3 的「141 处 `lock().unwrap()`」实际是 90 处。** 差 51 处 —— 原报告可能把 `tests` 模块里的也算进去了，或统计口径包含了非 `self.conn` 的锁。
+2. **§4.2 的「77 处待改签名」在报告写作时就已经改完了。** 引用这类「机械替换」类结论前应先 `grep` 复核一次。
+3. **§4.6 的「16 处 unwrap/expect」分布描述有误。** 原文说 `:145/:169/:214/:224/:953/:963/:984` 共 7 处 `slot.lock().unwrap()`，实际还有 `.expect()` 与 `parse().unwrap()` 若干，逐一定位比按行号清单改更可靠。
+
+**方法论教训**：审查报告里的**行号与计数是最易腐坏的部分**，因为它们是「瞬间快照」。后续会话引用前必须重新 `grep` 验证，否则会照着已经不存在的行号改代码。
+
+### 9.4 Residual Risk 的更新
+
+原 §8.7 的 7 条剩余风险中，第 6 条**已关闭**：
+
+> ~~6. wx/Tauri 壳层的 panic 面仍在（§4.6）。`slot.lock().unwrap()` 7 处的修复需要理解每个 slot 的语义，本次未逐一定位，改动风险高于收益不确定。~~
+> → **已解决。** `child_slot()` 把所有 slot 锁统一成「中毒也能取回」的语义，无需逐个理解 slot 内容即可安全收敛。`src-tauri/src/` 下现已零 unwrap/expect。
+
+第 3 条**部分缓解**：
+
+> ~~3. 单连接 + 全局 Mutex 的架构不变。`parking_lot` 解决了 panic 传染，但「一个慢查询阻塞所有请求」的特性保留。~~
+> → panic 传染已彻底解决（`parking_lot` 无中毒概念）。「慢查询阻塞」的结构未变，仍是已知特性。
+
+其余 5 条（测试缺口、pipeline 并发、选择模型统一 1/3、SQL 条件构造、结论基线）**全部仍然有效**，其中第 2 条（`pipeline.rs` 零测试承载最多业务编排）在完成 P2-§3.5 之前仍然是最高优先的补强对象。

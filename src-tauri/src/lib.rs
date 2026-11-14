@@ -37,9 +37,30 @@ static INFER_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 /// ensure_infer_venv（pip 安装），串行化避免同一 venv 并发写入损坏。
 static INFER_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// 取「子进程槽」的互斥锁。
+///
+/// std 的互斥锁在持锁线程 panic 后会永久中毒，之后每次 lock() 都返回 Err。
+/// 这里槽里存的是一个 Option<Child>，中毒不影响数据正确性，故直接取回内部值继续用；
+/// 若在此处 unwrap，一旦某次 panic，后续「关窗/托盘退出杀后端」就全部失效，
+/// 留下占着 9178 端口的残留进程。
+fn child_slot(slot: &'static OnceLock<Mutex<Option<Child>>>) -> std::sync::MutexGuard<'static, Option<Child>> {
+  slot
+    .get_or_init(|| Mutex::new(None))
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 取「推理服务启动流程」的互斥锁。仅用于串行化，中毒同样不影响正确性。
+fn infer_start_guard() -> std::sync::MutexGuard<'static, ()> {
+  INFER_START_LOCK
+    .get_or_init(|| Mutex::new(()))
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
+  let app_built = tauri::Builder::default()
     .plugin(tauri_plugin_opener::init())
     .invoke_handler(tauri::generate_handler![
       infer_start,
@@ -84,7 +105,7 @@ pub fn run() {
           app
             .default_window_icon()
             .cloned()
-            .expect("默认窗口图标缺失"),
+            .ok_or("默认窗口图标缺失，无法创建托盘图标")?,
         )
         .tooltip("BeiWay-MoeVault")
         .on_tray_icon_event(|tray, event| {
@@ -125,8 +146,7 @@ pub fn run() {
           }
           _ => {}
         })
-        .build(app)
-        .expect("托盘图标创建失败");
+        .build(app)?;
       std::mem::forget(_tray); // 防止 drop 移除托盘图标
 
       // Windows 原生拖放：注册 IDropTarget（详见 drag_drop.rs 顶部说明）。
@@ -141,15 +161,16 @@ pub fn run() {
       match start_backend() {
         Ok(child) => {
           // 持有子进程句柄（全局）：托盘退出/应用退出时确保杀掉后端，避免残留占端口
-          let slot = BACKEND_CHILD.get_or_init(|| Mutex::new(None));
-          *slot.lock().unwrap() = Some(child);
+          *child_slot(&BACKEND_CHILD) = Some(child);
           // 后台等待后端就绪
           let handle = app.handle().clone();
           thread::spawn(move || {
             wait_for_backend();
             // 加载后端 URL
             if let Some(window) = handle.get_webview_window("main") {
-              let _ = window.navigate(BACKEND_URL.parse().unwrap());
+              if let Ok(url) = BACKEND_URL.parse() {
+                let _ = window.navigate(url);
+              }
             }
           });
         }
@@ -165,8 +186,7 @@ pub fn run() {
         match start_infer() {
           Ok(child) => {
             if let Some(child) = child {
-              let slot = INFER_CHILD.get_or_init(|| Mutex::new(None));
-              *slot.lock().unwrap() = Some(child);
+              *child_slot(&INFER_CHILD) = Some(child);
             }
             // 后台等待推理服务就绪（仅记录日志，不阻塞窗口）
             wait_for_infer();
@@ -178,9 +198,17 @@ pub fn run() {
       });
       Ok(())
     })
-    .build(tauri::generate_context!())
-    .expect("error while building tauri application")
-    .run(|_app_handle, event| {
+    .build(tauri::generate_context!());
+  // 这里已是进程入口的最外层：事件循环建不起来就无法继续，
+  // 但用 exit 而不是 panic，避免用户在无控制台时只看到「闪一下」而无任何线索。
+  let app = match app_built {
+    Ok(app) => app,
+    Err(e) => {
+      eprintln!("[MoeVault] 桌面壳初始化失败，无法创建事件循环: {e}");
+      std::process::exit(1);
+    }
+  };
+  app.run(|_app_handle, event| {
       // 应用退出（任何路径：托盘退出/窗口关闭/系统关机）
       if let RunEvent::Exit = event {
         // 增强1：BUG追踪器——退出前请求后端转储日志（后端仍在运行）
@@ -210,21 +238,17 @@ fn dump_logs_on_exit() {
 
 /// 杀掉后端子进程（托盘退出/应用退出时调用，避免残留占 9178 端口）。
 fn kill_backend() {
-    if let Some(slot) = BACKEND_CHILD.get() {
-        if let Some(mut child) = slot.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    if let Some(mut child) = child_slot(&BACKEND_CHILD).take() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
 /// 杀掉推理服务子进程（应用退出时调用，避免残留占 8001 端口）。
 fn kill_infer() {
-    if let Some(slot) = INFER_CHILD.get() {
-        if let Some(mut child) = slot.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    if let Some(mut child) = child_slot(&INFER_CHILD).take() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -232,8 +256,9 @@ fn kill_infer() {
 /// 后端未就绪/读取失败时返回 false（正常退出，避免意外隐藏窗口）。
 fn read_close_to_tray_setting() -> bool {
   use std::io::{Read, Write};
+  let addr = std::net::SocketAddr::from(([127, 0, 0, 1], BACKEND_PORT));
   if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-    &format!("127.0.0.1:{BACKEND_PORT}").parse().unwrap(),
+    &addr,
     std::time::Duration::from_millis(500),
   ) {
     let _ = stream.write_all(
@@ -373,10 +398,8 @@ fn wait_for_backend() {
 
 /// 检查后端 /health 是否返回 200。
 fn backend_healthy() -> bool {
-  match std::net::TcpStream::connect_timeout(
-    &format!("127.0.0.1:{BACKEND_PORT}").parse().unwrap(),
-    Duration::from_millis(150),
-  ) {
+  let addr = std::net::SocketAddr::from(([127, 0, 0, 1], BACKEND_PORT));
+  match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)) {
     Ok(mut stream) => {
       use std::io::Write;
       // 发送 HTTP 请求并读取响应头，确认 200
@@ -399,10 +422,8 @@ fn backend_healthy() -> bool {
 
 /// 检查推理服务 /health 是否返回 200（TCP 直连 8001）。
 fn infer_healthy() -> bool {
-  match std::net::TcpStream::connect_timeout(
-    &format!("127.0.0.1:{INFER_PORT}").parse().unwrap(),
-    Duration::from_millis(150),
-  ) {
+  let addr = std::net::SocketAddr::from(([127, 0, 0, 1], INFER_PORT));
+  match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)) {
     Ok(mut stream) => {
       use std::io::Write;
       let _ = stream.write_all(
@@ -819,10 +840,7 @@ fn ensure_infer_venv() -> Result<PathBuf, String> {
 /// 使用 CREATE_NO_WINDOW 隐藏控制台；日志写 <runtime>/infer.log
 fn start_infer() -> std::io::Result<Option<Child>> {
   // 全流程互斥：避免 setup 后台线程与「启动服务」/「一键安装」并发安装依赖或重复 spawn
-  let _guard = INFER_START_LOCK
-    .get_or_init(|| Mutex::new(()))
-    .lock()
-    .unwrap();
+  let _guard = infer_start_guard();
   if infer_healthy() {
     // 已有一个实例在 8001：确认它是否用 venv python（GPU torch / 正确依赖）。
     // 若是系统 Python 的旧实例（如用户手动部署 GPU 前残留），杀掉后用 venv 重启，
@@ -949,18 +967,15 @@ fn wait_for_infer() {
 #[tauri::command]
 fn infer_start() -> Result<String, String> {
   // 已有子进程句柄（壳已拉起）或外部实例健康 → 已在运行
-  if let Some(slot) = INFER_CHILD.get() {
-    if slot.lock().unwrap().is_some() {
-      return Ok("推理服务已在运行".into());
-    }
+  if INFER_CHILD.get().is_some() && child_slot(&INFER_CHILD).is_some() {
+    return Ok("推理服务已在运行".into());
   }
   if infer_healthy() {
     return Ok("推理服务已在运行（外部实例）".into());
   }
   match start_infer() {
     Ok(Some(child)) => {
-      let slot = INFER_CHILD.get_or_init(|| Mutex::new(None));
-      *slot.lock().unwrap() = Some(child);
+      *child_slot(&INFER_CHILD) = Some(child);
       Ok("推理服务启动中…".into())
     }
     Ok(None) => Ok("推理服务已在运行（外部实例）".into()),
@@ -979,10 +994,7 @@ fn infer_stop() -> Result<(), String> {
 /// 未运行时附带关键依赖缺失列表（供设置页显示"一键安装"入口）。
 #[tauri::command]
 fn infer_status() -> Result<serde_json::Value, String> {
-  let owned = INFER_CHILD
-    .get()
-    .map(|s| s.lock().unwrap().is_some())
-    .unwrap_or(false);
+  let owned = INFER_CHILD.get().is_some() && child_slot(&INFER_CHILD).is_some();
   let running = infer_healthy();
   let deps_missing: Vec<String> = if running {
     Vec::new()
@@ -1002,10 +1014,7 @@ fn infer_status() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn infer_install_deps() -> Result<String, String> {
   // 与 start_infer 共用同一把锁：避免与 setup 后台自动安装并发写 venv
-  let _guard = INFER_START_LOCK
-    .get_or_init(|| Mutex::new(()))
-    .lock()
-    .unwrap();
+  let _guard = infer_start_guard();
   let venv = ensure_infer_venv()?;
   Ok(format!("推理依赖已就绪（{}），可启动服务", venv.display()))
 }

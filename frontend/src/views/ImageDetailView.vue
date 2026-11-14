@@ -3,13 +3,17 @@ import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { ArrowDown, ArrowRight, ArrowLeft } from '@element-plus/icons-vue'
-import { displayTagName, searchTagKey } from '@/utils/tagNormalize'
+import { displayTagName } from '@/utils/tagNormalize'
 import { useLibraryStore, originalUrl } from '@/stores/library'
 import { findScrollContainer } from '@/utils/scrollTarget'
 import { useTaskStore } from '@/stores/tasks'
 import { useSettingsStore } from '@/stores/settings'
 import { get, post, put, del } from '@/api/client'
 import { reportLog } from '@/api/log'
+import { fmtBytes } from '@/utils/format'
+import { groupTags, TAG_GROUP_DEFS, type DetailTag } from '@/constants/tagGroups'
+import TagEditPanel from '@/components/detail/TagEditPanel.vue'
+import SauceCompareDialog from '@/components/detail/SauceCompareDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -18,7 +22,7 @@ const taskStore = useTaskStore()
 const settingsStore = useSettingsStore()
 
 const image = computed(() => library.images.find((i) => i.id === Number(route.params.id)))
-const tags = ref<Array<{ tag_id: number; name: string; name_cn: string | null; category: string; source: string; image_count: number }>>([])
+const tags = ref<DetailTag[]>([])
 const aiInfo = ref<string | null>(null)
 const aiTags = ref<string[]>([])
 const aiChecked = ref(false)
@@ -127,30 +131,11 @@ function preloadAround() {
   }
 }
 
-// E3: 标签按 danbooru 分类（画师/系列/角色/常规），按后端 category 字段分组
-const tagGroups = computed(() => {
-  const groups: Record<'artist' | 'copyright' | 'character' | 'general', typeof tags.value> = {
-    artist: [],
-    copyright: [],
-    character: [],
-    general: [],
-  }
-  for (const t of tags.value) {
-    const cat = t.category
-    if (cat === 'artist') groups.artist.push(t)
-    else if (cat === 'copyright') groups.copyright.push(t)
-    else if (cat === 'character') groups.character.push(t)
-    else groups.general.push(t)
-  }
-  return groups
-})
-type TagGroupKey = 'artist' | 'copyright' | 'character' | 'general'
-const tagGroupDefs: Array<{ key: TagGroupKey; label: string; type: 'danger' | 'warning' | 'success' | 'primary' }> = [
-  { key: 'artist', label: '画师', type: 'danger' },
-  { key: 'copyright', label: '系列', type: 'warning' },
-  { key: 'character', label: '角色', type: 'success' },
-  { key: 'general', label: '常规', type: 'primary' },
-]
+// E3: 标签按 danbooru 分类（画师/系列/角色/常规）。
+// 分组口径由 constants/tagGroups.ts 统一提供，标签编辑弹窗与本页共用一份，
+// 避免两处各自维护分类规则后逐渐漂移。
+const tagGroups = computed(() => groupTags(tags.value))
+const tagGroupDefs = TAG_GROUP_DEFS
 const hasAnyTags = computed(() => tags.value.length > 0)
 
 /** 增强2：有序导航 id 列表——浏览上下文（来源目录组/筛选结果/搜索结果）优先，
@@ -695,308 +680,40 @@ async function openSourceUrl(url: string) {
   window.open(url, '_blank', 'noopener')
 }
 
-// ---- 对比原图（图库图 vs 网络原图） ----
+// ---- 对比原图 / 标签编辑：已拆分为独立组件 ----
+// 对比原图弹窗 → components/detail/SauceCompareDialog.vue
+// 标签编辑（含原始文本） → components/detail/TagEditPanel.vue
+// 两者通过 v-model + 事件与父组件协作，父组件只保留「开关状态」与「保存后刷新」。
+/** 对比原图弹窗开关（内容见 SauceCompareDialog）。 */
 const compareVisible = ref(false)
-const compareLoading = ref(false)
-const netInfo = ref<{
-  width: number | null
-  height: number | null
-  size_bytes: number | null
-  file_url: string | null
-} | null>(null)
+/** 标签编辑弹窗开关（内容见 TagEditPanel）。 */
+const editDialogVisible = ref(false)
 
-async function openCompare() {
+function openCompare() {
   if (!image.value) return
   compareVisible.value = true
-  compareLoading.value = true
-  netInfo.value = null
-  netImgOk.value = false
-  compareError.value = ''
-  try {
-    const r = await get<{
-      ok: boolean
-      page_url: string
-      info: { width: number | null; height: number | null; size_bytes: number | null; file_url: string | null }
-    }>(`/images/${image.value.id}/source-info`)
-    netInfo.value = r.info
-    // 信息为空 → 明确提示（源站不可达 / 域名未收录），而非静默空白
-    if (!r.info.file_url && !r.info.width && !r.info.size_bytes) {
-      compareError.value = `无法获取网络图信息：源站（${r.page_url || '未知'}）不可达或域名未收录`
-    }
-  } catch (e) {
-    compareError.value = (e as Error).message
-  } finally {
-    compareLoading.value = false
-  }
-}
-/** 对比原图错误提示（信息为空时显示）。 */
-const compareError = ref('')
-/** 网络原图是否加载成功（原生 img @load/@error）。 */
-const netImgOk = ref(false)
-
-/** 网络图经后端代理加载（绕开 WebView2 网络栈差异 + 防盗链）。 */
-function proxyUrl(url: string | null): string | undefined {
-  if (!url) return undefined
-  return `/api/v1/proxy-image?url=${encodeURIComponent(url)}`
 }
 
-/** 红绿白：红=网络大，绿=库大，白=相等；null 无法比较 → 灰。 */
-function cmpColor(local: number | null | undefined, net: number | null | undefined): string {
-  if (net == null || local == null) return ''
-  if (net > local) return 'cmp-red'
-  if (net < local) return 'cmp-green'
-  return 'cmp-white'
-}
-const localPixels = computed(() => (image.value ? image.value.width * image.value.height : null))
-const netPixels = computed(() =>
-  netInfo.value?.width && netInfo.value.height ? netInfo.value.width * netInfo.value.height : null,
-)
-const sizeColor = computed(() => cmpColor(image.value?.sizeBytes ?? null, netInfo.value?.size_bytes))
-const pxColor = computed(() => cmpColor(localPixels.value, netPixels.value))
-
-async function keepNetwork() {
-  if (!image.value || !netInfo.value?.file_url) return
-  try {
-    await ElMessageBox.confirm(
-      '下载网络原图替换库内图片？\n标签/评分/来源链接保留，旧文件将被删除。',
-      '保留网络原图',
-      { type: 'warning', confirmButtonText: '替换', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  try {
-    await post(`/images/${image.value.id}/replace-from-url`, { url: netInfo.value.file_url })
-    // 改进3：替换后彻底刷新——更新库列表 + 详情 + 强制绕过浏览器图片缓存（URL 加时间戳）
-    await library.fetchImages(500)
-    await loadDetail()
-    prevSrc.value = originalSrc.value
-    imgLoaded.value = false
-    cacheBust.value++
-    compareVisible.value = false
-    ElMessage.success('已用网络原图替换库内图片')
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
+function openEditDialog() {
+  editDialogVisible.value = true
 }
 
-// ---- 标签编辑模式 ----
-const editMode = ref(false)
-interface TagEdit {
-  original: string
-  tagId: number
-  newName?: string
-  deleted?: boolean
-  /** 文本是否有有效修改（一个字没动不算） */
-  dirty: boolean
-}
-const tagEdits = ref<Record<string, TagEdit>>({})
-/** 正在编辑（显示输入框）的标签名。 */
-const editingName = ref<string | null>(null)
-/** 新增标签（分类 → 临时新标签列表；key 用自增 id）。 */
-interface NewTag {
-  key: number
-  category: string
-  value: string
-}
-const newTags = ref<NewTag[]>([])
-let newTagSeq = 0
-
-function enterEditMode() {
-  editMode.value = true
-  tagEdits.value = {}
-  newTags.value = []
-  for (const t of tags.value) tagEdits.value[t.name] = { original: t.name, tagId: t.tag_id, dirty: false }
-}
-function exitEditMode() {
-  editMode.value = false
-  tagEdits.value = {}
-  newTags.value = []
-  editingName.value = null
-}
-/** 点 ×：划掉（待删除），再点恢复。 */
-function toggleTagDelete(name: string) {
-  const e = tagEdits.value[name]
-  if (e) e.deleted = !e.deleted
-}
-/** 点标签本体：进入编辑（显示输入框，自动聚焦）。 */
-function startEditTag(name: string) {
-  if (!editMode.value) return
-  editingName.value = name
-  // 初始化输入缓冲为当前显示值
-  const e = tagEdits.value[name]
-  editBuffer.value = e?.newName ?? name
-}
-/** 编辑输入缓冲（v-model 双向绑定）。 */
-const editBuffer = ref('')
-/** 失焦/回车：提交缓冲到 tagEdits（有效修改才标记 dirty）。 */
-function commitEditTag(name: string) {
-  if (!editMode.value || editingName.value !== name) return
-  const e = tagEdits.value[name]
-  if (e) {
-    const trimmed = editBuffer.value.trim()
-    const valid = trimmed !== '' && trimmed !== name
-    e.dirty = valid
-    e.newName = valid ? trimmed : undefined
-  }
-  editingName.value = null
-}
-/** 输入变更：有效修改（≠原名且非空）标记 dirty。 */
-function applyTagEdit(name: string, newName: string) {
-  const e = tagEdits.value[name]
-  if (!e) return
-  const trimmed = newName.trim()
-  const valid = trimmed !== '' && trimmed !== name
-  e.dirty = valid
-  e.newName = valid ? trimmed : undefined
-}
-/** 失焦/回车：退出当前编辑。 */
-function stopEditTag(name: string) {
-  commitEditTag(name)
-}
-/** 新增标签：点蓝色 + 号，加入该分类的空标签输入框。 */
-function addNewTag(category: string) {
-  const key = ++newTagSeq
-  newTags.value.push({ key, category, value: '' })
-  editingNewKey.value = key
-}
-/** 正在输入的新增标签 key。 */
-const editingNewKey = ref<number | null>(null)
-/** 新增标签输入缓冲。 */
-const newTagBuffer = ref('')
-function startNewTagEdit(key: number) {
-  editingNewKey.value = key
-  const t = newTags.value.find((x) => x.key === key)
-  newTagBuffer.value = t?.value ?? ''
-}
-/** 失焦/回车：提交缓冲到新标签，保留非空内容。 */
-function commitNewTagEdit(key: number) {
-  const t = newTags.value.find((x) => x.key === key)
-  if (t) t.value = newTagBuffer.value.trim()
-  editingNewKey.value = null
-}
-function removeNewTag(key: number) {
-  newTags.value = newTags.value.filter((x) => x.key !== key)
-}
-function newTagsOf(category: string): NewTag[] {
-  return newTags.value.filter((x) => x.category === category)
-}
-/** 生效修改：一次性提交删除 + 重命名 + 新增（仅本图；空白新增自动丢弃）。 */
-async function applyTagChanges() {
-  if (!image.value) return
-  const id = image.value.id
-  let ok = 0
-  try {
-    for (const e of Object.values(tagEdits.value)) {
-      if (e.deleted) {
-        await del(`/images/${id}/tags/${e.tagId}`)
-        ok++
-      } else if (e.dirty && e.newName) {
-        // 仅本图重命名 = 删旧标签 + 添加新文本标签
-        await del(`/images/${id}/tags/${e.tagId}`)
-        await post(`/images/${id}/tags`, { name: e.newName, category: 'general' })
-        ok++
-      }
-    }
-    // 新增标签：空白自动丢弃
-    for (const t of newTags.value) {
-      const name = t.value.trim()
-      if (!name) continue
-      await post(`/images/${id}/tags`, { name, category: t.category })
-      ok++
-    }
-    ElMessage.success(`已生效 ${ok} 项修改`)
-    exitEditMode()
-    editDialogVisible.value = false
-    await loadDetail()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
+/** 替换网络原图后：刷新库列表与详情，并绕过浏览器图片缓存。 */
+async function onCompareReplaced() {
+  await library.fetchImages(500)
+  await loadDetail()
+  prevSrc.value = originalSrc.value
+  imgLoaded.value = false
+  cacheBust.value++
 }
 
 // ---- 增强2：标签栏（左栏 danbooru 风格）----
-/** 修改标签二级窗口。 */
-const editDialogVisible = ref(false)
 /** 标签栏折叠状态（增强1：整栏收起；增强2：localStorage 持久化）。 */
 const tagPanelCollapsed = ref(localStorage.getItem('moevault-detail-tag-collapsed') === '1')
 /** 基本信息栏折叠状态（增强1：整栏收起；增强2：localStorage 持久化）。 */
 const infoPanelCollapsed = ref(localStorage.getItem('moevault-detail-info-collapsed') === '1')
 watch(tagPanelCollapsed, (v) => localStorage.setItem('moevault-detail-tag-collapsed', v ? '1' : '0'))
 watch(infoPanelCollapsed, (v) => localStorage.setItem('moevault-detail-info-collapsed', v ? '1' : '0'))
-
-function openEditDialog() {
-  enterEditMode()
-  editDialogVisible.value = true
-}
-
-// ---- 追加增强1：修改原始标签文本（三级窗口）----
-const rawTagsVisible = ref(false)
-const rawTagsText = ref('')
-
-/** 生成当前标签的原始文本（画师名,\n角色名,\n作品名,\n常规1,常规2,…，显示用空格形式）。 */
-function buildRawTagsText(): string {
-  const lines: string[] = []
-  for (const g of tagGroupDefs) {
-    const list = tagGroups.value[g.key]
-    if (list.length === 0) continue
-    lines.push(`${list.map((t) => displayTagName(t.name)).join(',')},`)
-  }
-  return lines.join('\n')
-}
-
-function openRawTagsDialog() {
-  rawTagsText.value = buildRawTagsText()
-  rawTagsVisible.value = true
-}
-
-/** 解析原始文本（每行逗号分隔）→ 分类标签。返回失败信息或 null。 */
-function parseRawTags(text: string): Array<{ name: string; category: string }> | string {
-  const out: Array<{ name: string; category: string }> = []
-  const cats: Record<string, string> = { 画师: 'artist', 角色: 'character', 作品: 'copyright', 常规: 'general' }
-  const lines = text.split('\n')
-  for (const raw of lines) {
-    const line = raw.trim()
-    if (!line) continue
-    // 支持「画师: xxx」或裸行；行尾逗号可忽略
-    const content = line.replace(/,$/, '')
-    const catMatch = content.match(/^(画师|角色|作品|常规)\s*[:：]\s*(.*)$/)
-    const items = catMatch ? catMatch[2].split(',') : content.split(',')
-    const cat = catMatch ? cats[catMatch[1]] : 'general'
-    for (const it of items) {
-      const name = it.trim()
-      if (name) out.push({ name, category: cat })
-    }
-  }
-  return out
-}
-
-/** 生效：删除全部旧标签，按解析结果重建（保留来源 manual）。 */
-async function applyRawTags() {
-  if (!image.value) return
-  const id = image.value.id
-  const parsed = parseRawTags(rawTagsText.value)
-  if (typeof parsed === 'string') {
-    ElMessage.error(parsed)
-    return
-  }
-  try {
-    // 删旧
-    for (const t of tags.value) {
-      await del(`/images/${id}/tags/${t.tag_id}`)
-    }
-    // 建新（按分类；BUG1：空格输入归一化为下划线规范名）
-    for (const p of parsed) {
-      await post(`/images/${id}/tags`, { name: searchTagKey(p.name), category: p.category })
-    }
-    ElMessage.success(`已重建 ${parsed.length} 个标签`)
-    rawTagsVisible.value = false
-    exitEditMode()
-    editDialogVisible.value = false
-    await loadDetail()
-  } catch (e) {
-    ElMessage.error((e as Error).message)
-  }
-}
 
 /** 点标签 → 跳到图库页并只搜索该标签。 */
 function jumpTag(name: string) {
@@ -1036,13 +753,6 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
 })
 
-/** 文件大小格式化。 */
-function fmtBytes(b: number): string {
-  if (b >= 1 << 30) return `${(b / (1 << 30)).toFixed(2)} GB`
-  if (b >= 1 << 20) return `${(b / (1 << 20)).toFixed(1)} MB`
-  if (b >= 1 << 10) return `${(b / (1 << 10)).toFixed(0)} KB`
-  return `${b} B`
-}
 </script>
 
 <template>
@@ -1223,139 +933,24 @@ function fmtBytes(b: number): string {
     </div>
   </div>
 
-  <!-- 对比原图弹窗：左=图库图，右=网络原图；红=网络大 绿=库大 白=相等 -->
-  <el-dialog v-model="compareVisible" title="对比原图" width="900px" :append-to-body="true">
-    <div v-loading="compareLoading" class="compare-body">
-      <div class="compare-side">
-        <div class="compare-side-title">图库原图</div>
-        <el-image :src="originalSrc" fit="contain" class="compare-img" />
-        <div class="compare-meta">
-          <div :class="pxColor">分辨率：{{ image?.width }} × {{ image?.height }}</div>
-          <div :class="sizeColor">文件大小：{{ fmtBytes(image?.sizeBytes ?? 0) }}</div>
-        </div>
-      </div>
-      <div class="compare-divider">vs</div>
-      <div class="compare-side">
-        <div class="compare-side-title">网络原图</div>
-        <template v-if="netInfo">
-          <img
-            v-if="netInfo.file_url"
-            :src="proxyUrl(netInfo.file_url)"
-            class="compare-img compare-img-native"
-            alt="网络原图"
-            @load="netImgOk = true"
-            @error="netImgOk = false"
-          />
-          <div v-if="netInfo.file_url && !netImgOk" class="compare-img placeholder-name">网络图加载失败</div>
-          <div v-else-if="!netInfo.file_url" class="compare-img placeholder-name">无网络图链接</div>
-          <div class="compare-meta">
-            <div :class="pxColor">
-              分辨率：{{ netInfo.width && netInfo.height ? `${netInfo.width} × ${netInfo.height}` : '未知' }}
-            </div>
-            <div :class="sizeColor">
-              文件大小：{{ netInfo.size_bytes != null ? fmtBytes(netInfo.size_bytes) : '未知' }}
-            </div>
-          </div>
-        </template>
-        <el-empty v-else-if="!compareLoading && !compareError" description="无法获取网络图信息" :image-size="50" />
-        <el-empty v-else-if="!compareLoading && compareError" :description="compareError" :image-size="50" />
-      </div>
-    </div>
-    <template #footer>
-      <span class="hint" style="margin-right: auto">红色=网络图更大 绿色=图库图更大 白色=相等</span>
-      <el-button @click="compareVisible = false">保留图库原图</el-button>
-      <el-button type="primary" :disabled="!netInfo?.file_url" @click="keepNetwork">保留网络原图</el-button>
-    </template>
-  </el-dialog>
+  <!-- 对比原图弹窗（已拆分为独立组件：拉取源站信息 + 左右对比 + 替换） -->
+  <SauceCompareDialog
+    v-model="compareVisible"
+    :image-id="image?.id ?? null"
+    :width="image?.width ?? null"
+    :height="image?.height ?? null"
+    :size-bytes="image?.sizeBytes ?? null"
+    :original-src="originalSrc"
+    @replaced="onCompareReplaced"
+  />
 
-  <!-- 增强2：修改标签二级窗口（复用原标签编辑模式逻辑） -->
-  <el-dialog v-model="editDialogVisible" title="修改标签" width="560px" append-to-body @closed="exitEditMode">
-    <div class="edit-hint">点标签编辑文本 · ×划掉删除（再点恢复） · 改字后出现↻还原文本</div>
-    <!-- 追加增强1：修改原始标签文本入口 -->
-    <div class="edit-hint">
-      <el-button size="small" text type="primary" @click="openRawTagsDialog">修改原始标签文本…</el-button>
-    </div>
-    <div class="tag-groups">
-      <div v-for="g in tagGroupDefs" :key="g.key" class="tag-group">
-        <!-- 追加BUG2：空分类也显示 + 号，允许新增任意分类标签 -->
-        <span class="tag-group-label">
-          {{ g.label }}
-          <span class="tag-add" title="新增标签" @click="addNewTag(g.key)">＋</span>
-        </span>
-        <template v-for="t in tagGroups[g.key as keyof typeof tagGroups]" :key="t.name">
-          <el-input
-            v-if="editingName === t.name"
-            v-model="editBuffer"
-            size="small"
-            class="tag-edit-input"
-            autofocus
-            @blur="stopEditTag(t.name)"
-            @keyup.enter="stopEditTag(t.name)"
-          />
-          <span
-            v-else
-            class="tag-edit"
-            :class="{ deleted: tagEdits[t.name]?.deleted }"
-            @click="startEditTag(t.name)"
-          >
-            {{ tagEdits[t.name]?.newName ?? (t.name_cn ? `${t.name}(${t.name_cn})` : t.name) }}
-            <span
-              v-if="tagEdits[t.name]?.dirty && !tagEdits[t.name]?.deleted"
-              class="tag-revert"
-              title="还原文本（不还原删除状态）"
-              @click.stop="applyTagEdit(t.name, t.name)"
-            >↻</span>
-            <span
-              class="tag-del"
-              :class="{ armed: tagEdits[t.name]?.deleted }"
-              :title="tagEdits[t.name]?.deleted ? '再点恢复' : '标记删除'"
-              @click.stop="toggleTagDelete(t.name)"
-            >✕</span>
-          </span>
-        </template>
-        <template v-for="nt in newTagsOf(g.key)" :key="nt.key">
-          <el-input
-            v-if="editingNewKey === nt.key"
-            v-model="newTagBuffer"
-            size="small"
-            class="tag-edit-input"
-            autofocus
-            placeholder="输入新标签…"
-            @blur="commitNewTagEdit(nt.key)"
-            @keyup.enter="commitNewTagEdit(nt.key)"
-          />
-          <span
-            v-else
-            class="tag-edit"
-            :class="{ 'new-tag': true }"
-            @click="startNewTagEdit(nt.key)"
-          >
-            {{ nt.value || '（空）' }}
-            <span class="tag-del" @click.stop="removeNewTag(nt.key)">✕</span>
-          </span>
-        </template>
-      </div>
-    </div>
-    <template #footer>
-      <el-button @click="editDialogVisible = false">取消</el-button>
-      <el-button type="success" @click="applyTagChanges">生效修改</el-button>
-    </template>
-  </el-dialog>
-
-  <!-- 追加增强1：修改原始标签文本（三级窗口） -->
-  <el-dialog v-model="rawTagsVisible" title="修改原始标签文本" width="480px" append-to-body>
-    <div class="edit-hint">每行一个分类，行内逗号分隔，行尾逗号可省略</div>
-    <el-input
-      v-model="rawTagsText"
-      type="textarea"
-      :rows="10"
-      placeholder="画师名,&#10;角色名,&#10;作品名,&#10;常规标签1,常规标签2,常规标签3,常规标签4,"
-    />
-    <template #footer>
-      <el-button @click="rawTagsVisible = false">取消</el-button>
-      <el-button type="success" @click="applyRawTags">生效</el-button>
-    </template>
-  </el-dialog>
+  <!-- 标签编辑弹窗（已拆分为独立组件：编辑状态机 + 原始文本重建） -->
+  <TagEditPanel
+    v-model="editDialogVisible"
+    :image-id="image?.id ?? null"
+    :tags="tags"
+    @saved="loadDetail()"
+  />
   <el-empty v-if="!image" description="图片不存在或已删除" />
 </template>
 
@@ -1710,29 +1305,6 @@ function fmtBytes(b: number): string {
   flex-wrap: wrap;
   gap: 6px;
 }
-.edit-hint {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin: 0 0 8px;
-  line-height: 1.5;
-}
-.tag-groups {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.tag-group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
-.tag-group-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--el-text-color-secondary);
-  margin-right: 2px;
-}
 .ai-info {
   margin-top: 8px;
   padding: 8px;
@@ -1745,151 +1317,10 @@ function fmtBytes(b: number): string {
   overflow-y: auto;
 }
 
-/* 改进2：标签编辑模式 */
-.tag-edit {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  margin: 1px 3px 1px 0;
-  padding: 1px 5px;
-  border: 1px dashed var(--el-border-color);
-  border-radius: 6px;
-  background: var(--el-fill-color-light);
-  cursor: text;
-  font-size: 12px;
-  line-height: 20px;
-  height: 22px;
-  transition: opacity 0.15s;
-  user-select: none;
-  max-width: 100%;
-}
-.tag-edit:hover {
-  border-color: var(--el-color-primary);
-}
-.tag-edit.deleted {
-  opacity: 0.45;
-  text-decoration: line-through;
-}
-.tag-edit-input {
-  width: 110px;
-  margin: 1px 3px 1px 0;
-}
-.tag-edit-input :deep(.el-input__wrapper) {
-  box-shadow: none;
-  padding: 0 6px;
-  min-height: 24px;
-}
-.tag-add {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  margin-left: 4px;
-  border-radius: 50%;
-  color: #fff;
-  background: var(--el-color-primary);
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
-  vertical-align: middle;
-  user-select: none;
-}
-.tag-add:hover {
-  opacity: 0.85;
-}
-.tag-del {
-  cursor: pointer;
-  color: var(--el-color-danger);
-  font-size: 12px;
-  line-height: 1;
-  padding: 2px;
-  border-radius: 4px;
-  user-select: none;
-}
-.tag-del:hover {
-  background: var(--el-color-danger-light-7);
-}
-.tag-del.armed {
-  color: #fff;
-  background: var(--el-color-danger);
-}
-.tag-revert {
-  cursor: pointer;
-  color: var(--el-color-warning);
-  font-size: 14px;
-  line-height: 1;
-  padding: 2px;
-  border-radius: 4px;
-  user-select: none;
-}
-.tag-revert:hover {
-  background: var(--el-color-warning-light-7);
-}
-.hint {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-left: 8px;
-}
 
-/* 改进1：对比原图弹窗 */
+/* 文件名（右栏信息）：长文件名换行不溢出 */
 .file-name {
   word-break: break-all;
 }
-.compare-body {
-  display: flex;
-  align-items: stretch;
-  gap: 16px;
-  min-height: 300px;
-}
-.compare-side {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.compare-side-title {
-  text-align: center;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-.compare-img {
-  flex: 1;
-  min-height: 240px;
-  background: var(--el-fill-color-light);
-  border-radius: 6px;
-}
-.compare-img-native {
-  width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-}
-.compare-img :deep(.el-image__inner) {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-}
-.compare-divider {
-  align-self: center;
-  font-weight: 700;
-  color: var(--el-text-color-secondary);
-}
-.compare-meta {
-  margin-top: 8px;
-  font-size: 13px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.cmp-red {
-  color: var(--el-color-danger);
-  font-weight: 600;
-}
-.cmp-green {
-  color: var(--el-color-success);
-  font-weight: 600;
-}
-.cmp-white {
-  color: var(--el-text-color-primary);
-}
+
 </style>

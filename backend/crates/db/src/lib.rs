@@ -7,7 +7,7 @@
 mod migration;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use moevault_core::models::{
     DedupGroupDetail, DedupGroupSummary, DedupStats, GroupMember, Image, ImageFilter,
@@ -67,9 +67,15 @@ pub struct AppLog {
 }
 
 /// SQLite 数据库封装。单连接 + Mutex：SQLite 写串行化，WAL 下读并发足够。
+///
+/// 互斥锁用 parking_lot::Mutex 而非 std::sync::Mutex：
+/// 后者在持锁线程 panic 后会进入「中毒」状态，此后每一次 lock() 都返回 Err ——
+/// 一个请求里的 unwrap() panic 会连锁成整个数据库层不可用，而进程还活着
+/// （表现为「界面能点、所有数据都是空的」）。parking_lot 没有中毒概念，
+/// 持锁线程 panic 只会释放锁，后续请求照常执行。
 #[derive(Clone)]
 pub struct Db {
-    conn: std::sync::Arc<Mutex<Connection>>,
+    conn: Arc<parking_lot::Mutex<Connection>>,
 }
 
 impl Db {
@@ -86,7 +92,7 @@ impl Db {
         conn.pragma_update(None, "busy_timeout", 5000)?;
 
         let db = Self {
-            conn: std::sync::Arc::new(Mutex::new(conn)),
+            conn: Arc::new(parking_lot::Mutex::new(conn)),
         };
         db.migrate()?;
         Ok(db)
@@ -94,7 +100,7 @@ impl Db {
 
     /// 执行所有未应用的迁移（幂等）。
     pub fn migrate(&self) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         migration::run(&conn)
     }
 
@@ -112,7 +118,7 @@ impl Db {
         limit: i64,
         cursor_id: Option<i64>,
     ) -> Result<(Vec<ImageListItem>, Option<i64>), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 500);
 
         let mut sql = String::from(
@@ -170,7 +176,7 @@ impl Db {
         status: &str,
         filter: &ImageFilter,
     ) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let (conds, params) = build_filter_conds(status, filter);
         let sql = format!("SELECT COUNT(*) FROM images i WHERE {}", conds.join(" AND "));
         let mut stmt = conn.prepare(&sql)?;
@@ -187,7 +193,7 @@ impl Db {
 
     /// 指定状态的图片总数。
     pub fn count_images(&self, status: &str) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM images WHERE status = ?1",
             params![status],
@@ -198,7 +204,7 @@ impl Db {
 
     /// 总览统计。
     pub fn stats(&self) -> Result<Stats, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // 图片总数 = active 图数量（与图库列表口径一致；回收站图单列）
         let total_images =
             conn.query_row("SELECT COUNT(*) FROM images WHERE status = 'active'", [], |r| r.get(0))?;
@@ -248,7 +254,7 @@ impl Db {
 
     /// 创建导入批次，返回新 id。
     pub fn create_import_batch(&self, source_path: &str) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO import_batches (source_path, total, done, failed, duplicate, state, created_at)
              VALUES (?1, 0, 0, 0, 0, 'pending', ?2)",
@@ -267,7 +273,7 @@ impl Db {
         duplicate: i64,
         state: &str,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE import_batches SET total = ?1, done = ?2, failed = ?3, duplicate = ?4, state = ?5
              WHERE id = ?6",
@@ -291,7 +297,7 @@ impl Db {
 
     /// 查询单个批次。
     pub fn get_import_batch(&self, id: i64) -> Result<Option<ImportBatch>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, source_path, total, done, failed, duplicate, state, created_at
              FROM import_batches WHERE id = ?1",
@@ -302,7 +308,7 @@ impl Db {
 
     /// 批次列表（按创建时间倒序）。
     pub fn list_import_batches(&self, limit: i64) -> Result<Vec<ImportBatch>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 200);
         let mut stmt = conn.prepare(
             "SELECT id, source_path, total, done, failed, duplicate, state, created_at
@@ -327,44 +333,11 @@ impl Db {
         tag: Option<&str>,
         ai: Option<&str>,
     ) -> Result<Vec<(String, Vec<ImportDirCount>)>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // 条件：active + 筛选
         let mut conds = vec!["i.status = 'active'".to_string()];
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = sauce {
-            let is_sauced = "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
-            let is_ai = "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
-            match s {
-                "sauced" => conds.push(is_sauced.to_string()),
-                "unsauced" => conds.push(format!("NOT ({is_sauced}) AND NOT ({is_ai}) AND i.no_auto_sauce = 0")),
-                "un-sauced" => conds.push(format!("({is_ai}) OR i.no_auto_sauce = 1")),
-                _ => {}
-            }
-        }
-        if let Some(t) = tag {
-            match t {
-                "tagged" => conds.push(
-                    "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
-                        .to_string(),
-                ),
-                "untagged" => conds.push(
-                    "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
-                        .to_string(),
-                ),
-                "no_need" => conds.push(
-                    "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')"
-                        .to_string(),
-                ),
-                _ => {}
-            }
-        }
-        if let Some(a) = ai {
-            match a {
-                "ai" => conds.push("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '')".to_string()),
-                "not_ai" => conds.push("(i.ai_metadata IS NULL OR i.ai_metadata = '')".to_string()),
-                _ => {}
-            }
-        }
+        // 三组筛选条件与图库、某来源组明细共用同一份实现（见 sauce_tag_ai_conds）
+        conds.extend(sauce_tag_ai_conds(sauce, tag, ai));
         let where_sql = conds.join(" AND ");
         // 按天 + 来源分组统计（日期用本地时区：date(imported_at, 'unixepoch', 'localtime')）
         let sql = format!(
@@ -376,10 +349,8 @@ impl Db {
              GROUP BY day, i.source_dir
              ORDER BY day DESC, cnt DESC"
         );
+        // sauce/tag/ai 三组条件都不带占位符，无需绑定参数
         let mut stmt = conn.prepare(&sql)?;
-        for (i, v) in params.iter().enumerate() {
-            stmt.raw_bind_parameter(i + 1, v.as_ref())?;
-        }
         let mut rows = stmt.raw_query();
         // 聚合为 天 → [来源组]
         let mut days: Vec<(String, Vec<ImportDirCount>)> = Vec::new();
@@ -408,7 +379,7 @@ impl Db {
         limit: i64,
         cursor_id: Option<i64>,
     ) -> Result<(Vec<ImageListItem>, Option<i64>), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 200);
         let mut conds = vec![
             "i.status = 'active'".to_string(),
@@ -420,40 +391,7 @@ impl Db {
             Box::new(source_dir.unwrap_or("").to_string()),
         ];
         // 复用与 tree 相同的筛选
-        if let Some(s) = sauce {
-            let is_sauced = "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
-            let is_ai = "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
-            match s {
-                "sauced" => conds.push(is_sauced.to_string()),
-                "unsauced" => conds.push(format!("NOT ({is_sauced}) AND NOT ({is_ai}) AND i.no_auto_sauce = 0")),
-                "un-sauced" => conds.push(format!("({is_ai}) OR i.no_auto_sauce = 1")),
-                _ => {}
-            }
-        }
-        if let Some(t) = tag {
-            match t {
-                "tagged" => conds.push(
-                    "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
-                        .to_string(),
-                ),
-                "untagged" => conds.push(
-                    "NOT EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))"
-                        .to_string(),
-                ),
-                "no_need" => conds.push(
-                    "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')"
-                        .to_string(),
-                ),
-                _ => {}
-            }
-        }
-        if let Some(a) = ai {
-            match a {
-                "ai" => conds.push("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '')".to_string()),
-                "not_ai" => conds.push("(i.ai_metadata IS NULL OR i.ai_metadata = '')".to_string()),
-                _ => {}
-            }
-        }
+        conds.extend(sauce_tag_ai_conds(sauce, tag, ai));
         // 游标
         let base_param_n = params.len() + 1;
         if let Some(c) = cursor_id {
@@ -494,7 +432,7 @@ impl Db {
 
     /// 判断 md5 是否已存在。
     pub fn md5_exists(&self, md5: &str) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n: i64 = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM images WHERE md5 = ?1)",
             params![md5],
@@ -508,7 +446,7 @@ impl Db {
         if images.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -550,7 +488,7 @@ impl Db {
 
     /// 所有未分组的 active 图片：`(id, phash, clarity)`。
     pub fn unclustered_active_images(&self) -> Result<Vec<(i64, i64, f64)>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, phash, clarity_score FROM images
              WHERE status = 'active' AND dedup_group IS NULL ORDER BY id",
@@ -565,7 +503,7 @@ impl Db {
 
     /// 全部查重组种子：`(group_id, phash_seed)`。
     pub fn cluster_seeds(&self) -> Result<Vec<(i64, i64)>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT id, phash_seed FROM dedup_groups")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
@@ -577,7 +515,7 @@ impl Db {
 
     /// 创建查重组（种子 = 首成员 phash），返回组 id。
     pub fn create_dedup_group(&self, phash: i64, image_id: i64) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO dedup_groups (phash_seed, best_image, state, created_at)
              VALUES (?1, ?2, 'open', ?3)",
@@ -588,7 +526,7 @@ impl Db {
 
     /// 把图片归入查重组。
     pub fn assign_to_group(&self, image_id: i64, group_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET dedup_group = ?2 WHERE id = ?1",
             params![image_id, group_id],
@@ -601,7 +539,7 @@ impl Db {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -619,7 +557,7 @@ impl Db {
 
     /// 清空全部查重结果（全量重建前调用）。
     pub fn clear_dedup(&self) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM dedup_groups", [])?;
         conn.execute(
             "UPDATE images SET dedup_group = NULL, is_redundant = 0",
@@ -630,7 +568,7 @@ impl Db {
 
     /// 全部 active 图片：`(id, phash, clarity)`，按 id 排序。
     pub fn all_active_images(&self) -> Result<Vec<(i64, i64, f64)>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, phash, clarity_score FROM images
              WHERE status = 'active' ORDER BY id",
@@ -648,7 +586,7 @@ impl Db {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "SELECT id, phash, clarity_score FROM images
@@ -669,7 +607,7 @@ impl Db {
 
     /// 组内 active 成员：`(image_id, clarity)`。
     pub fn group_members_active(&self, group_id: i64) -> Result<Vec<(i64, f64)>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, clarity_score FROM images
              WHERE dedup_group = ?1 AND status = 'active' ORDER BY id",
@@ -684,7 +622,7 @@ impl Db {
 
     /// 设置组最优图。
     pub fn set_group_best(&self, group_id: i64, best_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE dedup_groups SET best_image = ?2 WHERE id = ?1",
             params![group_id, best_id],
@@ -694,7 +632,7 @@ impl Db {
 
     /// 设置组状态（open/resolved）。
     pub fn set_group_state(&self, group_id: i64, state: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE dedup_groups SET state = ?2 WHERE id = ?1",
             params![group_id, state],
@@ -704,7 +642,7 @@ impl Db {
 
     /// 解除图片对 dedup_groups.best_image 的引用（purge 前调用，避免 FK 失败）。
     pub fn unset_group_best_ref(&self, image_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE dedup_groups SET best_image = NULL WHERE best_image = ?1",
             params![image_id],
@@ -714,7 +652,7 @@ impl Db {
 
     /// 标记图片为冗余候选。
     pub fn set_redundant(&self, image_id: i64, redundant: bool) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET is_redundant = ?2 WHERE id = ?1",
             params![image_id, redundant as i64],
@@ -724,7 +662,7 @@ impl Db {
 
     /// 设置图片状态。
     pub fn set_status(&self, image_id: i64, status: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET status = ?2 WHERE id = ?1",
             params![image_id, status],
@@ -734,7 +672,7 @@ impl Db {
 
     /// 查重统计。
     pub fn dedup_stats(&self) -> Result<DedupStats, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         Ok(DedupStats {
             group_count: conn.query_row(
                 "SELECT COUNT(*) FROM dedup_groups g
@@ -761,7 +699,7 @@ impl Db {
         limit: i64,
         cursor_id: Option<i64>,
     ) -> Result<(Vec<DedupGroupSummary>, Option<i64>), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 500);
         let mut stmt = conn.prepare(
             "SELECT g.id,
@@ -800,7 +738,7 @@ impl Db {
 
     /// 查重组详情（含成员）。
     pub fn get_dedup_group(&self, id: i64) -> Result<Option<DedupGroupDetail>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let state: Option<String> = conn
             .query_row("SELECT state FROM dedup_groups WHERE id = ?1", params![id], |r| {
                 r.get(0)
@@ -845,7 +783,7 @@ impl Db {
 
     /// 按 id 查询图片（完整行）。
     pub fn get_image_by_id(&self, id: i64) -> Result<Option<Image>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, md5, phash, rel_path, width, height, format, size_bytes, file_mtime,
                     exif_datetime, clarity_score, aesthetic_score, dedup_group, is_redundant,
@@ -891,7 +829,7 @@ impl Db {
         reason: &str,
         original_rel: &str,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO recycle_bin (image_id, reason, original_rel, deleted_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -902,7 +840,7 @@ impl Db {
 
     /// 删除回收站记录（恢复/永久删除时）。
     pub fn delete_recycle_bin(&self, image_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM recycle_bin WHERE image_id = ?1", params![image_id])?;
         Ok(())
     }
@@ -912,7 +850,7 @@ impl Db {
         &self,
         image_id: i64,
     ) -> Result<Option<(String, String, i64)>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT reason, original_rel, deleted_at FROM recycle_bin WHERE image_id = ?1",
             params![image_id],
@@ -928,7 +866,7 @@ impl Db {
         limit: i64,
         cursor_id: Option<i64>,
     ) -> Result<(Vec<RecycledItem>, Option<i64>), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 500);
         let mut stmt = conn.prepare(
             "SELECT i.id, i.rel_path, i.thumb_rel, rb.reason, rb.original_rel, rb.deleted_at
@@ -963,14 +901,14 @@ impl Db {
 
     /// 回收站总数。
     pub fn recycle_bin_count(&self) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row("SELECT COUNT(*) FROM recycle_bin", [], |r| r.get(0))
             .map_err(DbError::from)
     }
 
     /// 永久删除图片行（级联 image_tags）。
     pub fn delete_image_row(&self, image_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM images WHERE id = ?1", params![image_id])?;
         Ok(())
     }
@@ -979,7 +917,7 @@ impl Db {
 
     /// 读取设置项（不存在返回 None）。
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT value FROM settings WHERE key = ?1",
             params![key],
@@ -991,7 +929,7 @@ impl Db {
 
     /// 写入设置项（UPSERT）。
     pub fn put_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1004,7 +942,7 @@ impl Db {
 
     /// 获取或创建标签，返回 tag id。
     pub fn upsert_tag(&self, name: &str, category: &str) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         if let Some(id) = conn
             .query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get(0))
             .optional()?
@@ -1028,7 +966,7 @@ impl Db {
         if tag_ids.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -1045,7 +983,7 @@ impl Db {
 
     /// 图片的标签视图（按来源分组排序）。
     pub fn image_tags(&self, image_id: i64) -> Result<Vec<ImageTagView>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.name, t.name_cn, t.category, REPLACE(it.source, 'auto_', ''), it.confidence,
                     (SELECT COUNT(DISTINCT it2.image_id) FROM image_tags it2 WHERE it2.tag_id = t.id)
@@ -1073,7 +1011,7 @@ impl Db {
 
     /// 图片是否已有自动标签。
     pub fn image_has_auto_tags(&self, image_id: i64) -> Result<bool, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM image_tags
              WHERE image_id = ?1 AND source IN ('auto_danbooru','auto_gelbooru','auto_local')",
@@ -1085,7 +1023,7 @@ impl Db {
 
     /// 单图打标状态。
     pub fn image_tagging_state(&self, image_id: i64) -> Result<TaggingState, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let tags = self.image_tags(image_id)?;
         let auto: Vec<_> = tags
             .iter()
@@ -1110,7 +1048,7 @@ impl Db {
 
     /// 未打标（无自动标签）的 active 图片 id 列表。
     pub fn untagged_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 10000);
         let mut stmt = conn.prepare(
             "SELECT i.id FROM images i
@@ -1131,7 +1069,7 @@ impl Db {
 
     /// 更新图片来源与溯源 URL。
     pub fn set_image_source(&self, image_id: i64, source: &str, source_url: Option<&str>) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET source = ?2, source_url = ?3 WHERE id = ?1",
             params![image_id, source, source_url],
@@ -1141,7 +1079,7 @@ impl Db {
 
     /// 设置/清除不可自动溯源标记。
     pub fn set_no_auto_sauce(&self, image_id: i64, flag: bool) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET no_auto_sauce = ?2 WHERE id = ?1",
             params![image_id, flag as i64],
@@ -1151,7 +1089,7 @@ impl Db {
 
     /// 写入 AI 生成图片元信息。
     pub fn set_ai_metadata(&self, image_id: i64, meta: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET ai_metadata = ?2 WHERE id = ?1",
             params![image_id, meta],
@@ -1161,7 +1099,7 @@ impl Db {
 
     /// 清除 AI 生成标记（ai_metadata 置空 + 删除 source=ai 标签）。
     pub fn clear_ai_mark(&self, image_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET ai_metadata = NULL WHERE id = ?1",
             params![image_id],
@@ -1178,7 +1116,7 @@ impl Db {
         if neg_tags.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         // 逐词删除（数量少，直接循环）
         for neg in neg_tags {
             conn.execute(
@@ -1192,7 +1130,7 @@ impl Db {
     }
 
     /// 未评分（aesthetic_score IS NULL）的 active 图片 id 列表。
-    pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {        let conn = self.conn.lock().unwrap();
+    pub fn unscored_active_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {        let conn = self.conn.lock();
         let limit = limit.clamp(1, 10000);
         let mut stmt = conn.prepare(
             "SELECT id FROM images
@@ -1209,7 +1147,7 @@ impl Db {
 
     /// 写入/更新溯源来源链接（可手动编辑）。
     pub fn update_source_url(&self, image_id: i64, url: Option<&str>) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET source_url = ?2 WHERE id = ?1",
             params![image_id, url],
@@ -1220,7 +1158,7 @@ impl Db {
     /// 重命名库内图片：更新 rel_path（文件名部分改为新名字，哈希目录前缀不变）。
     /// 物理改名由调用方完成；此处只校验新文件名格式并写库。
     pub fn rename_image_file(&self, image_id: i64, new_rel_path: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET rel_path = ?2 WHERE id = ?1",
             params![image_id, new_rel_path],
@@ -1240,7 +1178,7 @@ impl Db {
         format: &str,
         size_bytes: i64,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET md5 = ?2, rel_path = ?3, width = ?4, height = ?5, format = ?6, size_bytes = ?7 WHERE id = ?1",
             params![image_id, md5, rel_path, width, height, format, size_bytes],
@@ -1250,7 +1188,7 @@ impl Db {
 
     /// 从本图移除指定标签关联（仅本图，其他图不受影响）。
     pub fn remove_image_tag(&self, image_id: i64, tag_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2",
             params![image_id, tag_id],
@@ -1267,7 +1205,7 @@ impl Db {
 
     /// 写入美学评分。
     pub fn set_aesthetic_score(&self, image_id: i64, score: f64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET aesthetic_score = ?2 WHERE id = ?1",
             params![image_id, score],
@@ -1284,7 +1222,7 @@ impl Db {
         clarity: f64,
         phash: i64,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE images SET width = ?2, height = ?3, clarity_score = ?4, phash = ?5 WHERE id = ?1",
             params![image_id, width, height, clarity, phash],
@@ -1294,7 +1232,7 @@ impl Db {
 
     /// 解码失败的图片（width=0 或 height=0 的 active 图）。
     pub fn list_broken_images(&self, limit: i64) -> Result<Vec<i64>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 1000);
         let mut stmt = conn.prepare(
             "SELECT id FROM images WHERE status = 'active' AND (width = 0 OR height = 0) ORDER BY id LIMIT ?1",
@@ -1310,7 +1248,7 @@ impl Db {
     /// 标签列表（含关联图数，按图数降序）。
     /// 修改标签分类（artist/copyright/character/general）。
     pub fn set_tag_category(&self, tag_id: i64, category: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE tags SET category = ?2 WHERE id = ?1",
             params![tag_id, category],
@@ -1320,7 +1258,7 @@ impl Db {
 
     /// 删除标签（连同图片关联）。
     pub fn delete_tag(&self, tag_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM image_tags WHERE tag_id = ?1", params![tag_id])?;
         conn.execute("DELETE FROM tags WHERE id = ?1", params![tag_id])?;
         Ok(())
@@ -1331,7 +1269,7 @@ impl Db {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare("DELETE FROM image_tags WHERE tag_id = ?1")?;
@@ -1349,7 +1287,7 @@ impl Db {
 
     /// 设置标签黑名单（true=拉黑：标签页/详情页不再显示，关联保留）。
     pub fn set_tag_blacklisted(&self, tag_id: i64, blacklisted: bool) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE tags SET is_blacklisted = ?2 WHERE id = ?1",
             params![tag_id, blacklisted as i64],
@@ -1362,7 +1300,7 @@ impl Db {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare("UPDATE tags SET is_blacklisted = ?2 WHERE id = ?1")?;
@@ -1386,7 +1324,7 @@ impl Db {
         q: Option<&str>,
         offset: i64,
     ) -> Result<Vec<TagWithCount>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
         let mut sql = String::from(
@@ -1447,7 +1385,7 @@ impl Db {
         offset: i64,
         cover_rule: &str,
     ) -> Result<(Vec<TagBrowseItem>, i64), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
 
@@ -1544,7 +1482,7 @@ impl Db {
 
     /// 设置/清除标签手动封面（image_id=None 清除；manual 规则读取）。
     pub fn set_tag_cover(&self, tag_id: i64, image_id: Option<i64>) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         match image_id {
             Some(img) => {
                 conn.execute(
@@ -1562,7 +1500,7 @@ impl Db {
 
     /// 标签总数（与 list_tags_filtered 相同 q 条件），供分页 total 使用。
     pub fn count_tags_filtered(&self, q: Option<&str>) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut sql = String::from("SELECT COUNT(*) FROM tags t");
         if let Some(kw) = q {
             if !kw.trim().is_empty() {
@@ -1585,7 +1523,7 @@ impl Db {
         category: Option<&str>,
         no_cn_only: bool,
     ) -> Result<(Vec<TagWithCount>, i64), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
         let mut conds: Vec<String> = Vec::new();
@@ -1654,7 +1592,7 @@ impl Db {
 
     /// 设置/清除标签中文别名（name_cn；None 清除）。
     pub fn set_tag_name_cn(&self, tag_id: i64, name_cn: Option<&str>) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let v = name_cn.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         conn.execute(
             "UPDATE tags SET name_cn = ?2 WHERE id = ?1",
@@ -1665,7 +1603,7 @@ impl Db {
 
     /// 标签的中文别名列表（增强3）。
     pub fn list_tag_aliases(&self, tag_id: i64) -> Result<Vec<TagAlias>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, tag_id, alias FROM tag_aliases WHERE tag_id = ?1 ORDER BY id",
         )?;
@@ -1689,7 +1627,7 @@ impl Db {
         if alias.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM tag_aliases WHERE tag_id = ?1 AND alias = ?2)",
@@ -1709,7 +1647,7 @@ impl Db {
 
     /// 删除标签中文别名。
     pub fn remove_tag_alias(&self, alias_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM tag_aliases WHERE id = ?1", params![alias_id])?;
         Ok(())
     }
@@ -1727,7 +1665,7 @@ impl Db {
         net_height: Option<i64>,
         source_url: Option<&str>,
     ) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO replace_pending (image_id, temp_path, net_size, local_size, net_width, net_height, source_url, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1738,7 +1676,7 @@ impl Db {
 
     /// 待确认替换列表（含本图文件名，倒序）。
     pub fn list_replace_pending(&self) -> Result<Vec<ReplacePendingItem>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT rp.id, rp.image_id, rp.temp_path, rp.net_size, rp.local_size,
                     rp.net_width, rp.net_height, rp.source_url, rp.created_at, i.rel_path
@@ -1774,7 +1712,7 @@ impl Db {
 
     /// 删除待确认替换记录（确认替换或忽略后调用）。
     pub fn remove_replace_pending(&self, pending_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM replace_pending WHERE id = ?1", params![pending_id])?;
         Ok(())
     }
@@ -1824,7 +1762,7 @@ impl Db {
         drop(rows);
         drop(stmt);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let matched = pairs.len() as i64;
         let mut updated = 0i64;
         let mut missing = 0i64;
@@ -1860,7 +1798,7 @@ impl Db {
     /// 搜索联想：按名称/中文名/中文别名前缀匹配标签，按关联图数倒序（danbooru 风格词频）。
     /// 空格/下划线归一化：输入空格也匹配下划线名。转义 LIKE 通配符。
     pub fn suggest_tags(&self, q: &str, limit: i64) -> Result<Vec<TagWithCount>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 50);
         // 归一化：空格 → 下划线（匹配规范名）；也保留原输入（匹配别名/中文名）
         let norm = q.trim().replace(' ', "_");
@@ -1906,7 +1844,7 @@ impl Db {
 
     /// 读取溯源缓存。
     pub fn get_sauce_cache(&self, md5: &str) -> Result<Option<SauceCacheEntry>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT similarity, source, source_url FROM sauce_cache WHERE image_md5 = ?1",
             params![md5],
@@ -1925,7 +1863,7 @@ impl Db {
         source_url: Option<&str>,
         raw_json: Option<&str>,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO sauce_cache (image_md5, similarity, source, source_url, raw_json, hit_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1938,7 +1876,7 @@ impl Db {
 
     /// 创建任务记录，返回 job id。
     pub fn create_job(&self, ty: &str, payload: Option<&str>) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let now = now_secs();
         conn.execute(
             "INSERT INTO jobs (type, status, total, done, failed, payload, error, created_at, updated_at)
@@ -1950,7 +1888,7 @@ impl Db {
 
     /// 启动任务：置为 running 并设置总数。
     pub fn start_job(&self, job_id: i64, total: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE jobs SET status = 'running', total = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, total, now_secs()],
@@ -1967,7 +1905,7 @@ impl Db {
         failed: i64,
         error: Option<&str>,
     ) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let now = now_secs();
         let finished = if status == "done" || status == "failed" || status == "cancelled" {
             Some(now)
@@ -1989,7 +1927,7 @@ impl Db {
 
     /// 任务列表（按创建时间倒序）。
     pub fn list_jobs(&self, limit: i64) -> Result<Vec<Job>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 500);
         let mut stmt = conn.prepare(
             "SELECT id, type, status, total, done, failed, payload, error, created_at, updated_at, finished_at
@@ -2005,7 +1943,7 @@ impl Db {
 
     /// 单条任务详情。
     pub fn get_job(&self, job_id: i64) -> Result<Option<Job>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, type, status, total, done, failed, payload, error, created_at, updated_at, finished_at
              FROM jobs WHERE id = ?1",
@@ -2018,7 +1956,7 @@ impl Db {
 
     /// 清空历史任务（done/failed/cancelled），保留 running/pending。返回删除数。
     pub fn clear_jobs(&self) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute(
             "DELETE FROM jobs WHERE status IN ('done','failed','cancelled')",
             [],
@@ -2028,7 +1966,7 @@ impl Db {
 
     /// 标记任务为 cancelled（供中断）。
     pub fn cancel_job(&self, job_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE jobs SET status = 'cancelled', finished_at = ?2, updated_at = ?2 WHERE id = ?1 AND status IN ('pending','running')",
             params![job_id, now_secs()],
@@ -2038,7 +1976,7 @@ impl Db {
 
     /// 重新标记任务为 pending（供继续，重置计数并清错误）。
     pub fn resume_job(&self, job_id: i64) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE jobs SET status = 'pending', done = 0, failed = 0, error = NULL, finished_at = NULL, updated_at = ?2 WHERE id = ?1",
             params![job_id, now_secs()],
@@ -2050,7 +1988,7 @@ impl Db {
 
     /// 写入一条日志（限量保留：超过 MAX_LOGS 删除最旧）。
     pub fn add_log(&self, level: &str, category: &str, message: &str) -> Result<(), DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO app_logs (level, category, message, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![level, category, message, now_secs()],
@@ -2079,7 +2017,7 @@ impl Db {
         levels: &[String],
         categories: &[String],
     ) -> Result<Vec<AppLog>, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let limit = limit.clamp(1, 5000);
         let mut sql = String::from(
             "SELECT id, level, category, message, created_at FROM app_logs",
@@ -2136,7 +2074,7 @@ impl Db {
 
     /// 清空日志。
     pub fn clear_logs(&self) -> Result<i64, DbError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM app_logs", [])?;
         Ok(n as i64)
     }
@@ -2156,6 +2094,54 @@ fn row_to_job(r: &Row) -> rusqlite::Result<Job> {
         updated_at: r.get(9)?,
         finished_at: r.get(10)?,
     })
+}
+
+/// 溯源 / 打标 / AI 三组状态条件的**唯一实现**。
+///
+/// 图库列表（`build_filter_conds` 的溯源部分）、主目录树（`Db::import_tree`）、
+/// 某来源组明细（`Db::import_dir_images`）原本各自逐字复制一遍这段 SQL，
+/// 三份并行演化必然漂移，故收敛到这里。三组条件**都不含占位符**，调用方无需绑定参数。
+fn sauce_tag_ai_conds(sauce: Option<&str>, tag: Option<&str>, ai: Option<&str>) -> Vec<String> {
+    let mut conds: Vec<String> = Vec::new();
+    // 「有溯源」：有来源链接，或来源不是 local —— 其一即可
+    const IS_SAUCED: &str =
+        "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
+    // 「有 AI 元数据」：字段非空，或存在 source=ai 的标签
+    const IS_AI: &str =
+        "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
+    // 「有自动打标」：存在来自任一本地/在线打标器来源的标签
+    const HAS_AUTO_TAG: &str =
+        "EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source IN ('auto_danbooru','auto_gelbooru','auto_local'))";
+
+    if let Some(s) = sauce {
+        match s {
+            "sauced" => conds.push(IS_SAUCED.to_string()),
+            // 不可溯源 = 既没溯源也没 AI 元数据，且用户没手动标记「无需溯源」
+            "unsauced" => conds.push(format!(
+                "NOT ({IS_SAUCED}) AND NOT ({IS_AI}) AND i.no_auto_sauce = 0"
+            )),
+            // 未溯源 = 已有 AI 元数据（视为可推断来源），或用户手动标记了无需溯源
+            "un-sauced" => conds.push(format!("({IS_AI}) OR i.no_auto_sauce = 1")),
+            _ => {}
+        }
+    }
+    if let Some(t) = tag {
+        match t {
+            "tagged" => conds.push(HAS_AUTO_TAG.to_string()),
+            "untagged" => conds.push(format!("NOT {HAS_AUTO_TAG}")),
+            // 无需打标 = 已有 AI 元数据（AI 图通常自带提示词）
+            "no_need" => conds.push(IS_AI.to_string()),
+            _ => {}
+        }
+    }
+    if let Some(a) = ai {
+        match a {
+            "ai" => conds.push("(i.ai_metadata IS NOT NULL AND i.ai_metadata != '')".to_string()),
+            "not_ai" => conds.push("(i.ai_metadata IS NULL OR i.ai_metadata = '')".to_string()),
+            _ => {}
+        }
+    }
+    conds
 }
 
 /// 构建图片筛选条件（status + filter），供列表查询与计数共用。
@@ -2255,17 +2241,8 @@ fn build_filter_conds(
         conds.push(format!("i.source = {t}"));
         params.push(Box::new(v.clone()));
     }
-    // 溯源状态（已溯源/不可溯源/未溯源）
-    if let Some(v) = &filter.sauce_status {
-        let is_sauced = "(i.source_url IS NOT NULL AND i.source_url != '') OR (i.source != 'local' AND i.source != '')";
-        let is_ai = "(i.ai_metadata IS NOT NULL AND i.ai_metadata != '') OR EXISTS (SELECT 1 FROM image_tags it WHERE it.image_id = i.id AND it.source = 'ai')";
-        match v.as_str() {
-            "sauced" => conds.push(is_sauced.to_string()),
-            "unsauced" => conds.push(format!("NOT ({is_sauced}) AND NOT ({is_ai}) AND i.no_auto_sauce = 0")),
-            "un-sauced" => conds.push(format!("({is_ai}) OR i.no_auto_sauce = 1")),
-            _ => {}
-        }
-    }
+    // 溯源状态（已溯源/不可溯源/未溯源）：与主目录视图共用同一份实现
+    conds.extend(sauce_tag_ai_conds(filter.sauce_status.as_deref(), None, None));
     if let Some(v) = &filter.format {
         let t = format!("?{}", params.len() + 1);
         conds.push(format!("i.format = {t}"));
@@ -2431,6 +2408,132 @@ mod tests {
         assert_eq!(tags.len(), 1, "AI 标签应成功入库");
         assert_eq!(tags[0].source, "ai");
         assert_eq!(tags[0].name, "1girl");
+    }
+
+
+    /// 回归：溯源/打标/AI 三组状态条件必须在**三个入口**给出同一个答案。
+    /// 这三段 SQL 曾各自复制一份（`build_filter_conds` / `import_tree` / `import_dir_images`），
+    /// 任一份漏改就会出现「图库数得对、主目录数得不对」。
+    #[test]
+    fn sauce_tag_ai_filter_consistent_across_entrypoints() {
+        let db = test_db();
+        let mk = |md5: &str, source_url: Option<&str>, ai: Option<&str>, no_sauce: bool| Image {
+            id: 0,
+            md5: md5.into(),
+            phash: 0,
+            rel_path: format!("{md5}.png"),
+            width: 10,
+            height: 10,
+            format: "png".into(),
+            size_bytes: 1,
+            file_mtime: 0,
+            exif_datetime: None,
+            clarity_score: 1.0,
+            aesthetic_score: None,
+            dedup_group: None,
+            is_redundant: false,
+            status: STATUS_ACTIVE.into(),
+            source: SOURCE_LOCAL.into(),
+            source_url: source_url.map(|s| s.to_string()),
+            no_auto_sauce: no_sauce,
+            ai_metadata: ai.map(|s| s.to_string()),
+            thumb_rel: format!("{md5}.webp"),
+            imported_at: 1_700_000_000,
+            source_dir: Some("d".into()),
+        };
+        // 1) 有溯源链接  2) 只有 AI 元数据  3) 两者都没有  4) 无溯源但用户标了「无需溯源」
+        // 注意 insert_images 不写 ai_metadata / no_auto_sauce（那是后续步骤写的），
+        // 必须单独调用 setter 才能造出这两种状态。
+        db.insert_images(&[
+            mk("a_sauced", Some("https://x/1"), None, false),
+            mk("b_ai", None, None, false),
+            mk("c_plain", None, None, false),
+            mk("d_no_sauce", None, None, false),
+        ])
+        .expect("插入失败");
+        let id_of = |md5: &str| -> i64 {
+            db.list_images_filtered("active", &ImageFilter::default(), SortKey::Imported, false, 100, None)
+                .expect("列表失败")
+                .0
+                .iter()
+                .find(|i| i.rel_path == format!("{md5}.png"))
+                .unwrap_or_else(|| panic!("找不到 {md5}"))
+                .id
+        };
+        db.set_ai_metadata(id_of("b_ai"), "[test] ai")
+            .expect("设置 AI 元数据失败");
+        db.set_no_auto_sauce(id_of("d_no_sauce"), true)
+            .expect("设置无需溯源失败");
+
+        // 主目录树 / 明细两条路径的计数，必须与图库列表逐项相等
+        let tree_count = |sauce: Option<&str>, tag: Option<&str>, ai: Option<&str>| {
+            db.import_tree(sauce, tag, ai)
+                .expect("主目录树失败")
+                .iter()
+                .flat_map(|(_, dirs)| dirs.iter())
+                .map(|(_, n)| *n)
+                .sum::<i64>()
+        };
+        // 明细接口按「天」取，日期字符串只能从树里拿（本地时区换算），故先把天都列出来再逐个累加
+        let dir_count = |sauce: Option<&str>, tag: Option<&str>, ai: Option<&str>| {
+            let tree = db.import_tree(sauce, tag, ai).expect("主目录树失败");
+            tree.iter()
+                .map(|(day, dirs)| {
+                    dirs.iter()
+                        .map(|(dir, _)| {
+                            db.import_dir_images(
+                                day,
+                                dir.as_deref(),
+                                sauce,
+                                tag,
+                                ai,
+                                100,
+                                None,
+                            )
+                            .expect("来源组明细失败")
+                            .0
+                            .len() as i64
+                        })
+                        .sum::<i64>()
+                })
+                .sum::<i64>()
+        };
+
+        // 溯源状态：三值都要对齐
+        for s in ["sauced", "unsauced", "un-sauced"] {
+            let filter = ImageFilter { sauce_status: Some(s.into()), ..Default::default() };
+            let lib = db
+                .count_images_filtered("active", &filter)
+                .expect("图库计数失败");
+            assert_eq!(lib, tree_count(Some(s), None, None), "溯源={s} 主目录树计数与图库不一致");
+            assert_eq!(
+                lib,
+                dir_count(Some(s), None, None),
+                "溯源={s} 来源组明细计数与图库不一致"
+            );
+        }
+        // 打标状态：tagged / untagged / no_need 也必须对齐
+        for t in ["tagged", "untagged", "no_need"] {
+            assert_eq!(
+                tree_count(None, Some(t), None),
+                dir_count(None, Some(t), None),
+                "打标={t} 主目录树与来源组明细不一致"
+            );
+        }
+        // AI 状态
+        for a in ["ai", "not_ai"] {
+            assert_eq!(
+                tree_count(None, None, Some(a)),
+                dir_count(None, None, Some(a)),
+                "AI={a} 主目录树与来源组明细不一致"
+            );
+        }
+
+        // 具体预期值：有链接 1 张；不可溯源 = 纯本地且无需溯源 = 1 张（c_plain）；
+        // 未溯源 = 有 AI 元数据 或 标了无需溯源 = 2 张（b_ai, d_no_sauce）
+        assert_eq!(tree_count(Some("sauced"), None, None), 1);
+        assert_eq!(tree_count(Some("unsauced"), None, None), 1);
+        assert_eq!(tree_count(Some("un-sauced"), None, None), 2);
     }
 
     #[test]

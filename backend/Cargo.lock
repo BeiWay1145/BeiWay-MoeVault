@@ -932,6 +932,7 @@ name = "moevault-db"
 version = "0.1.0"
 dependencies = [
  "moevault-core",
+ "parking_lot",
  "rusqlite",
  "thiserror",
  "tracing",
