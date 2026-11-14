@@ -4,6 +4,8 @@
 > 评估范围：`python/server/` 全部推理逻辑（1010 行）→ Rust 原生实现的可行性
 > 评估立场：**严格**。本报告用于决策，乐观结论必须有证据支撑，风险必须明说。
 > 标记约定：**[已验证]** = 本机实测 / 源码逐行核对 / 上游源码确认；**[推测]** = 基于架构常识的估计，未在本机跑通；**[未知]** = 当前条件无法核实
+>
+> ⚠️ **2026-11-14 局部更正**：本报告关于 **R3（ort 的 CUDA 部署门槛）** 的判断只对 ort rc.11+ 成立。打标环节已单独完成实测评估，见 [`docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md`](./RUST_TAGGER_REWRITE_EVAL_2026-11.md)：ort **rc.10** 发布的是 ORT 1.22.0，只需要 **CUDA 12 + cuDNN 9**，可直接复用 torch/lib 里现成的 DLL，零额外体积；数值对拍 Jaccard 1.0000。本文 §4.1 / §4.3 / §6.5 / §8 R3 / §9.2 / §11 中「CUDA ≥13.2 + cuDNN ≥9.23」的表述均应按该文修正。**结论层面**「不提升吞吐」仍然成立（并发形态下 Rust 仅快约 5%）。
 
 ---
 
@@ -29,7 +31,7 @@
 2. ~~**cl_tagger 的预处理不可离线复现。**~~ → **已推翻。** 两个子断言都不成立：
    - 「可能有 naflex 三输入」→ `model_metadata.json` 明写 `"is_naflex": false`；用 onnxruntime 读出的实际签名**只有 1 个输入** `pixel_values`，shape `[batch_size, 3, 384, 384]`，输出 `logits` `[N, 108139]`。三输入分支在本机部署里根本不存在。
    - 「预处理不可手写」→ 手写 `resize(384,384,BILINEAR) → /255 → (x-0.5)/0.5 → CHW` 与 transformers 路径**40 图严格对拍**：prob_maxdiff **0.0133**、0.5 阈值翻转 **8 / 2487**（全部落在 0.5±0.005 的模型自身边界抖动区）。等价于 u8 量化级差异，不影响任何实际判定。
-3. **ort 的 CUDA 部署门槛比现状更高，不是更低。**（**这一条仍然成立，也是真正剩下的障碍**） ort 官方文档原文：`ort` provides binaries for **CUDA ≥ 13.2** and targets **cuDNN ≥ 9.23**. Make sure compatible versions of CUDA and cuDNN are installed and available on the **PATH** [已验证，ort.pyke.io/perf/execution-providers]。而现状的 `torch+cu126` wheel **自带 CUDA 运行时 DLL**，用户不需要装 CUDA Toolkit。迁移后反而要让用户装 CUDA 13.2 + cuDNN 9.23 —— 这是**部署复杂度上升**，不是下降。
+3. ~~**ort 的 CUDA 部署门槛比现状更高，不是更低。**~~ → **2026-11-14 已推翻（只对 ort rc.11+ 成立）**。rc.10 发的是 ORT 1.22.0，只需 CUDA 12 + cuDNN 9，可直接复用 torch/lib 里现成的 10 个 DLL，零额外体积。原文保留如下以便追溯： ort 官方文档原文：`ort` provides binaries for **CUDA ≥ 13.2** and targets **cuDNN ≥ 9.23**. Make sure compatible versions of CUDA and cuDNN are installed and available on the **PATH** [已验证，ort.pyke.io/perf/execution-providers]。而现状的 `torch+cu126` wheel **自带 CUDA 运行时 DLL**，用户不需要装 CUDA Toolkit。迁移后反而要让用户装 CUDA 13.2 + cuDNN 9.23 —— 这是**部署复杂度上升**，不是下降。
 
 ### 0.3 现役打标模型已确认是 cl_tagger（本报告初稿判错，此处更正）
 
@@ -64,7 +66,7 @@
 >
 > **必须用 BILINEAR**（对应 `resample: 2`）。换成 BICUBIC/LANCZOS 会让 prob 偏差放大到 0.4–0.6，标签大幅翻转——这是迁移时最容易踩的坑。
 >
-> 剩余的真障碍只有一条：**`ort` 的 CUDA 部署要求（CUDA ≥13.2 + cuDNN ≥9.23 在 PATH）比 torch wheel 自带运行时更重**，会让「一键装 GPU」体验倒退。这是部署取舍问题，不是算法可行性问题。
+> ~~剩余的真障碍只有一条：**`ort` 的 CUDA 部署要求（CUDA ≥13.2 + cuDNN ≥9.23 在 PATH）比 torch wheel 自带运行时更重**。~~ → **2026-11-14 已推翻**（见 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md` §2）：那套要求只对 ort rc.11+ 成立；rc.10 发的是 ORT 1.22.0，只要 CUDA 12 + cuDNN 9，且能直接复用 torch/lib 里那 10 个 DLL，零额外体积。Rust 侧已实测跑通 76.8 ms/张、Jaccard 1.0000。
 >
 > 因此结论改为：**打标在技术上可迁，优先级排在美学之后**；是否迁取决于产品是否接受 GPU 部署退化，或是否愿意走 DirectML 兜底。
 >
@@ -183,7 +185,7 @@ return dict(sorted(result.items(), key=lambda kv: kv[1], reverse=True))  # 置�
 | 可能有 naflex 三输入，Rust 无实现 | `is_naflex: false`，ONNX 实际签名只有 1 个输入 `pixel_values`。**不存在此分支** |
 | 缺模型文件，无法数值验证 | 模型在 `E:\Game\AI\cl_tagger\models`，已完成对拍与 GPU 吞吐实测 |
 
-唯一剩下的问题在推理运行时而非预处理：**`ort` 的 CUDA EP 要求系统级 CUDA ≥13.2 + cuDNN ≥9.23 在 PATH**，比 torch wheel 自带运行时重（见 §4.1）。
+~~唯一剩下的问题在推理运行时而非预处理：`ort` 的 CUDA EP 要求系统级 CUDA ≥13.2 + cuDNN ≥9.23 在 PATH。~~ → **2026-11-14 已验证并推翻该障碍**：ort rc.10 → ORT 1.22.0，只需 CUDA 12 + cuDNN 9；最小必需 10 个 DLL = 1660.4 MB，复用 torch/lib 时零额外体积；实测 CUDA EP 生效、76.8 ms/张、Jaccard 1.0000。详见 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md` §2。
 
 wd14 分支仍是**可以逐行翻译**的备选（resize + CLIP 归一化 + NCHW + sigmoid + 阈值 + 降序），但它已不是主路径。
 
@@ -260,7 +262,7 @@ score  = 1.0 + score01*4.0
 - 有 `ep::CUDA::default()` 与 `with_execution_providers`，多 EP 顺序注册即自动逐算子回落。
 
 **劣势（这是关键）**：
-- **CUDA 部署门槛上升**：官方原文要求 **CUDA ≥ 13.2、cuDNN ≥ 9.23，且在 PATH 上** [已验证]。而 torch `+cu126` wheel 自带 CUDA runtime，用户不必装 Toolkit。**迁移后「一键装 GPU」这个已经做好的体验会退化。**
+- 对 ort rc.10 不成立：rc.10 发的是 ORT 1.22.0，只需 CUDA 12 + cuDNN 9，10 个 DLL 可随包分发或直接复用 torch/lib（零额外体积），已实测跑通。换成 rc.11+ 才需要 CUDA 13。详见 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md` §2。
 - 预编译二进制只覆盖 `sm_75 / 8.x / 9.x / 12.x`；不在列表内的算力需自行编译 ONNX Runtime [已验证]。
 - WebGPU EP 官方明示 **experimental，可能产生错误结果或崩溃** [已验证] —— 不能作为兜底。
 - 仍是 rc：`2.0.0-rc.15` 意味着 API 仍可能破坏性变动，不适合作为「交付给用户」的稳定底座。
@@ -314,7 +316,7 @@ score  = 1.0 + score01*4.0
 
 | | 现状（Python） | ort CUDA EP | candle CUDA | CPU-only |
 |---|---|---|---|---|
-| 用户需自备 | 无（torch wheel 自带 CUDA 运行时） | **CUDA ≥13.2 + cuDNN ≥9.23 且在 PATH** | CUDA toolkit + nvcc（要编译 kernel） | 无 |
+| 用户需自备 | 无（torch wheel 自带 CUDA 运行时） | 对 ort rc.10 不成立：只需 CUDA 12 + cuDNN 9，可复用 torch/lib 的 DLL，零额外体积（见 §2 更正） | CUDA toolkit + nvcc（要编译 kernel） | 无 |
 | 安装体积 | 2.32GB wheel / 解压 6–7GB [推测] | ORT CUDA DLL（数百 MB）[未知] | 二进制内置 kernel，随 binary 增大 [未知] | +几十 MB |
 | 首次可用时间 | pip 装完即可 | 装完 CUDA 即可 | **首次需编译 kernel**（分钟级）[推测] | 立即 |
 | 一键化难度 | 已实现（`infer_install_gpu`） | **高**（装 CUDA Toolkit 无法静默 pip 化） | 中（需 MSVC + CUDA） | 低 |
@@ -339,7 +341,7 @@ score  = 1.0 + score01*4.0
 | 打标吞吐 | 预热后 20 次串行 POST `/infer/tags` 共 3.659 s ≈ **183 ms/张**（含 HTTP 往返）[已验证] |
 | venv 位置 | `D:\Program Files\BeiWay-MoeVault\runtime\python\.venv`（torch 2.11.0+cu128）[已验证] |
 
-→ **GPU 路径现在是可实测的了**。但 `ort` 的 CUDA EP 是否能在本机这套 CUDA/cuDNN 上跑通，仍未验证——它要求的是系统级 CUDA 13.2 + cuDNN 9.23，与 torch 自带的 cu128 不是一回事。
+→ **GPU 路径现在是可实测的了**。~~但 `ort` 的 CUDA EP 是否能在本机这套 CUDA/cuDNN 上跑通，仍未验证——它要求的是系统级 CUDA 13.2 + cuDNN 9.23，与 torch 自带的 cu128 不是一回事。~~ → **2026-11-14 已验证：能跑通。** ort 2.0.0-rc.10 自带 ORT 1.22.0，只需 CUDA 12 + cuDNN 9，与 torch 的 cu128 同源；实测 CUDA EP 生效、76.8 ms/张纯推理、Jaccard 1.0000。详见 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md`。
 
 ---
 
@@ -394,9 +396,9 @@ score  = 1.0 + score01*4.0
 **仍然无法验证的（不含已在别处解决的）：**
 
 - **candle CPU 上 anime 模型的实际延迟**：本机 torch 齐全但 candle 版尚未实现，无对照。
-- **`ort` CUDA EP 在本机的可用性**：现役是 torch 的 cu128 运行时，onnxruntime-gpu 的 CUDA EP 走的是它自己那份；`ort` 要求系统级 CUDA 13.2 + cuDNN 9.23，本机未装，未验证。
-- **candle 与 ort 两套 CUDA 栈能否共存**：未验证。
-- **`ort` CUDA DLL 的实际体积**：未测。
+- ~~**`ort` CUDA EP 在本机的可用性**：要求系统级 CUDA 13.2 + cuDNN 9.23，本机未装，未验证。~~ → **已验证可用**（ort rc.10 / ORT 1.22.0 / CUDA 12 + cuDNN 9），见 `RUST_TAGGER_REWRITE_EVAL_2026-11.md` §1.4。
+- **candle 与 ort 两套 CUDA 栈能否共存**：未验证。（注：若只迁打标，则只用 ort，不引入 candle，此条不适用。）
+- ~~**`ort` CUDA DLL 的实际体积**：未测。~~ → **已测**：最小必需集合 10 个 DLL = 1,741,090,464 B (1660.4 MB)；加 exe 与 providers 共 1853.93 MB；若复用 torch/lib 则零额外体积。
 - **美学两个模型迁移后的数值一致性**：仅完成了权重键匹配核对，未做端到端 logits 对拍。
 
 **方法论教训（写下来避免重犯）**：初稿把「仓库 `find` 没找到模型」直接写成「本机不存在模型」，并据此把整个打标环节判为「不迁」。一个正确做法是**先问用户模型装在哪**——模型文件动辄 2GB，不放进版本库是常态，全仓搜索本来就不可能命中。
@@ -412,7 +414,7 @@ score  = 1.0 + score01*4.0
 | Python venv（CPU-only） | 0.85–1.0 GB [推测] | 0 | 0 |
 | Python venv（CUDA torch） | 7–9 GB [推测] | 0 | 0 |
 | Rust 二进制增量 | — | candle+safetensors ≈ +8–15 MB；ort 预编译 ORT ≈ +15–25 MB（CPU）[推测] | ≈ +8–15 MB [推测] |
-| CUDA 运行时归属 | 由 wheel 自带 | **转嫁给用户系统 CUDA 13.2 + cuDNN 9.23** | 同左 |
+| CUDA 运行时归属 | 由 wheel 自带 | ort rc.10 下可随包带 10 个 DLL（1660.4 MB）或复用 torch/lib，不必要求用户装 Toolkit | 同左 |
 | MSI 包体 | 10.0 MB [已验证] | 估 35–50 MB [推测] | 估 20–28 MB [推测] |
 | 模型文件 | 2.4 GB（外置，不进包） | 不变 | 不变 |
 
@@ -486,7 +488,7 @@ score  = 1.0 + score01*4.0
 |---|---|---|---|
 | R1 | ~~打标模型文件不存在~~ → **已消除**。模型在 `E:\Game\AI\cl_tagger\models`，签名与 naflex 均已实测 | onnxruntime 读 session + metadata | 已解决；模型已复制到 `runtime/models/tagger\` |
 | R2 | **无 golden 基准**：`app.db` 的 `images` 表 0 行 | `backend/data/app.db` 实测 | 必须在目标机上用现存 Python 服务造基准集，再谈迁移 |
-| R3 | **ort 的 CUDA 要求（≥13.2 / cuDNN ≥9.23 在 PATH）比现状（torch wheel 自带 CUDA）更重** | ort 官方文档原文 | 要么接受 GPU 体验退化，要么走 DirectML EP，要么**不迁 GPU 路径**（保留 Python 作为 GPU 侧可选增强） |
+| R3 | ~~**ort 的 CUDA 要求（≥13.2 / cuDNN ≥9.23 在 PATH）比现状更重**~~ → **2026-11-14 已证实不成立（对 rc.10）**。rc.10 → ORT 1.22.0，需 CUDA 12 + cuDNN 9，可复用 torch/lib 的 10 个 DLL，零额外体积；Rust 侧实测 76.8 ms/张、Jaccard 1.0000 | `RUST_TAGGER_REWRITE_EVAL_2026-11.md` §2；`ort-sys-2.0.0-rc.10/build.rs:8` | 真实风险改为 **ort 版本被锁死在 rc.10**（rc.11+ 只发 ORT 1.31 + CUDA 13），详见该文 §4.2 |
 | R4 | ~~本机无法做任何 GPU 实验~~ → **已消除**。用户启用独显后 RTX 5070 Laptop 可用，打标实测 183 ms/张 | `nvidia-smi` + 并发压测 | 已解决；剩余风险是 `ort` 的 CUDA EP 与本机 torch cu128 不是同一套运行时，未验证 |
 
 ### 🟠 高风险（会显著增加工期或返工）
@@ -530,7 +532,7 @@ score  = 1.0 + score01*4.0
 - ✅ **美学（qalign + anime）**：**推荐迁移**。这是唯一「证据充分、收益确定、风险可控」的部分：两个模型的权重键与 candle 现成实现**严格匹配**（qalign 8/8、anime 完全对应），预处理逻辑简单且已在配置里写死，不需要 transformers。
 - ✅/⏸️ **打标（cl_tagger / SigLIP2，现役主力）**：**可迁，排在美学之后**。初稿判「不迁」的两个前提已被实测推翻（§0.3.1）：naflex 不存在、processor 可手写复现（40 图 prob_maxdiff 0.0133）。剩下的唯一代价是 `ort` 的 CUDA 部署要求更重。
 - ⏸️ **打标（wd14，兼容分支）**：**备查**。预处理是纯手写逻辑、技术上可 1:1 复现，但它是退路不是主路径，迁它没有收益。
-- ❌ **GPU 一键安装**：**迁移会让这个体验倒退**。ort 要求系统级 CUDA 13.2 + cuDNN 9.23，而 torch wheel 自带运行时。这一项必须提前和产品预期对齐。
+- ✅ **GPU 一键安装**：对 ort rc.10 **不成立**（可随包带 10 个 CUDA DLL 或复用 torch/lib，用户无需装 Toolkit，已实测 CUDA EP 生效 76.8 ms/张）。代价是 ort 版本被锁在 rc.10（rc.11+ 只发 CUDA 13），详见 `RUST_TAGGER_REWRITE_EVAL_2026-11.md` §4.2。
 
 ### 9.2 建议的执行顺序（每步都有独立的验收点）
 
@@ -566,7 +568,8 @@ score  = 1.0 + score01*4.0
 
 > 美学那部分（374MB + 2.18GB 两个模型）可以放心迁到 Rust，candle 已经有严丝合缝的现成实现，能顺带干掉 0.85–9 GB 的 venv。
 > **打标那部分同样可以迁**——初稿说「预处理依赖 transformers、模型不在手边」的两条理由，经本机实测都不成立（模型在 E: 盘 2.2GB，`is_naflex: false`，手写预处理 40 图对拍 prob_maxdiff 0.0133）。建议排在美学之后做。
-> 唯一要有心理准备的是部署侧：**迁到 Rust 会让「一键装 GPU」这个已经做好的体验倒退**，因为 ONNX Runtime 不像 PyTorch 那样把 CUDA 运行时打包进 wheel，它要求用户系统里已有 CUDA 13.2 + cuDNN 9.23。这是取舍，不是技术障碍。
+> 部署侧那个顾虑 **2026-11-14 已推翻**（对 ort rc.10）：它只要能找到 CUDA 12 + cuDNN 9 的 10 个 DLL，随包分发或复用 torch/lib 即可，用户不必装 Toolkit，已实测 76.8 ms/张。
+> **但真正的结论是「打标不值得现在做」**：打标任务 98% 的时间在等 SauceNAO，本地推理只占 1–2%；并发形态下 Rust 与 Python 吞吐只差 5%（11.46 vs 10.90 张/秒）。详见 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md` §3.4 与 §5。
 
 ---
 
@@ -619,7 +622,7 @@ score  = 1.0 + score01*4.0
 - nvidia-smi、推理服务 /health、/infer/tagger/config 端到端跑通
 
 **仍然未能验证（明确标注）**
-- `ort` CUDA EP 在本机的实际可用性（要求系统级 CUDA 13.2 + cuDNN 9.23，本机未装）
+- ~~`ort` CUDA EP 在本机的实际可用性~~ → **已验证可用**（见 `docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md` §1.4）
 - candle CPU 上 anime 模型的实际延迟
 - `ort` CUDA DLL 的实际体积与 candle+ort 两套 CUDA 栈能否共存
 - 200-500 张 golden 基准 JSON（打标服务现已可用，应尽快产出）

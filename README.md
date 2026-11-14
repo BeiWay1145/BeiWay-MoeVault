@@ -64,7 +64,8 @@
 | 文档 | 内容 |
 |---|---|
 | [docs/ARCH_REVIEW_2026-11.md](docs/ARCH_REVIEW_2026-11.md) | 架构审查（2026-11）：模块边界、重复代码、超长文件/函数、错误处理、前端状态、性能隐患、测试覆盖、P0–P3 分级与修复顺序 |
-| [docs/RUST_INFERENCE_FEASIBILITY.md](docs/RUST_INFERENCE_FEASIBILITY.md) | 打标/美学推理从 Python 迁到 Rust 的可行性检验：ort / candle / 混合三条路线、GPU 与部署复杂度、数值一致性验证方案 |
+| [docs/RUST_INFERENCE_FEASIBILITY.md](docs/RUST_INFERENCE_FEASIBILITY.md) | 打标/美学推理从 Python 迁到 Rust 的可行性检验：ort / candle / 混合三条路线、GPU 与部署复杂度、数值一致性验证方案（**注意：其中 R3「ort 需 CUDA 13.2 / cuDNN 9.23」只对 ort rc.11+ 成立，打标部分的更正见下一行**） |
+| [docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md](docs/RUST_TAGGER_REWRITE_EVAL_2026-11.md) | 打标环节单独做 Rust 重写的实测评估：已在 `ort rc.10` 跑通（Jaccard 1.0000、76.8 ms/张）、R3 更正（只需 CUDA 12 + cuDNN 9，可复用 torch/lib 零体积）、体积/吞吐三口径收益、以及「不建议做」的结论与替代方案（并发化 / 锁细化 / 打标与溯源解耦） |
 | [docs/EXPLORER_STYLE_SELECTION_PLAN.md](docs/EXPLORER_STYLE_SELECTION_PLAN.md) | 图库资源管理器式交互（选择/框选/拖出/右键菜单）的方案与架构建议 |
 | [docs/MULTI_EXIT_IP_PLAN.md](docs/MULTI_EXIT_IP_PLAN.md) | SauceNAO 多出口 IP 轮换（Clash 多入站端口）方案 |
 | [docs/DESIGN_FILTER_NAVIGATION.md](docs/DESIGN_FILTER_NAVIGATION.md) | 搜索式筛选 v2 设计 |
