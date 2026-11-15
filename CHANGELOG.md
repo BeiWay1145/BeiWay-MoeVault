@@ -30,6 +30,58 @@
     排序值刻意错开、美学分含并列与 NULL，对 5 种「排序 × 方向」组合断言
     「逐页拼接结果 == 一次取全的顺序」，并断言 Random 不返回游标。
 
+- **查重页「保留最优 → 回收站」点了没反应**（显示「已回收 0 张冗余图」，组还在）。
+  这不是显示问题，是**整条回收链路在最常见的状态下会失败**：
+  - 直接原因：图 2066 的原图**已经在 `data/recycle/` 里**，但 `images.status` 仍是
+    `active`、`recycle_bin` 也没有记录。`recycle_image` 的 `move_file` 发现源文件
+    不存在 → `std::fs::copy` 报 `IO 错误: 系统找不到指定的文件。(os error 2)` → 整个函数 Err。
+  - 这个「文件在回收站、状态还是正常」的半完成态，来源是 `replace_from_url` 与
+    `replace.rs` 的**原图替换**：它们把旧文件搬进 `data/recycle/` 却既不写
+    `recycle_bin` 也不改状态。而且「旧图可恢复」这个承诺从未成立——
+    `recycle_bin.image_id` 是 UNIQUE、id 已被**新内容**占用，旧文件根本没法登记成
+    回收站条目。所以每次替换只是在给 `data/recycle/` 扔孤儿文件。
+  - 放大成「0 张」的原因：`resolve_group` 逐张 `match recycle_image { Err => warn! }`
+    **静默吞掉失败**，随后无条件 `set_group_state(id, "resolved")`，接口只回
+    `{"recycled": 0}`；成员筛选条件是 `status='active'`，故组成员看起来毫无变化。
+
+  修复：
+  - `recycle_image` 改为**幂等且容忍半完成态**：状态已是 `recycled` 时补齐缺失的
+    bin 记录后直接成功；搬运时「源缺失但回收站已有同名文件」按已完成处理，
+    「两处都没有」报明确错误（`无法回收：<路径>`）而不是裸 NotFound。
+    `restore_image` 同样容忍半完成搬运，`purge_image` 删文件改为 best-effort
+    （原先是 `?`，删失败会留下「行还在、文件已删」的更糟残局）。
+  - `resolve_group` 不再吞错：收集 `failed` 明细，**只有全部成功才置 resolved**，
+    否则组保持 `open` 可重试；响应扩为 `{recycled, failed, errors, group_state}`。
+    前端按三种情况分别提示（成功 / 无需处理 / 部分失败并列失败原因）。
+  - 原图替换改为「**先落库、后删旧文件**」，并删掉「旧文件移入回收站」那段——
+    既然不可恢复，就别再制造孤儿。读原内容的真正途径是 `source_url` 重新下载。
+
+- **回收站里看不见的数据残局（BUG-B / BUG-C）**。库里有 12 张 `status=recycled`
+  却没有任何 `recycle_bin` 记录的图（回收站页用 `recycle_bin JOIN images` 查询，
+  所以它们**在回收站页完全不显示**），且原图早已不在磁盘——既恢复不了也删不掉；
+  同时 `data/recycle/` 堆了 228 个没有任何引用的孤儿文件（46.9 MB）。
+  新增 `backend/crates/dedup/src/audit.rs`：`audit_recycle` 按三类明确规则判定
+  （半完成 / 僵尸行 / 文件丢失 + 孤儿文件），`repair_recycle` 按规则修复，
+  支持 `dry_run` 只报数不落盘。对外提供 `GET /api/v1/trash/audit` 与
+  `POST /api/v1/trash/repair {dry_run, remove_orphans}`，回收站页新增
+  「一致性检查 / 修复」区块。实机执行结果：识别 13 项问题 + 228 个孤儿，
+  修复后 `bin_records=1 / issues=0 / orphans=0`，释放 46,952,974 字节。
+  顺带补一条：孤儿文件删完后会留下 256 个空的哈希前缀目录（看着像没清干净），
+  `remove_orphans` 时会自底向上收掉空目录（`removed_empty_dirs` 计数）。空目录本身无害，
+  故只在显式要求删孤儿时才清，不做隐式清理。
+  判定规则写死在代码里、报告逐项列出，**不做任何猜测性删除**。
+
+- **任务中心显示 total=0 而实际处理了 18 张（BUG-D）**。`start_job(job_id, total)`
+  在三条管线（打标 / 溯源 / 美学）里都写成
+  `force_ids.as_ref().map_or(0, |v| v.len())` —— 走「自动筛选待处理图片」时
+  `force_ids` 是 `None`，total 被写死 0，而管线内部实际取的是
+  `untagged_active_images(10000)` / `unscored_active_images(10000)`。
+  `jobs` 新增 `set_job_total()`，三条管线在算出真实 ids 后（`filter_eligible` 过滤之后）
+  立刻回填；启动日志也不再写死「（0 张）」，改为「（指定 N 张）」或「（自动筛选待…图片）」。
+  顺手给 `start_job` 加了终态保护（`WHERE status NOT IN ('done','failed','cancelled')`），
+  避免刚点中断、管线刚起来时把 `cancelled` 拉回 `running`。
+  实测：删掉 3 张图的自动标签制造 3 个候选 → 发起任务 → `total=3`（修复前恒为 0）。
+
 ### 开发环境
 
 - **落装 4 个 DSH 插件并完成运行时验证**（详见 `docs/SKILL_AUDIT_2026-11.md` §7）：

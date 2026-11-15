@@ -7,5 +7,8 @@ license.workspace = true
 [dependencies]
 moevault-core = { path = "../core" }
 moevault-db = { path = "../db" }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# 孤儿回收站文件扫描需要遍历目录树
+walkdir = { workspace = true }

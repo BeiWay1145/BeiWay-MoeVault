@@ -49,6 +49,10 @@ pub async fn run_aesthetic_pipeline(
         }
         None => db.unscored_active_images(10000)?,
     };
+    // 同上：以过滤后的真实候选集写回任务总数（避免任务中心显示 0/0）
+    if let Some(jid) = job_id {
+        let _ = db.set_job_total(jid, ids.len() as i64);
+    }
     if ids.is_empty() {
         return Ok(AestheticProgress::default());
     }

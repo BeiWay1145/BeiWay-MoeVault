@@ -208,23 +208,26 @@ pub fn do_replace_from_bytes(
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
     std::fs::write(&new_path, bytes).map_err(|e| format!("写入新文件失败: {e}"))?;
-    // 旧文件 → 回收站目录
-    if new_path != old_path {
-        let recycle_dst = st.recycle_dir().join(&img.rel_path);
-        if let Some(parent) = recycle_dst.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::rename(&old_path, &recycle_dst).is_err() {
-            let _ = std::fs::copy(&old_path, &recycle_dst).and_then(|_| std::fs::remove_file(&old_path));
-        }
-    }
     // 缩略图
     let thumb_rel = format!("{prefix}/{md5_hex}.webp");
     let thumb_path = st.thumbs_dir().join(&thumb_rel);
     moevault_ingest::importer::generate_thumbnail(&new_path, &thumb_path);
-    // 记录
+    // 记录（先落库：此步失败时新文件只是孤儿，图片行仍指向旧文件，可安全清理）
     db.replace_image_file(image_id, &md5_hex, &new_rel, w, h, ext, bytes.len() as i64)
         .map_err(|e| e.to_string())?;
+    // 旧文件删除（在元数据已切换之后）。
+    //
+    // 这里原先「移入回收站目录」以图可恢复，但那是个从未成立的承诺：
+    // recycle_bin.image_id 是 UNIQUE 且这张图的 id 已被新内容占用，旧文件
+    // 无法登记成回收站条目 → 回收站页面根本看不到它，恢复按钮也无从谈起。
+    // 结果是每次替换都在 data/recycle/<前缀>/ 下留一个无引用的死文件
+    //（BUG-C 里 27 个散落孤儿的来源）。既然实际不可恢复，就不该继续制造孤儿；
+    // 读取原内容的真正途径是 source_url 重新下载（本函数即为此而存在）。
+    if new_path != old_path && old_path.exists() {
+        if let Err(e) = std::fs::remove_file(&old_path) {
+            tracing::warn!(image_id, path = %old_path.display(), error = %e, "替换原图：旧文件删除失败（忽略）");
+        }
+    }
     Ok(json!({
         "ok": true,
         "md5": md5_hex,

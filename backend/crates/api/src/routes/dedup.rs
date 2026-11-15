@@ -284,26 +284,67 @@ async fn resolve_group(
     };
 
     if recycle_ids.is_empty() {
-        return Ok(Json(json!({ "recycled": 0 })));
+        // 本组已经处理过（成员都已是 recycled）——不是错误，但也不该假装成功。
+        return Ok(Json(json!({
+            "recycled": 0,
+            "failed": 0,
+            "errors": [],
+            "group_state": "unchanged",
+            "note": "本组没有需要回收的成员（可能已处理过）",
+        })));
     }
 
     // 逐个入回收站（spawn_blocking 内完成，因含文件 IO）
+    //
+    // 关键：单张失败**不再静默吞掉**。旧实现把 Err 记一条 warn 就算了，随后
+    // 无条件把组置成 resolved —— 用户看到「已回收 0 张」，组成员却原样躺在那儿，
+    // 组状态还被标成已处理，重试也无从下手。现在把失败明细回给前端，并且
+    // 只有「全部成功」才把组置 resolved，否则保持 open 供重试。
+    let total = recycle_ids.len();
     let db2 = state.db.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut recycled = 0;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut recycled = 0usize;
+        let mut failures: Vec<(i64, String)> = Vec::new();
         for rid in &recycle_ids {
             match moevault_dedup::recycle_image(&db2, *rid, "duplicate", &library_dir, &recycle_dir) {
                 Ok(()) => recycled += 1,
-                Err(e) => tracing::warn!(image_id = rid, error = %e, "resolve：单张回收失败，继续"),
+                Err(e) => {
+                    tracing::warn!(image_id = rid, error = %e, "resolve：单张回收失败");
+                    failures.push((*rid, e.to_string()));
+                }
             }
         }
-        // 标记组已处理（若全部 active 成员已回收或保留）
-        let _ = db2.set_group_state(id, "resolved");
-        Ok::<usize, moevault_dedup::DedupError>(recycled)
+        // 全部成功才标记组已处理；有失败则保持 open，用户可以修好数据后重试。
+        let resolved = failures.is_empty() && recycled == recycle_ids.len();
+        if resolved {
+            if let Err(e) = db2.set_group_state(id, "resolved") {
+                tracing::warn!(group_id = id, error = %e, "resolve：标记组已处理失败");
+            }
+        }
+        (recycled, failures, resolved)
     })
     .await
-    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?
-    .map_err(|e| error_response(ErrorKind::Internal, e.to_string()))?;
+    .map_err(|e| error_response(ErrorKind::Internal, format!("任务失败: {e}")))?;
 
-    Ok(Json(json!({ "recycled": result })))
+    let (recycled, failures, resolved) = outcome;
+    let errors: Vec<String> = failures
+        .iter()
+        .map(|(rid, msg)| format!("图片 {rid}: {msg}"))
+        .collect();
+    if !failures.is_empty() {
+        tracing::warn!(
+            group_id = id,
+            total,
+            recycled,
+            failed = failures.len(),
+            "resolve：部分成员回收失败，组保持未处理"
+        );
+    }
+
+    Ok(Json(json!({
+        "recycled": recycled,
+        "failed": failures.len(),
+        "errors": errors,
+        "group_state": if resolved { "resolved" } else { "open" },
+    })))
 }

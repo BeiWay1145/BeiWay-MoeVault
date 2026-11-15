@@ -29,6 +29,16 @@ export interface GroupDetail {
   members: GroupMember[]
 }
 
+/** 「保留最优 / 指定保留」的结果。
+ *  只有 failed === 0 才算整组处理完成；有失败时组保持 open，可以修好数据后重试。 */
+export interface ResolveResult {
+  recycled: number
+  failed?: number
+  errors?: string[]
+  group_state?: 'resolved' | 'open' | 'unchanged'
+  note?: string
+}
+
 /** 缩略图 URL：thumb_rel 为相对 data/thumbs 的路径（Windows 反斜杠转正斜杠）。 */
 export function thumbUrl(thumbRel: string | null): string | undefined {
   if (!thumbRel) return undefined
@@ -75,7 +85,7 @@ export const useDedupStore = defineStore('dedup', () => {
 
   async function resolve(id: number, mode: 'best_only' | 'specific', recycleIds?: number[]) {
     const body = mode === 'best_only' ? { mode } : { mode, recycle_ids: recycleIds ?? [] }
-    return post<{ recycled: number }>(`/dedup/groups/${id}/resolve`, body)
+    return post<ResolveResult>(`/dedup/groups/${id}/resolve`, body)
   }
 
   return {

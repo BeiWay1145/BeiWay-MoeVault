@@ -5,9 +5,14 @@
 //! - 簇内 refresh：按清晰度选 best，其余标记冗余候选（is_redundant）
 //! - 回收站：软删除（文件移入 recycle/ + 元数据保留）、恢复、永久删除
 
+pub mod audit;
 pub mod cluster;
 pub mod recycle;
 
+pub use audit::{
+    audit_recycle, repair_recycle, ImageIssue, IssueKind, OrphanFile, RecycleAudit, RepairOptions,
+    RepairReport,
+};
 pub use cluster::{cluster_scope, full_recluster, incremental_cluster, ClusterStats, DEFAULT_HAMMING_THRESHOLD};
 pub use recycle::{purge_all, purge_image, recycle_image, restore_image};
 

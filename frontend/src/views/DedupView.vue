@@ -112,7 +112,28 @@ async function resolveBest(g: DedupGroup) {
   resolving.value = g.id
   try {
     const r = await dedup.resolve(g.id, 'best_only')
-    ElMessage.success(`已回收 ${r.recycled} 张冗余图`)
+    const failed = r.failed ?? 0
+    if (failed === 0 && r.recycled > 0) {
+      ElMessage.success(`已回收 ${r.recycled} 张冗余图`)
+    } else if (failed === 0) {
+      // 没有可回收的成员：组本来就处理过了
+      ElMessage.info(r.note ?? '本组没有需要回收的成员')
+    } else {
+      // 部分失败：不能报「成功 0 张」了事，要把原因摊开
+      ElMessageBox.alert(
+        [
+          `成功回收 ${r.recycled} 张，失败 ${failed} 张。`,
+          '',
+          '组状态保持「未处理」，可以修好数据后重试。失败原因：',
+          ...(r.errors ?? []).slice(0, 10),
+          (r.errors?.length ?? 0) > 10 ? `……共 ${r.errors?.length} 条` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        '回收未全部完成',
+        { type: 'warning' },
+      )
+    }
     membersCache.value[g.id] = []
     expanded.value.delete(g.id)
     await dedup.fetchGroups()

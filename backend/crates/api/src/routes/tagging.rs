@@ -500,8 +500,20 @@ async fn run_tagging(
 
     tokio::spawn(async move {
         let db = st.db.clone();
+        // total 先按已知列表写；未指定列表时为 0，管线过滤出真实候选集后
+        // 会调用 set_job_total 回填（否则任务中心一直显示 0/0）。
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
-        let _ = db.add_log("info", "task", &format!("打标任务 #{job_id} 启动（{} 张）", force_ids.as_ref().map_or(0, |v| v.len())));
+        let _ = db.add_log(
+            "info",
+            "task",
+            &format!(
+                "打标任务 #{job_id} 启动{}",
+                force_ids
+                    .as_ref()
+                    .map(|v| format!("（指定 {} 张）", v.len()))
+                    .unwrap_or_else(|| "（自动筛选待打标图片）".to_string())
+            ),
+        );
         // 增强2：出口池（None = 直连）
         let exits = {
             let slot = st.exit_pool.read().await;
@@ -603,8 +615,21 @@ async fn run_sauce(
 
     tokio::spawn(async move {
         let db = st.db.clone();
+        // 同打标：total 由管线过滤后回填
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
-        let _ = db.add_log("info", "task", &format!("溯源任务 #{job_id} 启动（{} 张{}{}）", force_ids.as_ref().map_or(0, |v| v.len()), if force_sauce { "，强制重试不可溯源图" } else { "" }, if auto_replace { "，启用智能替换" } else { "" }));
+        let _ = db.add_log(
+            "info",
+            "task",
+            &format!(
+                "溯源任务 #{job_id} 启动{}{}{}",
+                force_ids
+                    .as_ref()
+                    .map(|v| format!("（指定 {} 张）", v.len()))
+                    .unwrap_or_else(|| "（自动筛选待溯源图片）".to_string()),
+                if force_sauce { "，强制重试不可溯源图" } else { "" },
+                if auto_replace { "，启用智能替换" } else { "" }
+            ),
+        );
         let result = moevault_tagger::run_sauce_pipeline(
             &db,
             &sauce,

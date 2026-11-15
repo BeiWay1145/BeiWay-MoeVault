@@ -573,7 +573,6 @@ async fn replace_from_url(
     let db = state.db.clone();
     let library_dir = state.library_dir();
     let thumbs_dir = state.thumbs_dir();
-    let recycle_dir = state.recycle_dir();
     let result = tokio::task::spawn_blocking(move || {
         // 1. 取原图记录
         let img = db
@@ -630,31 +629,27 @@ async fn replace_from_url(
         std::fs::write(&new_path, &bytes)
             .map_err(|e| error_response(ErrorKind::Internal, format!("写入新文件失败: {e}")))?;
         tracing::info!(id, new_path = %new_path.display(), "替换网络图：写入成功");
-        // 6. 旧文件移入回收站目录（增强3：可恢复，不直接删除；若非同一路径）
-        if new_path != old_path {
-            let recycle_dst = recycle_dir.join(&img.rel_path);
-            if let Some(parent) = recycle_dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::rename(&old_path, &recycle_dst) {
-                Ok(_) => tracing::info!(id, old = %old_path.display(), to = %recycle_dst.display(), "替换网络图：旧文件已移入回收站"),
-                Err(_) => {
-                    // 跨卷 rename 失败 → copy + remove
-                    match std::fs::copy(&old_path, &recycle_dst).and_then(|_| std::fs::remove_file(&old_path)) {
-                        Ok(_) => tracing::info!(id, old = %old_path.display(), to = %recycle_dst.display(), "替换网络图：旧文件已移入回收站（copy）"),
-                        Err(e) => tracing::warn!(id, old = %old_path.display(), error = %e, "替换网络图：旧文件移入回收站失败（忽略）"),
-                    }
-                }
-            }
-        }
-        // 7. 重新生成缩略图
+        // 6. 重新生成缩略图
         let thumb_rel = format!("{prefix}/{md5_hex}.webp");
         let thumb_path = thumbs_dir.join(&thumb_rel);
         moevault_ingest::importer::generate_thumbnail(&new_path, &thumb_path);
         tracing::info!(id, thumb = %thumb_rel, "替换网络图：缩略图已生成");
-        // 8. 更新库记录
+        // 7. 先更新库记录，再删旧文件。
+        //
+        // 旧实现把旧文件搬进 data/recycle/ 想保留「可恢复」，但 recycle_bin.image_id
+        // 是 UNIQUE 且这张图的 id 已被新内容占用 —— 旧文件不可能登记成回收站条目，
+        // 回收站页面看不到、恢复按钮也点不出。实际效果只是每替换一次就在
+        // data/recycle/<前缀>/ 留一个无引用的死文件（BUG-C 的孤儿来源）。
+        // 顺序上先落库：落库失败时新文件只是孤儿，图片行仍指向旧文件，数据不丢。
         db.replace_image_file(id, &md5_hex, &new_rel, w, h, ext, bytes.len() as i64)
             .map_err(db_error_response)?;
+        if new_path != old_path && old_path.exists() {
+            if let Err(e) = std::fs::remove_file(&old_path) {
+                tracing::warn!(id, old = %old_path.display(), error = %e, "替换网络图：旧文件删除失败（忽略）");
+            } else {
+                tracing::info!(id, old = %old_path.display(), "替换网络图：旧文件已删除");
+            }
+        }
         Ok::<_, ApiError>(json!({
             "ok": true,
             "md5": md5_hex,

@@ -947,6 +947,57 @@ impl Db {
             .map_err(DbError::from)
     }
 
+    /// 全部图片的相对路径（含 recycled，用于判断回收站文件是否为孤儿）。
+    pub fn all_image_rel_paths(&self) -> Result<Vec<String>, DbError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT rel_path FROM images")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 回收站记录里的原始相对路径（用于判断回收站文件是否为孤儿）。
+    pub fn all_recycle_original_rels(&self) -> Result<Vec<String>, DbError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT original_rel FROM recycle_bin")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 「文件已在回收站但元数据没登记」的 active 图：status=active 且库目录缺失。
+    /// 仅返回 id 列表，文件存在性由调用方在回收站目录侧确认。
+    pub fn active_image_rel_paths(&self) -> Result<Vec<(i64, String)>, DbError> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, rel_path FROM images WHERE status = 'active' ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 已回收图片的 (id, rel_path) 列表。
+    pub fn recycled_image_rel_paths(&self) -> Result<Vec<(i64, String)>, DbError> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, rel_path FROM images WHERE status = 'recycled' ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// 永久删除图片行（级联 image_tags）。
     pub fn delete_image_row(&self, image_id: i64) -> Result<(), DbError> {
         let conn = self.conn.lock();
@@ -1941,10 +1992,29 @@ impl Db {
     }
 
     /// 启动任务：置为 running 并设置总数。
+    ///
+    /// 只清 pending 的任务：已处于 done/failed/cancelled 的不动。
+    /// 否则「用户刚点中断、管线才刚起来」这种毫秒级竞争会把 cancelled 拉回 running。
     pub fn start_job(&self, job_id: i64, total: i64) -> Result<(), DbError> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE jobs SET status = 'running', total = ?2, updated_at = ?3 WHERE id = ?1",
+            "UPDATE jobs SET status = 'running', total = ?2, updated_at = ?3
+             WHERE id = ?1 AND status NOT IN ('done', 'failed', 'cancelled')",
+            params![job_id, total, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// 设置任务总数（不改变状态）。
+    ///
+    /// 用于「任务启动时还不知道工作量」的场景：批量打标/溯源/美学在未指定
+    /// 图片列表时，真实候选集要等管线按规则过滤后才确定（例如排除已有自动
+    /// 标签、AI 生成、已溯源、GIF 等）。旧实现在建任务时直接把 total 写成 0，
+    /// 于是任务中心一直显示 0/0，完成时才凭空跳到 18/18。
+    pub fn set_job_total(&self, job_id: i64, total: i64) -> Result<(), DbError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE jobs SET total = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, total, now_secs()],
         )?;
         Ok(())

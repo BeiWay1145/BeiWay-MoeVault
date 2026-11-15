@@ -325,6 +325,13 @@ pub async fn run_tag_pipeline(
         }
         None => db.untagged_active_images(10000)?,
     };
+    // 任务总数以**过滤后的真实候选集**为准写回。
+    // 不这么做的话，未指定图片列表的批量任务在建任务时只能写 total=0
+    //（此时还不知道会筛掉多少张），任务中心就一直显示 0/0，
+    // 直到任务结束才凭空跳到 18/18。
+    if let Some(jid) = job_id {
+        let _ = db.set_job_total(jid, ids.len() as i64);
+    }
     if ids.is_empty() {
         return Ok(TagProgress::default());
     }
@@ -806,6 +813,10 @@ pub async fn run_sauce_pipeline(
     } else {
         raw_ids
     };
+    // 同上：以过滤后的真实候选集写回任务总数
+    if let Some(jid) = job_id {
+        let _ = db.set_job_total(jid, ids.len() as i64);
+    }
     if ids.is_empty() {
         if let Some(_jid) = job_id {
             let _ = db.add_log("warn", "sauce", "批量溯源：所有图片均被跳过，无任务执行");

@@ -69,8 +69,21 @@ async fn run_aesthetic(
 
     tokio::spawn(async move {
         let db = st.db.clone();
+        // 同打标：total 由管线过滤后回填
         let _ = db.start_job(job_id, force_ids.as_ref().map_or(0, |v| v.len() as i64));
-        let _ = db.add_log("info", "aesthetic", &format!("美学任务 #{job_id} 启动（{} 张，设备 {}{}）", force_ids.as_ref().map_or(0, |v| v.len()), device.as_deref().unwrap_or("auto"), if force { "，强制重评" } else { "" }));
+        let _ = db.add_log(
+            "info",
+            "aesthetic",
+            &format!(
+                "美学任务 #{job_id} 启动（{}，设备 {}{}）",
+                force_ids
+                    .as_ref()
+                    .map(|v| format!("指定 {} 张", v.len()))
+                    .unwrap_or_else(|| "自动筛选未评分图片".to_string()),
+                device.as_deref().unwrap_or("auto"),
+                if force { "，强制重评" } else { "" }
+            ),
+        );
         let result = moevault_tagger::run_aesthetic_pipeline(
             &db,
             &infer,

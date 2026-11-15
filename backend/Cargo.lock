@@ -944,8 +944,10 @@ version = "0.1.0"
 dependencies = [
  "moevault-core",
  "moevault-db",
+ "serde",
  "thiserror",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
